@@ -76,9 +76,9 @@ $excludeDirs = @(
     "htmlcov",
     "fusion_bid_backend.egg-info",
     ".eggs",
-    # 本机运行数据整夹跳过，后面只建空目录
-    "data",
-    "reports"
+    # 仅跳过项目根 data（本机 DB/报告）；切勿把 "reports" 全局排除，
+    # 否则会误删 backend/app/reports 业务代码包
+    "data"
 )
 
 Write-Host "==> Copying project files..." -ForegroundColor Cyan
