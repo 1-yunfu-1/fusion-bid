@@ -151,6 +151,14 @@ Stop: close the console window.
 "@
 Set-Content -Path (Join-Path $stage "README_START.txt") -Value $enQuick -Encoding UTF8
 
+# Remove secrets + any accidental venv (must NOT ship machine-specific Python paths)
+Get-ChildItem -Path $stage -Recurse -Force -Directory -ErrorAction SilentlyContinue |
+    Where-Object { $_.Name -eq ".venv" -or $_.Name -eq "venv" -or $_.Name -eq "node_modules" -or $_.Name -eq "__pycache__" } |
+    ForEach-Object {
+        Write-Host "  remove dir: $($_.FullName)" -ForegroundColor Yellow
+        Remove-Item -Recurse -Force -LiteralPath $_.FullName -ErrorAction SilentlyContinue
+    }
+
 Get-ChildItem -Path $stage -Recurse -Force -File -ErrorAction SilentlyContinue | ForEach-Object {
     $n = $_.Name
     $remove = $false

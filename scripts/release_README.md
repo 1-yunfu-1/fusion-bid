@@ -107,6 +107,13 @@ A：请用本包 `start.bat` 启动，打开 **http://127.0.0.1:8000/**，并 Ct
 **Q：提示找不到 Python？**  
 A：安装 Python 3.12+，勾选 Add to PATH，重开终端后再双击 `start.bat`。
 
+**Q：报错 `Could not find executable at ...\pythoncore-3.xx\python.exe`？**  
+A：这是旧虚拟环境路径失效（或发布包误带了别人电脑上的 `.venv`）。处理：
+
+1. 删除本包目录下的 `backend\.venv` 文件夹（整夹删除）  
+2. 确认本机已安装 Python 3.12+ 且 `python --version` 可用  
+3. 再双击 `start.bat`，脚本会自动用本机 Python 重建环境  
+
 **Q：首次启动很慢 / pip 失败？**  
 A：需要能访问 PyPI（或配置国内镜像）。网络稳定后重新运行 `start.bat` 即可。
 
