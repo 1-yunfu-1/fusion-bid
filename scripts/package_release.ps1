@@ -75,7 +75,10 @@ $excludeDirs = @(
     "dist_release",
     "htmlcov",
     "fusion_bid_backend.egg-info",
-    ".eggs"
+    ".eggs",
+    # 本机运行数据整夹跳过，后面只建空目录
+    "data",
+    "reports"
 )
 
 Write-Host "==> Copying project files..." -ForegroundColor Cyan
@@ -90,18 +93,26 @@ if (Test-Path $srcDist) {
     Copy-Item -Recurse -Force $srcDist $dstDist
 }
 
-@("data", "data\reports", "data\browser_states", "data\fixtures") | ForEach-Object {
-    $p = Join-Path $stage $_
+# Empty data dirs only (never ship local DB / reports / secrets / cookies)
+if (-not $stage) { throw "stage path is empty" }
+$dataRoot = [System.IO.Path]::Combine($stage, "data")
+if (Test-Path -LiteralPath $dataRoot) {
+    Remove-Item -LiteralPath $dataRoot -Recurse -Force
+}
+foreach ($rel in @("data", "data\reports", "data\browser_states", "data\fixtures")) {
+    $p = [System.IO.Path]::Combine($stage, $rel)
     New-Item -ItemType Directory -Force -Path $p | Out-Null
-    $keep = Join-Path $p ".gitkeep"
-    if (-not (Test-Path $keep)) {
-        New-Item -ItemType File -Path $keep -Force | Out-Null
-    }
+    New-Item -ItemType File -Path ([System.IO.Path]::Combine($p, ".gitkeep")) -Force | Out-Null
 }
 
-$envExample = Join-Path $Root ".env.example"
-if (Test-Path $envExample) {
-    Copy-Item $envExample (Join-Path $stage ".env.example") -Force
+$envExample = [System.IO.Path]::Combine($Root, ".env.example")
+if (Test-Path -LiteralPath $envExample) {
+    Copy-Item -LiteralPath $envExample -Destination ([System.IO.Path]::Combine($stage, ".env.example")) -Force
+}
+# Never ship .env (only example; start script creates on first run)
+$envFile = [System.IO.Path]::Combine($stage, ".env")
+if (Test-Path -LiteralPath $envFile) {
+    Remove-Item -LiteralPath $envFile -Force
 }
 
 # Launchers
@@ -161,17 +172,42 @@ Get-ChildItem -Path $stage -Recurse -Force -Directory -ErrorAction SilentlyConti
 
 Get-ChildItem -Path $stage -Recurse -Force -File -ErrorAction SilentlyContinue | ForEach-Object {
     $n = $_.Name
+    $ext = $_.Extension.ToLowerInvariant()
     $remove = $false
     if ($n -eq ".env") { $remove = $true }
     if ($n -eq "llm_secrets.json") { $remove = $true }
+    if ($n -eq "llm_runtime.json") { $remove = $true }
     if ($n -like "*_state.json") { $remove = $true }
+    if ($n -like "storage_state*") { $remove = $true }
     if ($n -like "*.db") { $remove = $true }
     if ($n -like "*.sqlite*") { $remove = $true }
+    if ($ext -eq ".docx" -or $ext -eq ".doc") { $remove = $true }
+    if ($ext -eq ".pyc") { $remove = $true }
     if ($remove) {
         Write-Host "  remove: $($_.FullName)" -ForegroundColor Yellow
         Remove-Item -Force -LiteralPath $_.FullName
     }
 }
+
+# 最终校验
+$violations = @()
+Get-ChildItem -Path $stage -Recurse -Force -File -ErrorAction SilentlyContinue | ForEach-Object {
+    $n = $_.Name
+    if ($n -eq ".env") { $violations += $_.FullName }
+    if ($n -eq "llm_secrets.json") { $violations += $_.FullName }
+    if ($n -like "*.db") { $violations += $_.FullName }
+    if ($n -like "*.docx") { $violations += $_.FullName }
+    if ($n -eq "pyvenv.cfg") { $violations += $_.FullName }
+}
+Get-ChildItem -Path $stage -Recurse -Force -Directory -ErrorAction SilentlyContinue |
+    Where-Object { $_.Name -in @(".venv", "venv", "node_modules") } |
+    ForEach-Object { $violations += $_.FullName }
+if ($violations.Count -gt 0) {
+    Write-Host "PACKAGE VALIDATION FAILED:" -ForegroundColor Red
+    $violations | ForEach-Object { Write-Host "  $_" -ForegroundColor Red }
+    throw "Release package contains forbidden files"
+}
+Write-Host "==> Validation OK (no .env / secrets / db / venv / reports)" -ForegroundColor Green
 
 $zipPath = Join-Path $outRoot "$pkgName.zip"
 if (Test-Path $zipPath) {
