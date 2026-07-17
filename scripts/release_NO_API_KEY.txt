@@ -1,0 +1,11 @@
+【重要】本发布包不包含任何 API Key
+
+请在启动系统后自行配置：
+
+1. 推荐：浏览器打开 http://127.0.0.1:8000/
+   → 设置 → API 配置组 → 填写 Base URL 与 Key
+
+2. 或：编辑项目根目录 .env（首次启动会从 .env.example 自动生成）
+   填写 LLM_API_KEY=... 后重启 start.bat
+
+密钥会保存在本机 data/llm_secrets.json，请勿把含密钥的文件再打包外传。
