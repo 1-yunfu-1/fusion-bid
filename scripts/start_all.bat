@@ -9,9 +9,10 @@ set "ROOT=%CD%"
 echo ========================================
 echo   FusionBid - One Click Start
 echo ========================================
+echo   Root: %ROOT%
 echo.
 
-REM ---- 1) Find a working system Python (prefer py launcher) ----
+REM ---- Find system Python (prefer py launcher) ----
 set "SYS_PY="
 where py >nul 2>&1
 if not errorlevel 1 (
@@ -24,18 +25,17 @@ if not defined SYS_PY (
   )
 )
 if not defined SYS_PY (
-  echo [ERROR] 未找到可用的 Python 3。
-  echo 请安装 Python 3.12+：https://www.python.org/downloads/
-  echo 安装时务必勾选 "Add python.exe to PATH"
-  echo 不要使用已损坏的 Windows Store 占位 python。
+  echo [ERROR] Python 3 not found.
+  echo Install Python 3.12+ and check "Add python.exe to PATH"
+  echo https://www.python.org/downloads/
   pause
   exit /b 1
 )
 
 echo [OK] System Python: %SYS_PY%
-"%SYS_PY%" -c "import sys; v=sys.version_info; assert v.major==3 and v.minor>=12, f'need Python>=3.12, got {sys.version}'" 2>nul
+"%SYS_PY%" -c "import sys; v=sys.version_info; raise SystemExit(0 if v.major==3 and v.minor>=12 else 1)" 2>nul
 if errorlevel 1 (
-  echo [ERROR] 需要 Python 3.12 或更高版本。
+  echo [ERROR] Need Python ^>= 3.12
   "%SYS_PY%" -c "import sys; print(sys.version)"
   pause
   exit /b 1
@@ -55,20 +55,11 @@ set "NEED_VENV=0"
 if not exist "%PY%" (
   set "NEED_VENV=1"
 ) else (
-  REM venv exists but base interpreter may be missing ^(copied from another PC^)
+  REM Only rebuild when venv python cannot run
   "%PY%" -c "import sys; print(sys.version)" >nul 2>&1
   if errorlevel 1 (
-    echo [WARN] 现有 .venv 已损坏或来自其他电脑，将删除并重建...
+    echo [WARN] Broken venv detected, will recreate...
     set "NEED_VENV=1"
-  ) else (
-    REM also fail if pyvenv.cfg points to non-existent home
-    if exist "%VENV_DIR%\pyvenv.cfg" (
-      findstr /I /C:"Users\\user\\AppData" "%VENV_DIR%\pyvenv.cfg" >nul 2>&1
-      if not errorlevel 1 (
-        echo [WARN] 检测到打包误带的开发机虚拟环境，将重建...
-        set "NEED_VENV=1"
-      )
-    )
   )
 )
 
@@ -77,19 +68,18 @@ if "!NEED_VENV!"=="1" (
     echo [1/4] Removing broken venv...
     rmdir /s /q "%VENV_DIR%" 2>nul
   )
-  echo [1/4] Creating new venv with local Python...
+  echo [1/4] Creating venv...
   pushd "%ROOT%\backend"
   "%SYS_PY%" -m venv .venv
   if errorlevel 1 (
-    echo [ERROR] 创建虚拟环境失败。
-    echo 请确认 Python 安装完整，并重试。
+    echo [ERROR] Failed to create venv
     popd
     pause
     exit /b 1
   )
   popd
   if not exist "%PY%" (
-    echo [ERROR] venv 创建后仍找不到 python.exe
+    echo [ERROR] venv python.exe missing after create
     pause
     exit /b 1
   )
@@ -97,21 +87,17 @@ if "!NEED_VENV!"=="1" (
   echo [1/4] venv OK
 )
 
-echo [2/4] Installing backend deps ^(first run may take several minutes^)...
+echo [2/4] Installing backend deps ^(may take a few minutes^)...
 "%PY%" -m pip install -q -U pip
 if errorlevel 1 (
-  echo [ERROR] pip 自检失败，尝试重建 venv...
+  echo [WARN] pip upgrade failed, recreating venv...
   rmdir /s /q "%VENV_DIR%" 2>nul
   pushd "%ROOT%\backend"
   "%SYS_PY%" -m venv .venv
   popd
   "%PY%" -m pip install -q -U pip
   if errorlevel 1 (
-    echo [ERROR] pip install failed
-    echo 常见原因：网络问题 / Python 损坏 / 权限不足
-    echo 也可手动执行：
-    echo   "%SYS_PY%" -m venv backend\.venv
-    echo   backend\.venv\Scripts\python.exe -m pip install -e backend[full]
+    echo [ERROR] pip failed
     pause
     exit /b 1
   )
@@ -119,32 +105,50 @@ if errorlevel 1 (
 
 "%PY%" -m pip install -q -e "%ROOT%\backend[full]"
 if errorlevel 1 (
-  echo [ERROR] 依赖安装失败，请检查网络后重试。
+  echo [ERROR] Dependency install failed. Check network and retry.
   pause
   exit /b 1
 )
 
-echo [3/4] Playwright chromium ^(optional for login crawl^)...
+echo [3/4] Playwright chromium ^(optional^)...
 "%PY%" -m playwright install chromium >nul 2>&1
 
 if not exist "%ROOT%\frontend\dist\index.html" (
-  echo [WARN] frontend\dist missing. UI may be API-only.
+  echo [WARN] frontend\dist missing - UI may show JSON only.
+  echo        Run: cd frontend ^&^& npm install ^&^& npm run build
+) else (
+  echo [OK] frontend\dist found
+)
+
+REM free port 8000 if occupied by old process
+for /f "tokens=5" %%P in ('netstat -ano ^| findstr ":8000" ^| findstr "LISTENING"') do (
+  echo [WARN] Port 8000 in use by PID %%P, trying to stop it...
+  taskkill /F /PID %%P >nul 2>&1
 )
 
 echo [4/4] Starting server...
 echo.
-echo   Open:  http://127.0.0.1:8000
-echo   Docs:  http://127.0.0.1:8000/docs
-echo   API Key: fill in Settings page ^(not bundled^)
+echo   Open browser:  http://127.0.0.1:8000/
+echo   API docs:      http://127.0.0.1:8000/docs
+echo   API Key: configure in Settings page
 echo.
-echo   Close this window to stop.
+echo   Keep this window open. Close it to stop.
 echo ========================================
 echo.
 
 cd /d "%ROOT%\backend"
+
+REM open browser after short delay in background
+start "" cmd /c "timeout /t 2 /nobreak >nul & start http://127.0.0.1:8000/"
+
 "%PY%" -m uvicorn app.main:app --host 127.0.0.1 --port 8000
+set "RC=%ERRORLEVEL%"
 
 echo.
+if not "%RC%"=="0" (
+  echo [ERROR] Server exited with code %RC%
+  echo If port busy: close other FusionBid/uvicorn windows.
+)
 echo Stopped.
 pause
 endlocal
