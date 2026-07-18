@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
-from app.browser.pdf_detail import restore_reading_order
+import pytest
+
+from app.browser.pdf_detail import _extract_rendered_text_pages, restore_reading_order
 from app.deduplication.engine import CandidateRecord, is_duplicate
 from app.reports.fields import (
+    _ai_source_chunks,
     _validate_ai_extraction_rows,
     build_extraction_data,
     enrich_report_item,
@@ -125,6 +128,99 @@ def test_pdf_reading_order_removes_same_coordinate_duplicates():
     assert text == "招标人：某公司\n资格要求"
 
 
+def test_pdf_reading_order_removes_subpixel_render_duplicates():
+    text = restore_reading_order(
+        [
+            {"text": "招标文件售价", "x": 98.9, "y": 100, "width": 80},
+            {"text": "招标文件售价", "x": 98.4, "y": 100, "width": 80},
+            {"text": "800.0", "x": 190, "y": 100, "width": 30},
+        ]
+    )
+    assert text == "招标文件售价800.0"
+
+
+class _FakeLayer:
+    def __init__(self, items):
+        self.items = items
+
+    async def wait_for(self, **_kwargs):
+        return None
+
+    async def evaluate(self, _script):
+        return self.items
+
+    async def inner_text(self, **_kwargs):
+        return ""
+
+
+class _FakePage:
+    def __init__(self, items):
+        self.layer = _FakeLayer(items)
+        self.scrolled = False
+
+    async def wait_for(self, **_kwargs):
+        return None
+
+    async def scroll_into_view_if_needed(self, **_kwargs):
+        self.scrolled = True
+
+    def locator(self, selector):
+        assert selector == ".textLayer"
+        return self.layer
+
+
+class _FakePages:
+    def __init__(self, pages):
+        self.pages = pages
+
+    @property
+    def first(self):
+        return self.pages[0]
+
+    async def count(self):
+        return len(self.pages)
+
+    def nth(self, index):
+        return self.pages[index]
+
+
+class _FakeFrame:
+    def __init__(self, pages):
+        self.pages = _FakePages(pages)
+
+    def locator(self, selector):
+        assert selector == ".page"
+        return self.pages
+
+
+@pytest.mark.asyncio
+async def test_pdfjs_text_layer_fallback_scrolls_and_extracts_every_page():
+    rendered_pages = [
+        _FakePage(
+            [
+                {"text": "招标人：", "x": 10, "y": 100, "width": 40},
+                {"text": "某研究所", "x": 55, "y": 100, "width": 50},
+            ]
+        ),
+        _FakePage(
+            [
+                {"text": "资格要求：", "x": 10, "y": 100, "width": 50},
+                {"text": "具备营业执照", "x": 65, "y": 100, "width": 70},
+            ]
+        ),
+    ]
+
+    pages, page_count = await _extract_rendered_text_pages(
+        _FakeFrame(rendered_pages), timeout_ms=1_000
+    )
+
+    assert page_count == 2
+    assert [page["page"] for page in pages] == [1, 2]
+    assert pages[0]["text"] == "招标人：某研究所"
+    assert pages[1]["text"] == "资格要求：具备营业执照"
+    assert all(page.scrolled for page in rendered_pages)
+
+
 def test_different_project_codes_and_lifecycle_not_merged():
     tender = CandidateRecord(
         title="服务器、数据库、数据库集群软件招标公告",
@@ -141,3 +237,46 @@ def test_different_project_codes_and_lifecycle_not_merged():
         announcement_type="终止公告",
     )
     assert is_duplicate(tender, termination)[0] is False
+
+
+def test_purchaser_consistency_handles_spaced_pdf_label():
+    content = "招 标 人 ： 西安航天动力试验技术研究所\n项目编号：TEST-001"
+    result = build_extraction_data(
+        title="服务器招标公告",
+        clean_content=content,
+        detail_status="full",
+        source_metadata={"content_pages": [{"page": 1, "text": content}]},
+    )
+    assert result["fields"]["purchaser"] == "西安航天动力试验技术研究所"
+    assert result["fields"]["purchaser_source_label"] == "招标人"
+    assert result["field_records"]["purchaser"]["status"] == "verified"
+
+
+def test_purchaser_label_without_reliable_value_is_review_failure():
+    content = "招 标 人：\n联系方式：029-12345678"
+    result = build_extraction_data(
+        title="服务器招标公告",
+        clean_content=content,
+        detail_status="full",
+        source_metadata={"content_pages": [{"page": 1, "text": content}]},
+    )
+    assert result["fields"]["purchaser"] == "提取失败，待复核"
+    assert result["field_records"]["purchaser"]["status"] == "extraction_failed"
+    assert result["quality_status"] == "needs_review"
+
+
+def test_ai_source_chunks_preserve_page_markers_without_raw_html():
+    chunks, truncated = _ai_source_chunks(
+        "fallback",
+        {
+            "content_pages": [
+                {"page": 1, "text": "招标人：某研究所"},
+                {"page": 2, "text": "投标人资格要求：具备营业执照"},
+            ]
+        },
+        chunk_chars=1000,
+    )
+    assert truncated is False
+    assert "[第1页]" in chunks[0]
+    assert "[第2页]" in chunks[0]
+    assert "<script" not in chunks[0]

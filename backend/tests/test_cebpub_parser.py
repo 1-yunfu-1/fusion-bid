@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import pytest
 
+from app.browser.pdf_detail import PublicPdfDetail
 from app.sources.base import ListItem, SearchQuery
 from app.sources.cebpub_source import CebpubSource
 
@@ -174,3 +175,36 @@ async def test_cebpub_accepts_detail_nested_under_verified_identity(monkeypatch)
     detail = await source.fetch_detail(item)
     assert detail.detail_status == "full"
     assert "嵌套详情正文" in detail.clean_content
+
+
+@pytest.mark.asyncio
+async def test_cebpub_interactive_fetch_uses_visible_browser(monkeypatch):
+    source = CebpubSource()
+    business_id = "1d1600b68217477890a8076bc98a6880"
+    item = ListItem(
+        title="服务器、数据库、数据库集群软件招标公告",
+        source_url="https://ctbpsp.com/",
+        source_item_id=business_id,
+        raw={"businessId": business_id},
+    )
+    calls = []
+
+    async def fake_pdf_detail(**kwargs):
+        calls.append(kwargs)
+        return PublicPdfDetail(
+            status="needs_human_verification",
+            detail_url=kwargs["detail_url"],
+            message="等待人工验证",
+            failure_reason="verification_timeout",
+        )
+
+    monkeypatch.setattr(
+        "app.sources.cebpub_source.fetch_public_pdf_detail", fake_pdf_detail
+    )
+    detail = await source.fetch_detail(item, interactive=True)
+
+    assert calls[0]["headless"] is False
+    assert calls[0]["timeout_ms"] == 300_000
+    assert detail.detail_status == "needs_human_verification"
+    assert detail.source_metadata["acquisition_mode"] == "interactive"
+    assert detail.source_metadata["failure_reason"] == "verification_timeout"

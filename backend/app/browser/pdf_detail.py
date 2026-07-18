@@ -36,6 +36,7 @@ class PublicPdfDetail:
     pages: list[dict[str, Any]] = field(default_factory=list)
     pdf_url: str | None = None
     message: str = ""
+    failure_reason: str | None = None
 
 
 def _normalise_identity(value: str) -> str:
@@ -68,19 +69,22 @@ def _join_pdf_line(items: list[dict[str, Any]]) -> str:
 def restore_reading_order(items: list[dict[str, Any]]) -> str:
     """用 PDF 文字坐标恢复阅读顺序，并清理同坐标重复渲染文字。"""
     unique: list[dict[str, Any]] = []
-    seen: set[tuple[str, int, int]] = set()
+    # 部分 PDF 为了加粗或描边，会把同一段文字以约 0.5px 的偏移渲染两次。
+    # 不能只按四舍五入后的坐标去重，否则边界附近的副本仍会保留下来。
+    seen_by_text: dict[str, list[tuple[float, float]]] = {}
     for item in items:
         text = str(item.get("text") or "").replace("\x00", "").strip()
         if not text:
             continue
-        key = (
-            text,
-            round(float(item.get("x") or 0) * 2),
-            round(float(item.get("y") or 0) * 2),
-        )
-        if key in seen:
+        x = float(item.get("x") or 0)
+        y = float(item.get("y") or 0)
+        coordinates = seen_by_text.setdefault(text, [])
+        if any(
+            abs(old_x - x) <= 1.0 and abs(old_y - y) <= 1.0
+            for old_x, old_y in coordinates
+        ):
             continue
-        seen.add(key)
+        coordinates.append((x, y))
         unique.append({**item, "text": text})
 
     # PDF 原点在左下：y 由大到小。两个文字坐标相差 2.5pt 以内视为同行。
@@ -111,7 +115,60 @@ async def _launch_public_browser(playwright, *, headless: bool = True):
     raise RuntimeError(f"无法启动本地浏览器: {last_error}")
 
 
-async def _ocr_rendered_pages(frame) -> list[dict[str, Any]]:
+async def _extract_rendered_text_pages(
+    frame, *, timeout_ms: int, max_pages: int = 100
+) -> tuple[list[dict[str, Any]], int]:
+    """逐页滚动 PDF.js，并从已经渲染的文字层读取正文。
+
+    新版 PDF.js 不再保证 ``window.PDFViewerApplication`` 暴露为全局变量，
+    但阅读器正常显示时，每页仍会生成 ``.textLayer``。逐页滚动可以触发
+    懒加载，同时避免再次直连受访问策略保护的 PDF 地址。
+    """
+    page_locators = frame.locator(".page")
+    try:
+        await page_locators.first.wait_for(state="attached", timeout=timeout_ms)
+    except Exception:  # noqa: BLE001
+        return [], 0
+
+    page_count = await page_locators.count()
+    pages: list[dict[str, Any]] = []
+    for index in range(min(page_count, max_pages)):
+        page = page_locators.nth(index)
+        try:
+            await page.scroll_into_view_if_needed(timeout=min(timeout_ms, 15_000))
+            layer = page.locator(".textLayer")
+            await layer.wait_for(state="attached", timeout=min(timeout_ms, 15_000))
+            items = await layer.evaluate(
+                """layer => {
+                    const layerRect = layer.getBoundingClientRect();
+                    return Array.from(layer.querySelectorAll('span')).map((span) => {
+                        const rect = span.getBoundingClientRect();
+                        return {
+                            text: span.textContent || '',
+                            x: rect.left - layerRect.left,
+                            y: layerRect.bottom - rect.bottom,
+                            width: rect.width,
+                            height: rect.height,
+                        };
+                    });
+                }"""
+            )
+            text = restore_reading_order(items or [])
+            if not text:
+                text = (await layer.inner_text(timeout=5_000)).strip()
+        except Exception as exc:  # noqa: BLE001
+            logger.info("PDF text layer page %s unavailable: %s", index + 1, exc)
+            continue
+        if text:
+            pages.append(
+                {"page": index + 1, "text": text, "method": "pdf_text_layer"}
+            )
+    return pages, page_count
+
+
+async def _ocr_rendered_pages(
+    frame, *, page_numbers: set[int] | None = None
+) -> list[dict[str, Any]]:
     """扫描 PDF 无文本层时的本地 OCR 降级；组件未安装时安静失败。"""
     try:
         from PIL import Image
@@ -123,6 +180,9 @@ async def _ocr_rendered_pages(frame) -> list[dict[str, Any]]:
     count = await pages.count()
     output: list[dict[str, Any]] = []
     for index in range(min(count, 100)):
+        page_number = index + 1
+        if page_numbers is not None and page_number not in page_numbers:
+            continue
         locator = pages.nth(index)
         try:
             await locator.scroll_into_view_if_needed(timeout=10_000)
@@ -133,7 +193,7 @@ async def _ocr_rendered_pages(frame) -> list[dict[str, Any]]:
             logger.info("PDF OCR page %s unavailable: %s", index + 1, exc)
             continue
         if text:
-            output.append({"page": index + 1, "text": text, "method": "ocr"})
+            output.append({"page": page_number, "text": text, "method": "ocr"})
     return output
 
 
@@ -152,6 +212,7 @@ async def fetch_public_pdf_detail(
             status="metadata_only",
             detail_url=detail_url,
             message="Playwright 未安装，无法读取 PDF.js 详情",
+            failure_reason="playwright_missing",
         )
 
     async with async_playwright() as playwright:
@@ -165,28 +226,46 @@ async def fetch_public_pdf_detail(
             page = await context.new_page()
             await page.goto(detail_url, wait_until="domcontentloaded", timeout=timeout_ms)
             pdf_loaded = False
-            for attempt in range(2):
+            attempts = 1
+            for attempt in range(attempts):
                 try:
                     await page.wait_for_selector(
                         'iframe[src*="web_pdf"], iframe[src*="pdfjs"]',
-                        timeout=max(20_000, timeout_ms // 2),
+                        timeout=timeout_ms if not headless else min(timeout_ms, 15_000),
                     )
                     pdf_loaded = True
                     break
                 except Exception:  # noqa: BLE001
-                    if attempt == 0:
+                    # 可见浏览器由用户完成官方验证，刷新会清除验证进度。
+                    if headless and attempt == 0 and attempts > 1:
                         try:
                             await page.reload(wait_until="domcontentloaded", timeout=timeout_ms)
                         except Exception:  # noqa: BLE001
                             pass
             if not pdf_loaded:
-                body = (await page.locator("body").inner_text(timeout=10_000)).strip()
+                try:
+                    body = (await page.locator("body").inner_text(timeout=10_000)).strip()
+                except Exception:  # noqa: BLE001
+                    return PublicPdfDetail(
+                        status="needs_human_verification",
+                        detail_url=detail_url,
+                        message="可见浏览器已关闭，公告详情尚未完成采集",
+                        failure_reason="browser_closed",
+                    )
                 lower = body.lower()
+                if not headless:
+                    return PublicPdfDetail(
+                        status="needs_human_verification",
+                        detail_url=detail_url,
+                        message=f"{timeout_ms // 1000} 秒内未检测到公告 PDF，请重新采集并完成官方验证",
+                        failure_reason="verification_timeout",
+                    )
                 if any(marker.lower() in lower for marker in _VERIFY_MARKERS):
                     return PublicPdfDetail(
                         status="needs_human_verification",
                         detail_url=detail_url,
                         message="详情页要求人工完成安全验证",
+                        failure_reason="verification_required",
                     )
                 # 站点安全脚本未能放行详情 API 时，通常只剩入口导航与
                 # about:blank iframe。这不等于「原文无详情」，必须标记待人工验证。
@@ -195,11 +274,13 @@ async def fetch_public_pdf_detail(
                         status="needs_human_verification",
                         detail_url=detail_url,
                         message="站点安全策略未放行公告详情，需人工在官方页面验证",
+                        failure_reason="verification_required",
                     )
                 return PublicPdfDetail(
                     status="metadata_only",
                     detail_url=detail_url,
                     message="详情页未加载 PDF.js 公告正文",
+                    failure_reason="pdf_not_loaded",
                 )
 
             main_text = await page.locator("body").inner_text(timeout=10_000)
@@ -215,6 +296,7 @@ async def fetch_public_pdf_detail(
                     status="failed",
                     detail_url=detail_url,
                     message="详情页 ID 或标题与列表记录不一致，已拒绝使用",
+                    failure_reason="identity_mismatch",
                 )
 
             pdf_frame = next(
@@ -227,21 +309,21 @@ async def fetch_public_pdf_detail(
             )
             if pdf_frame is None:
                 return PublicPdfDetail(
-                    status="metadata_only", detail_url=detail_url, message="PDF.js iframe 未就绪"
+                    status="metadata_only",
+                    detail_url=detail_url,
+                    message="PDF.js iframe 未就绪",
+                    failure_reason="pdf_not_ready",
                 )
+            pdf_query = parse_qs(urlparse(pdf_frame.url).query).get("file", [None])[0]
+            pdf_url = unquote(pdf_query) if pdf_query else None
+
+            # 旧版 PDF.js 会暴露 PDFViewerApplication，可直接读取所有页面；
+            # 新版页面可能只暴露已渲染的 textLayer，因此这里不再等待该全局变量。
             try:
-                await pdf_frame.wait_for_selector(".textLayer", timeout=timeout_ms)
-            except Exception:  # noqa: BLE001
-                # 扫描件可能不会生成文本层，下方继续走 OCR。
-                pass
-            await pdf_frame.wait_for_function(
-                "window.PDFViewerApplication && "
-                "window.PDFViewerApplication.pdfDocument",
-                timeout=timeout_ms,
-            )
-            raw_pages = await pdf_frame.evaluate(
-                """async () => {
-                    const doc = window.PDFViewerApplication.pdfDocument;
+                raw_pages = await pdf_frame.evaluate(
+                    """async () => {
+                    const doc = window.PDFViewerApplication?.pdfDocument;
+                    if (!doc) return [];
                     const pages = [];
                     for (let pageNo = 1; pageNo <= doc.numPages; pageNo += 1) {
                         const page = await doc.getPage(pageNo);
@@ -259,7 +341,9 @@ async def fetch_public_pdf_detail(
                     }
                     return pages;
                 }"""
-            )
+                )
+            except Exception:  # noqa: BLE001
+                raw_pages = []
             pages = [
                 {
                     "page": int(row.get("page") or index + 1),
@@ -269,18 +353,49 @@ async def fetch_public_pdf_detail(
                 for index, row in enumerate(raw_pages or [])
             ]
             pages = [row for row in pages if row["text"]]
-            content_format = "pdf_text"
+            page_count = len(raw_pages or [])
             if not pages:
-                pages = await _ocr_rendered_pages(pdf_frame)
-                content_format = "pdf_ocr" if pages else None
-            pdf_query = parse_qs(urlparse(pdf_frame.url).query).get("file", [None])[0]
-            pdf_url = unquote(pdf_query) if pdf_query else None
+                pages, page_count = await _extract_rendered_text_pages(
+                    pdf_frame, timeout_ms=timeout_ms
+                )
+
+            extracted_numbers = {int(row["page"]) for row in pages}
+            expected_numbers = set(range(1, min(page_count, 100) + 1))
+            missing_numbers = expected_numbers - extracted_numbers
+            if not pages or missing_numbers:
+                ocr_pages = await _ocr_rendered_pages(
+                    pdf_frame,
+                    page_numbers=missing_numbers if pages else None,
+                )
+                by_page = {int(row["page"]): row for row in pages}
+                by_page.update({int(row["page"]): row for row in ocr_pages})
+                pages = [by_page[number] for number in sorted(by_page)]
+                extracted_numbers = set(by_page)
+                missing_numbers = expected_numbers - extracted_numbers
+
+            methods = {str(row.get("method") or "") for row in pages}
+            if methods == {"ocr"}:
+                content_format = "pdf_ocr"
+            elif "ocr" in methods:
+                content_format = "pdf_mixed"
+            else:
+                content_format = "pdf_text"
             if not pages:
                 return PublicPdfDetail(
                     status="metadata_only",
                     detail_url=detail_url,
                     pdf_url=pdf_url,
                     message="PDF 无可用文本层，且本地 OCR 不可用或未识别到文字",
+                    failure_reason="content_unavailable",
+                )
+            if missing_numbers:
+                missing = "、".join(str(number) for number in sorted(missing_numbers))
+                return PublicPdfDetail(
+                    status="metadata_only",
+                    detail_url=detail_url,
+                    pdf_url=pdf_url,
+                    message=f"PDF 第 {missing} 页未能读取，已拒绝把不完整正文标记为完整详情",
+                    failure_reason="incomplete_pdf_pages",
                 )
             full_text = "\n".join(row["text"] for row in pages)
             if _normalise_identity(expected_title) not in _normalise_identity(full_text):
@@ -289,6 +404,7 @@ async def fetch_public_pdf_detail(
                     detail_url=detail_url,
                     pdf_url=pdf_url,
                     message="PDF 正文标题与列表记录不一致，已拒绝使用",
+                    failure_reason="pdf_title_mismatch",
                 )
             clean = "\n".join(
                 f"【第{row['page']}页】\n{row['text']}" for row in pages
@@ -304,10 +420,16 @@ async def fetch_public_pdf_detail(
             )
         except Exception as exc:  # noqa: BLE001
             logger.info("public PDF detail unavailable for %s: %s", expected_id, exc)
+            reason = (
+                "browser_closed"
+                if "TargetClosed" in type(exc).__name__
+                else "collector_error"
+            )
             return PublicPdfDetail(
-                status="metadata_only",
+                status="needs_human_verification" if not headless else "metadata_only",
                 detail_url=detail_url,
                 message=f"PDF 详情采集失败: {type(exc).__name__}",
+                failure_reason=reason,
             )
         finally:
             if browser is not None:

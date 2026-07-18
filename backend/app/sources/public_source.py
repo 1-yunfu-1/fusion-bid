@@ -29,7 +29,9 @@ class PublicSourcePlaceholder(TenderSourceAdapter):
     async def search(self, query: SearchQuery) -> list[ListItem]:
         return []
 
-    async def fetch_detail(self, item: ListItem) -> DetailResult:
+    async def fetch_detail(
+        self, item: ListItem, *, interactive: bool = False
+    ) -> DetailResult:
         raise NotImplementedError("请使用 ccgp 或 cebpub 适配器")
 
     async def extract_attachments(self, detail: DetailResult) -> list[str]:

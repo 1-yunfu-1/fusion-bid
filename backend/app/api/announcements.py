@@ -2,17 +2,23 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 from datetime import datetime
 from typing import Any
 from zoneinfo import ZoneInfo
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile
 from pydantic import BaseModel, Field
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import get_db
+from app.importers.official_document import (
+    MAX_UPLOAD_BYTES,
+    OfficialDocumentError,
+    extract_official_document,
+)
 from app.models.announcement import TenderAnnouncement
 from app.models.company import AnnouncementFieldCorrection, CompanyProfile
 from app.models.delivery import DeliveryHistory
@@ -60,6 +66,30 @@ _CORRECTABLE_FIELDS = {
 class FieldCorrectionRequest(BaseModel):
     fields: dict[str, Any]
     reason: str = Field(min_length=2, max_length=1000)
+
+
+class RecrawlRequest(BaseModel):
+    interactive_on_verification: bool = Field(
+        default=True,
+        description="手工重采遇到官方验证时是否启动可见浏览器",
+    )
+
+
+_recrawl_guard = asyncio.Lock()
+_active_recrawls: set[str] = set()
+
+
+async def _claim_recrawl(announcement_id: str) -> bool:
+    async with _recrawl_guard:
+        if announcement_id in _active_recrawls:
+            return False
+        _active_recrawls.add(announcement_id)
+        return True
+
+
+async def _release_recrawl(announcement_id: str) -> None:
+    async with _recrawl_guard:
+        _active_recrawls.discard(announcement_id)
 
 
 def _content_hash(announcement: TenderAnnouncement) -> str:
@@ -149,6 +179,12 @@ async def _expanded_detail(
     announcement: TenderAnnouncement, db: AsyncSession
 ) -> dict[str, Any]:
     item = _base_item(announcement)
+    field_records = (announcement.extraction_data or {}).get("field_records") or {}
+    needs_review_fields = [
+        field_name
+        for field_name, record in field_records.items()
+        if isinstance(record, dict) and record.get("status") == "extraction_failed"
+    ]
     enriched = enrich_report_item(
         item,
         keywords=list(announcement.keywords or []),
@@ -176,6 +212,7 @@ async def _expanded_detail(
                     "assessable", False
                 ),
                 "evidence_field_count": len(enriched.get("field_evidence") or {}),
+                "needs_review_fields": needs_review_fields,
             },
             "corrections": [
                 {
@@ -285,9 +322,113 @@ async def reextract_announcement(
     }
 
 
+@router.post("/{announcement_id}/import-detail")
+async def import_announcement_detail(
+    announcement_id: str,
+    file: UploadFile = File(...),
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    if not await _claim_recrawl(announcement_id):
+        raise HTTPException(status_code=409, detail="该公告正在处理详情，请勿重复提交")
+    try:
+        announcement = await db.get(TenderAnnouncement, announcement_id)
+        if not announcement:
+            raise HTTPException(status_code=404, detail="公告不存在")
+        try:
+            data = await file.read(MAX_UPLOAD_BYTES + 1)
+            imported = await asyncio.to_thread(
+                extract_official_document,
+                filename=file.filename,
+                content_type=file.content_type,
+                data=data,
+                expected_title=announcement.title,
+                expected_project_code=announcement.project_code,
+            )
+        except OfficialDocumentError as exc:
+            raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
+        finally:
+            await file.close()
+
+        imported_at = datetime.now(TZ)
+        metadata = dict(announcement.source_metadata or {})
+        metadata.update(
+            {
+                "detail_status": "full",
+                "detail_fetched": True,
+                "content_format": imported.content_format,
+                "content_pages": imported.pages,
+                "acquisition_mode": "manual_import",
+                "message": f"已导入官方文件并读取 {len(imported.pages)} 页正文",
+                "manual_import": {
+                    "filename": imported.filename,
+                    "content_type": imported.content_type,
+                    "size_bytes": imported.size_bytes,
+                    "sha256": imported.sha256,
+                    "identity_basis": imported.identity_basis,
+                    "imported_at": imported_at.isoformat(),
+                },
+            }
+        )
+        announcement.clean_content = imported.clean_content
+        announcement.raw_content = imported.clean_content
+        announcement.detail_status = "full"
+        announcement.content_format = imported.content_format
+        announcement.source_metadata = metadata
+        announcement.crawl_time = imported_at
+        announcement.extraction_data = await build_extraction_data_with_ai(
+            title=announcement.title,
+            clean_content=imported.clean_content,
+            summary=announcement.summary or "",
+            region=announcement.region,
+            project_code=announcement.project_code,
+            publish_time=announcement.publish_time,
+            detail_status="full",
+            source_metadata=metadata,
+        )
+        announcement.extraction_data = apply_manual_corrections(
+            announcement.extraction_data,
+            await _manual_corrections_for(announcement.id, db),
+        )
+        announcement.extraction_version = "v2"
+        fields = (announcement.extraction_data or {}).get("fields") or {}
+        announcement.project_code = fields.get("project_code") or announcement.project_code
+        announcement.announcement_type = fields.get("announcement_type")
+        announcement.content_hash = _content_hash(announcement)
+        await _analysis_for(announcement, db)
+        await db.commit()
+        await db.refresh(announcement)
+        return {
+            "ok": True,
+            "message": "官方文件已导入、抽取并分析",
+            "acquisition_mode": "manual_import",
+            "content_format": imported.content_format,
+            "page_count": len(imported.pages),
+            "extraction_version": announcement.extraction_version,
+            "announcement": await _expanded_detail(announcement, db),
+        }
+    finally:
+        await _release_recrawl(announcement_id)
+
+
 @router.post("/{announcement_id}/recrawl")
 async def recrawl_announcement(
-    announcement_id: str, db: AsyncSession = Depends(get_db)
+    announcement_id: str,
+    body: RecrawlRequest | None = None,
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    body = body or RecrawlRequest()
+    if not await _claim_recrawl(announcement_id):
+        raise HTTPException(status_code=409, detail="该公告正在重新采集，请勿重复提交")
+    try:
+        return await _recrawl_announcement(announcement_id, body, db)
+    finally:
+        await _release_recrawl(announcement_id)
+
+
+async def _recrawl_announcement(
+    announcement_id: str,
+    body: RecrawlRequest,
+    db: AsyncSession,
 ) -> dict:
     announcement = await db.get(TenderAnnouncement, announcement_id)
     if not announcement:
@@ -310,8 +451,28 @@ async def recrawl_announcement(
         region=announcement.region,
         raw=raw,
     )
+    verification_attempted = False
+    acquisition_mode = "headless"
     try:
-        detail = await source.fetch_detail(item)
+        use_interactive_first = (
+            announcement.source_name == "cebpub"
+            and body.interactive_on_verification
+            and announcement.detail_status == "needs_human_verification"
+        )
+        if use_interactive_first:
+            verification_attempted = True
+            acquisition_mode = "interactive"
+            detail = await source.fetch_detail(item, interactive=True)
+        else:
+            detail = await source.fetch_detail(item, interactive=False)
+            if (
+                announcement.source_name == "cebpub"
+                and body.interactive_on_verification
+                and detail.detail_status in {"needs_human_verification", "metadata_only"}
+            ):
+                verification_attempted = True
+                acquisition_mode = "interactive"
+                detail = await source.fetch_detail(item, interactive=True)
         detail.attachment_links = await source.extract_attachments(detail)
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(status_code=502, detail=f"重新采集失败: {exc}") from exc
@@ -352,6 +513,8 @@ async def recrawl_announcement(
             "status": detail.detail_status,
             "at": datetime.now(TZ).isoformat(),
             "message": (detail.source_metadata or {}).get("message"),
+            "failure_reason": (detail.source_metadata or {}).get("failure_reason"),
+            "acquisition_mode": acquisition_mode,
         }
         announcement.source_metadata = metadata
         if not previous_full:
@@ -373,6 +536,11 @@ async def recrawl_announcement(
         "ok": detail.detail_status == "full",
         "message": message,
         "recrawl_status": detail.detail_status,
+        "detail_status": detail.detail_status,
+        "extraction_version": announcement.extraction_version,
+        "acquisition_mode": acquisition_mode,
+        "verification_attempted": verification_attempted,
+        "failure_reason": (detail.source_metadata or {}).get("failure_reason"),
         "announcement": await _expanded_detail(announcement, db),
     }
 

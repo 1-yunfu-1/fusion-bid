@@ -71,7 +71,9 @@ class TenderSourceAdapter(ABC):
         raise NotImplementedError
 
     @abstractmethod
-    async def fetch_detail(self, item: ListItem) -> DetailResult:
+    async def fetch_detail(
+        self, item: ListItem, *, interactive: bool = False
+    ) -> DetailResult:
         raise NotImplementedError
 
     @abstractmethod

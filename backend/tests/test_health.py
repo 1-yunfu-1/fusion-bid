@@ -12,6 +12,10 @@ async def test_health_ok(client: AsyncClient):
     assert data["status"] in ("ok", "degraded")
     assert data["database_ok"] is True
     assert data["database"] == "ok"
+    assert data["extraction_version"] == "v2"
+    assert "interactive-detail-recrawl-v1" in data["capabilities"]
+    assert "official-document-import-v1" in data["capabilities"]
+    assert "pdfjs-text-layer-capture-v1" in data["capabilities"]
     assert "Asia/Shanghai" in data["timezone"]
     assert data["phase"] == "phase8-integration"
 

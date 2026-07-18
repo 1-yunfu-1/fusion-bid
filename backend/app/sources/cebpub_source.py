@@ -323,7 +323,9 @@ class CebpubSource(TenderSourceAdapter):
             )
         return results
 
-    async def fetch_detail(self, item: ListItem) -> DetailResult:
+    async def fetch_detail(
+        self, item: ListItem, *, interactive: bool = False
+    ) -> DetailResult:
         """通过官方详情链路读取当前公告；失败时严格降级为列表元数据。"""
         raw = item.raw or {}
         clean = _metadata_content(item)
@@ -336,6 +338,8 @@ class CebpubSource(TenderSourceAdapter):
                 detail_url=detail_url,
                 expected_id=business_id,
                 expected_title=item.title,
+                timeout_ms=300_000 if interactive else 25_000,
+                headless=not interactive,
             )
             pdf_metadata = {
                 "detail_status": pdf_detail.status,
@@ -347,6 +351,8 @@ class CebpubSource(TenderSourceAdapter):
                 "content_format": pdf_detail.content_format,
                 "content_pages": pdf_detail.pages,
                 "message": pdf_detail.message,
+                "failure_reason": pdf_detail.failure_reason,
+                "acquisition_mode": "interactive" if interactive else "headless",
             }
             if pdf_detail.status == "full":
                 raw_json = json.dumps(

@@ -30,7 +30,9 @@ class FixtureSourcePlaceholder(TenderSourceAdapter):
         # 明确返回空列表，不伪造招投标结果
         return []
 
-    async def fetch_detail(self, item: ListItem) -> DetailResult:
+    async def fetch_detail(
+        self, item: ListItem, *, interactive: bool = False
+    ) -> DetailResult:
         raise NotImplementedError("无 fixture 条目可解析")
 
     async def extract_attachments(self, detail: DetailResult) -> list[str]:

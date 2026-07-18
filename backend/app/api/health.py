@@ -33,6 +33,12 @@ async def health_check() -> HealthResponse:
         database_ok=db_ok,
         database_revision=revision,
         extraction_version="v2",
+        capabilities=[
+            "detail-evidence-v2",
+            "interactive-detail-recrawl-v1",
+            "official-document-import-v1",
+            "pdfjs-text-layer-capture-v1",
+        ],
         message="服务正常" if db_ok else "数据库连接异常",
     )
 

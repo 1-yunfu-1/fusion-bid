@@ -247,7 +247,9 @@ class LoginPortalSource(TenderSourceAdapter):
                 break
         return results
 
-    async def fetch_detail(self, item: ListItem) -> DetailResult:
+    async def fetch_detail(
+        self, item: ListItem, *, interactive: bool = False
+    ) -> DetailResult:
         try:
             html = await fetch_page_with_state(item.source_url, state_path=self.state_path)
         except LoginRequiredError:

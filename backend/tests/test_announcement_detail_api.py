@@ -4,8 +4,10 @@ from __future__ import annotations
 
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+import app.api.announcements as announcements_api
 from app.models.announcement import TenderAnnouncement
 from app.reports.fields import build_extraction_data
+from app.sources.base import DetailResult
 
 
 async def _create_announcement(db_engine) -> str:
@@ -119,3 +121,157 @@ async def test_company_profile_roundtrip(client):
     loaded = await client.get("/api/company-profile")
     assert loaded.json()["name"] == "测试企业"
     assert loaded.json()["product_capabilities"] == ["服务器"]
+
+
+async def _create_pending_announcement(db_engine) -> str:
+    factory = async_sessionmaker(db_engine, class_=AsyncSession, expire_on_commit=False)
+    async with factory() as db:
+        row = TenderAnnouncement(
+            title="服务器、数据库、数据库集群软件招标公告",
+            source_name="cebpub",
+            source_url="https://ctbpsp.com/",
+            detail_url="https://ctbpsp.com/",
+            source_item_id="1d1600b68217477890a8076bc98a6880",
+            data_mode="live",
+            detail_status="metadata_only",
+            extraction_version="needs_recrawl",
+            clean_content="项目名称：服务器项目",
+            raw_content="项目名称：服务器项目",
+            source_metadata={},
+            attachment_links=[],
+            related_urls=[],
+            related_sources=[],
+            dedupe_reasons=[],
+        )
+        db.add(row)
+        await db.commit()
+        await db.refresh(row)
+        return row.id
+
+
+async def test_recrawl_falls_back_to_interactive_and_extracts_purchaser(
+    client, db_engine, monkeypatch
+):
+    announcement_id = await _create_pending_announcement(db_engine)
+    content = (
+        "服务器、数据库、数据库集群软件招标公告\n"
+        "招标人：西安航天动力试验技术研究所\n"
+        "招标代理机构：陕西铭源项目管理有限公司\n"
+        "3. 投标人资格要求\n3.1 具备有效营业执照。"
+    )
+
+    class FakeSource:
+        enabled = True
+
+        def __init__(self):
+            self.calls = []
+
+        async def fetch_detail(self, item, *, interactive=False):
+            self.calls.append(interactive)
+            if not interactive:
+                return DetailResult(
+                    title=item.title,
+                    source_url=item.source_url,
+                    detail_url=item.source_url,
+                    detail_status="needs_human_verification",
+                    detail_fetched=False,
+                    source_metadata={
+                        "message": "需要人工验证",
+                        "failure_reason": "verification_required",
+                    },
+                )
+            return DetailResult(
+                title=item.title,
+                source_url=item.source_url,
+                detail_url=item.source_url,
+                detail_status="full",
+                detail_fetched=True,
+                content_format="pdf_text",
+                clean_content=content,
+                raw_content=content,
+                source_metadata={
+                    "content_pages": [{"page": 1, "text": content}],
+                    "acquisition_mode": "interactive",
+                },
+            )
+
+        async def extract_attachments(self, detail):
+            return []
+
+    source = FakeSource()
+    monkeypatch.setattr(announcements_api, "get_source", lambda _name: source)
+    response = await client.post(
+        f"/api/announcements/{announcement_id}/recrawl",
+        json={"interactive_on_verification": True},
+    )
+
+    assert response.status_code == 200, response.text
+    payload = response.json()
+    assert source.calls == [False, True]
+    assert payload["ok"] is True
+    assert payload["acquisition_mode"] == "interactive"
+    assert payload["verification_attempted"] is True
+    assert payload["announcement"]["fields"]["purchaser"] == "西安航天动力试验技术研究所"
+    assert payload["announcement"]["fields"]["purchaser_source_label"] == "招标人"
+
+
+async def test_duplicate_recrawl_returns_409(client, db_engine):
+    announcement_id = await _create_pending_announcement(db_engine)
+    announcements_api._active_recrawls.add(announcement_id)
+    try:
+        response = await client.post(f"/api/announcements/{announcement_id}/recrawl")
+    finally:
+        announcements_api._active_recrawls.discard(announcement_id)
+    assert response.status_code == 409
+
+
+async def test_import_official_html_extracts_and_analyzes(client, db_engine):
+    announcement_id = await _create_pending_announcement(db_engine)
+    html = """
+    <html><body><article>
+      <h1>服务器、数据库、数据库集群软件招标公告</h1>
+      <p>招标人：西安航天动力试验技术研究所</p>
+      <p>招标代理机构：陕西铭源项目管理有限公司</p>
+      <h2>3. 投标人资格要求</h2>
+      <p>3.1 具备有效营业执照。</p>
+      <p>3.2 不接受联合体投标。</p>
+      <h2>4. 招标文件获取</h2>
+    </article><script>window.bad = true</script></body></html>
+    """
+    response = await client.post(
+        f"/api/announcements/{announcement_id}/import-detail",
+        files={"file": ("官方公告.html", html.encode(), "text/html")},
+    )
+
+    assert response.status_code == 200, response.text
+    payload = response.json()
+    assert payload["ok"] is True
+    assert payload["acquisition_mode"] == "manual_import"
+    assert payload["content_format"] == "html"
+    assert payload["announcement"]["detail_status"] == "full"
+    assert (
+        payload["announcement"]["fields"]["purchaser"]
+        == "西安航天动力试验技术研究所"
+    )
+    metadata = payload["announcement"]["source_metadata"]
+    assert metadata["manual_import"]["identity_basis"] == "title"
+    assert metadata["manual_import"]["filename"] == "官方公告.html"
+    assert "window.bad" not in payload["announcement"]["clean_content"]
+
+
+async def test_import_identity_mismatch_preserves_pending_record(client, db_engine):
+    announcement_id = await _create_pending_announcement(db_engine)
+    response = await client.post(
+        f"/api/announcements/{announcement_id}/import-detail",
+        files={
+            "file": (
+                "其他项目.html",
+                b"<html><body>unrelated official document</body></html>",
+                "text/html",
+            )
+        },
+    )
+
+    assert response.status_code == 422
+    detail = await client.get(f"/api/announcements/{announcement_id}")
+    assert detail.json()["detail_status"] == "metadata_only"

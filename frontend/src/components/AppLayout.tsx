@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { Button, Drawer, Grid, Layout, Menu, Typography, theme } from "antd";
+import { Alert, Button, Drawer, Grid, Layout, Menu, Typography, theme } from "antd";
 import {
   CloudServerOutlined,
   DashboardOutlined,
@@ -11,6 +11,8 @@ import {
   UnorderedListOutlined,
 } from "@ant-design/icons";
 import { Link, Outlet, useLocation } from "react-router-dom";
+import { useQuery } from "@tanstack/react-query";
+import { fetchHealth } from "../api/health";
 
 const { Header, Sider, Content, Footer } = Layout;
 
@@ -45,6 +47,15 @@ export default function AppLayout() {
   const location = useLocation();
   const screens = Grid.useBreakpoint();
   const isDesktop = Boolean(screens.lg);
+  const healthQuery = useQuery({
+    queryKey: ["health"],
+    queryFn: fetchHealth,
+    refetchInterval: 15000,
+  });
+  const apiCompatible = Boolean(
+    healthQuery.data?.capabilities?.includes("interactive-detail-recrawl-v1") &&
+      healthQuery.data?.capabilities?.includes("official-document-import-v1"),
+  );
   const {
     token: { colorBgContainer },
   } = theme.useToken();
@@ -106,6 +117,15 @@ export default function AppLayout() {
           </Typography.Text>
         </Header>
         <Content className="app-content">
+          {healthQuery.data && !apiCompatible ? (
+            <Alert
+              type="error"
+              showIcon
+              style={{ marginBottom: 16 }}
+              message="当前后端进程未加载详情采集新版本"
+              description="请使用 FusionBid 启动脚本安全重启服务。重启前已禁用自动重采和官方文件导入，避免旧接口继续生成缺少采购主体的结果。"
+            />
+          ) : null}
           <Outlet />
         </Content>
         <Footer className="muted app-footer">

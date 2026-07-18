@@ -176,7 +176,9 @@ class CcgpSource(TenderSourceAdapter):
             )
         return results
 
-    async def fetch_detail(self, item: ListItem) -> DetailResult:
+    async def fetch_detail(
+        self, item: ListItem, *, interactive: bool = False
+    ) -> DetailResult:
         try:
             html = await self.fetcher.get_text(item.source_url)
         except Exception as exc:  # noqa: BLE001

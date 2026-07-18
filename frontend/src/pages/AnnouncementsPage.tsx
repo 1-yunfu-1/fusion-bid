@@ -1,5 +1,10 @@
 import { useState } from "react";
 import {
+  ExportOutlined,
+  ReloadOutlined,
+  UploadOutlined,
+} from "@ant-design/icons";
+import {
   Alert,
   Button,
   Card,
@@ -15,10 +20,13 @@ import {
   Tabs,
   Tag,
   Typography,
+  Upload,
   message,
 } from "antd";
+import type { UploadFile } from "antd";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { apiClient } from "../api/client";
+import { fetchHealth } from "../api/health";
 import { listTasks } from "../api/tasks";
 import { formatDateTime } from "../utils/format";
 
@@ -135,7 +143,16 @@ export default function AnnouncementsPage() {
   const [detailStatus, setDetailStatus] = useState<string>();
   const [selectedId, setSelectedId] = useState<string>();
   const [correctionOpen, setCorrectionOpen] = useState(false);
+  const [importOpen, setImportOpen] = useState(false);
+  const [importFiles, setImportFiles] = useState<UploadFile[]>([]);
   const [correctionForm] = Form.useForm();
+  const healthQuery = useQuery({ queryKey: ["health"], queryFn: fetchHealth });
+  const recrawlCompatible = Boolean(
+    healthQuery.data?.capabilities?.includes("interactive-detail-recrawl-v1"),
+  );
+  const importCompatible = Boolean(
+    healthQuery.data?.capabilities?.includes("official-document-import-v1"),
+  );
 
   const sourceQuery = useQuery({
     queryKey: ["sources"],
@@ -174,19 +191,49 @@ export default function AnnouncementsPage() {
     mutationFn: async (action: "recrawl" | "reextract" | "analyze") => {
       const { data } = await apiClient.post(
         `/api/announcements/${selectedId}/${action}`,
-        {},
-        { timeout: 300000 },
+        action === "recrawl" ? { interactive_on_verification: false } : {},
+        { timeout: action === "recrawl" ? 90000 : 300000 },
       );
       return data;
     },
-    onSuccess: (data) => {
-      message.success(data.message || "操作完成");
+    onSuccess: (data, action) => {
+      if (action === "recrawl" && data.ok === false) {
+        message.warning(data.message || "本次未获得已验证详情");
+      } else {
+        message.success(data.message || "操作完成");
+      }
       qc.invalidateQueries({ queryKey: ["announcement-detail", selectedId] });
       qc.invalidateQueries({ queryKey: ["announcements"] });
     },
     onError: (error: unknown) => {
       const value = error as { response?: { data?: { detail?: string } }; message?: string };
       message.error(value.response?.data?.detail || value.message || "操作失败");
+    },
+  });
+
+  const importMutation = useMutation({
+    mutationFn: async () => {
+      const file = importFiles[0]?.originFileObj;
+      if (!file || !selectedId) throw new Error("请选择官方 PDF 或 HTML 文件");
+      const body = new FormData();
+      body.append("file", file);
+      const { data } = await apiClient.post(
+        `/api/announcements/${selectedId}/import-detail`,
+        body,
+        { timeout: 300000 },
+      );
+      return data;
+    },
+    onSuccess: (data) => {
+      message.success(data.message || "官方文件已导入");
+      setImportOpen(false);
+      setImportFiles([]);
+      qc.invalidateQueries({ queryKey: ["announcement-detail", selectedId] });
+      qc.invalidateQueries({ queryKey: ["announcements"] });
+    },
+    onError: (error: unknown) => {
+      const value = error as { response?: { data?: { detail?: string } }; message?: string };
+      message.error(value.response?.data?.detail || value.message || "官方文件导入失败");
     },
   });
 
@@ -210,6 +257,9 @@ export default function AnnouncementsPage() {
 
   const detail = detailQuery.data;
   const analysis = detail?.analysis_data || {};
+  const needsReviewFields = Array.isArray(detail?.data_quality?.needs_review_fields)
+    ? (detail.data_quality.needs_review_fields as string[])
+    : [];
   const evidenceRows = Object.entries(detail?.field_evidence || {}).map(
     ([field, value]) => ({ field, ...value }),
   );
@@ -225,10 +275,28 @@ export default function AnnouncementsPage() {
   const detailActions = (
     <div className="announcement-detail-actions">
       <Button
+        icon={<ExportOutlined />}
+        href={detail?.detail_url || detail?.source_url}
+        target="_blank"
+        rel="noreferrer"
+        disabled={!detail?.detail_url && !detail?.source_url}
+      >
+        浏览器打开官方页
+      </Button>
+      <Button
+        icon={<UploadOutlined />}
+        disabled={!importCompatible}
+        onClick={() => setImportOpen(true)}
+      >
+        导入官方文件
+      </Button>
+      <Button
+        icon={<ReloadOutlined />}
+        disabled={!recrawlCompatible}
         loading={actionMutation.isPending && actionMutation.variables === "recrawl"}
         onClick={() => actionMutation.mutate("recrawl")}
       >
-        重新采集并解析
+        自动重新采集
       </Button>
       <Button
         disabled={detail?.detail_status !== "full"}
@@ -380,6 +448,35 @@ export default function AnnouncementsPage() {
         {detail && (
           <>
             {isMobile && detailActions}
+            <div aria-live="polite">
+              {actionMutation.isPending && actionMutation.variables === "recrawl" ? (
+                <Alert
+                  type="info"
+                  showIcon
+                  style={{ marginBottom: 16 }}
+                  message="正在采集官方详情"
+                  description="正在尝试公开详情链路，不会弹出临时浏览器；失败后可在常用浏览器打开官方页并导入下载的 PDF 或 HTML。"
+                />
+              ) : null}
+              {!healthQuery.isLoading && (!recrawlCompatible || !importCompatible) ? (
+                <Alert
+                  type="error"
+                  showIcon
+                  style={{ marginBottom: 16 }}
+                  message="详情采集工具已禁用"
+                  description="当前后端缺少自动重采或官方文件导入能力，请先使用 FusionBid 启动脚本安全重启。"
+                />
+              ) : null}
+              {needsReviewFields.length > 0 ? (
+                <Alert
+                  type="error"
+                  showIcon
+                  style={{ marginBottom: 16 }}
+                  message="部分字段提取失败，待复核"
+                  description={`正文中存在字段标签，但解析未得到可信值：${needsReviewFields.map((field) => fieldLabels[field] || field).join("、")}`}
+                />
+              ) : null}
+            </div>
             <Tabs
               items={[
               {
@@ -501,6 +598,42 @@ export default function AnnouncementsPage() {
           </>
         )}
       </Drawer>
+
+      <Modal
+        title="导入官方详情文件"
+        open={importOpen}
+        onCancel={() => {
+          setImportOpen(false);
+          setImportFiles([]);
+        }}
+        onOk={() => importMutation.mutate()}
+        okText="导入并分析"
+        confirmLoading={importMutation.isPending}
+        okButtonProps={{ disabled: importFiles.length === 0 }}
+        destroyOnClose
+      >
+        <Alert
+          type="info"
+          showIcon
+          style={{ marginBottom: 16 }}
+          message="文件必须与当前公告匹配"
+          description="支持官方 PDF、HTML，最大 20 MB、PDF 最多 100 页。系统校验公告标题或项目编号后再抽取，不保存原始文件。"
+        />
+        <Upload.Dragger
+          accept=".pdf,.html,.htm,application/pdf,text/html"
+          maxCount={1}
+          fileList={importFiles}
+          beforeUpload={() => false}
+          onChange={({ fileList }) => setImportFiles(fileList.slice(-1))}
+          onRemove={() => {
+            setImportFiles([]);
+            return true;
+          }}
+        >
+          <p className="ant-upload-drag-icon"><UploadOutlined /></p>
+          <p className="ant-upload-text">选择或拖入官方 PDF / HTML</p>
+        </Upload.Dragger>
+      </Modal>
 
       <Modal
         title="人工校正公告字段"

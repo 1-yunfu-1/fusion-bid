@@ -18,6 +18,7 @@ class HealthResponse(BaseModel):
     database_ok: bool
     database_revision: str = "unversioned"
     extraction_version: str = "v2"
+    capabilities: list[str] = Field(default_factory=list)
     message: str = ""
 
 
