@@ -1,0 +1,15 @@
+{
+  "manifest_version": 3,
+  "name": "FusionBid 官方公告采集",
+  "version": "1.0.0",
+  "description": "从用户已正常打开的中国招标投标公共服务平台 PDF.js 阅读器逐页提取文字并发送到本机 FusionBid。",
+  "permissions": ["activeTab", "scripting"],
+  "host_permissions": [
+    "https://ctbpsp.com/*",
+    "http://127.0.0.1:8000/*"
+  ],
+  "action": {
+    "default_title": "采集当前官方公告",
+    "default_popup": "popup.html"
+  }
+}

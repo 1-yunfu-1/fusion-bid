@@ -225,6 +225,75 @@ async def test_duplicate_recrawl_returns_409(client, db_engine):
     assert response.status_code == 409
 
 
+async def test_browser_text_layer_capture_extracts_verified_pages(client, db_engine):
+    await _create_pending_announcement(db_engine)
+    detail_url = (
+        "https://ctbpsp.com/#/bulletinDetail?"
+        "uuid=1d1600b68217477890a8076bc98a6880&inpvalue=&dataSource=0"
+    )
+    response = await client.post(
+        "/api/announcements/capture-rendered-detail",
+        json={
+            "source_name": "cebpub",
+            "source_item_id": "1d1600b68217477890a8076bc98a6880",
+            "detail_url": detail_url,
+            "outer_text": "服务器、数据库、数据库集群软件招标公告 接收时间",
+            "page_count": 2,
+            "pages": [
+                {
+                    "page": 1,
+                    "items": [
+                        {"text": "招标人：", "x": 10, "y": 100, "width": 40},
+                        {
+                            "text": "西安航天动力试验技术研究所",
+                            "x": 55,
+                            "y": 100,
+                            "width": 150,
+                        },
+                        {
+                            "text": "3.1 具备有效营业执照。",
+                            "x": 10,
+                            "y": 80,
+                            "width": 180,
+                        },
+                    ],
+                },
+                {
+                    "page": 2,
+                    "text": "招标代理机构：陕西铭源项目管理有限公司",
+                },
+            ],
+        },
+    )
+
+    assert response.status_code == 200, response.text
+    payload = response.json()
+    assert payload["ok"] is True
+    assert payload["acquisition_mode"] == "browser_extension"
+    assert payload["page_count"] == 2
+    assert payload["announcement"]["fields"]["purchaser"] == "西安航天动力试验技术研究所"
+    assert payload["announcement"]["source_metadata"]["browser_capture"]["cookies_received"] is False
+
+
+async def test_browser_capture_rejects_missing_page_without_mutation(client, db_engine):
+    announcement_id = await _create_pending_announcement(db_engine)
+    response = await client.post(
+        "/api/announcements/capture-rendered-detail",
+        json={
+            "source_name": "cebpub",
+            "source_item_id": "1d1600b68217477890a8076bc98a6880",
+            "detail_url": "https://ctbpsp.com/#/bulletinDetail?uuid=1d1600b68217477890a8076bc98a6880",
+            "outer_text": "服务器、数据库、数据库集群软件招标公告",
+            "page_count": 2,
+            "pages": [{"page": 1, "text": "只有第一页"}],
+        },
+    )
+
+    assert response.status_code == 422
+    detail = await client.get(f"/api/announcements/{announcement_id}")
+    assert detail.json()["detail_status"] == "metadata_only"
+
+
 async def test_import_official_html_extracts_and_analyzes(client, db_engine):
     announcement_id = await _create_pending_announcement(db_engine)
     html = """

@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import re
 from datetime import datetime
-from typing import Any
+from typing import Any, Literal
+from urllib.parse import urlparse
 from zoneinfo import ZoneInfo
 
 from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile
@@ -14,6 +16,7 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import get_db
+from app.browser.pdf_detail import restore_reading_order
 from app.importers.official_document import (
     MAX_UPLOAD_BYTES,
     OfficialDocumentError,
@@ -75,6 +78,29 @@ class RecrawlRequest(BaseModel):
     )
 
 
+class RenderedTextItem(BaseModel):
+    text: str = Field(max_length=20_000)
+    x: float = 0
+    y: float = 0
+    width: float = 0
+    height: float = 0
+
+
+class RenderedCapturePage(BaseModel):
+    page: int = Field(ge=1, le=100)
+    text: str = Field(default="", max_length=200_000)
+    items: list[RenderedTextItem] = Field(default_factory=list, max_length=20_000)
+
+
+class RenderedDetailCaptureRequest(BaseModel):
+    source_name: Literal["cebpub"] = "cebpub"
+    source_item_id: str = Field(pattern=r"^[0-9a-fA-F]{32}$")
+    detail_url: str = Field(min_length=20, max_length=2_000)
+    outer_text: str = Field(min_length=1, max_length=200_000)
+    page_count: int = Field(ge=1, le=100)
+    pages: list[RenderedCapturePage] = Field(min_length=1, max_length=100)
+
+
 _recrawl_guard = asyncio.Lock()
 _active_recrawls: set[str] = set()
 
@@ -98,6 +124,10 @@ def _content_hash(announcement: TenderAnnouncement) -> str:
         f"{announcement.source_url}"
     )
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def _normalise_capture_identity(value: str) -> str:
+    return re.sub(r"[^0-9A-Za-z\u4e00-\u9fff]+", "", value or "").lower()
 
 
 def _base_item(announcement: TenderAnnouncement) -> dict[str, Any]:
@@ -270,6 +300,132 @@ async def list_announcements(
         ],
         "total": int(total),
     }
+
+
+@router.post("/capture-rendered-detail")
+async def capture_rendered_detail(
+    body: RenderedDetailCaptureRequest,
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    """接收用户浏览器中已获准渲染的 PDF.js 文字层。
+
+    此接口不接收 Cookie、storage state 或 PDF 二进制，只保存逐页文字和
+    坐标。页面来源、UUID、外层标题和页码完整性均通过后才进入抽取链路。
+    """
+    parsed = urlparse(body.detail_url)
+    if parsed.scheme != "https" or parsed.netloc.lower() != "ctbpsp.com":
+        raise HTTPException(status_code=422, detail="仅接受 ctbpsp.com 官方详情页")
+    match = re.search(r"(?:[?&])uuid=([0-9a-fA-F]{32})(?:&|$)", body.detail_url)
+    if not match or match.group(1).lower() != body.source_item_id.lower():
+        raise HTTPException(status_code=422, detail="官方详情页 UUID 与采集记录不一致")
+
+    announcement = await db.scalar(
+        select(TenderAnnouncement)
+        .where(
+            TenderAnnouncement.source_name == body.source_name,
+            TenderAnnouncement.source_item_id == body.source_item_id,
+        )
+        .order_by(TenderAnnouncement.updated_at.desc())
+    )
+    if not announcement:
+        raise HTTPException(status_code=404, detail="FusionBid 中没有该官方公告记录")
+    if not await _claim_recrawl(announcement.id):
+        raise HTTPException(status_code=409, detail="该公告正在处理详情，请勿重复提交")
+
+    try:
+        if _normalise_capture_identity(announcement.title) not in _normalise_capture_identity(
+            body.outer_text
+        ):
+            raise HTTPException(
+                status_code=422,
+                detail="官方页面标题与 FusionBid 公告不一致，已拒绝导入",
+            )
+        page_numbers = [row.page for row in body.pages]
+        expected_numbers = list(range(1, body.page_count + 1))
+        if sorted(page_numbers) != expected_numbers or len(set(page_numbers)) != len(
+            page_numbers
+        ):
+            raise HTTPException(
+                status_code=422,
+                detail="PDF 页码不完整或重复，已拒绝把部分正文标记为完整详情",
+            )
+
+        pages: list[dict[str, Any]] = []
+        for row in sorted(body.pages, key=lambda value: value.page):
+            items = [item.model_dump() for item in row.items]
+            text = restore_reading_order(items) if items else row.text.strip()
+            if not text:
+                raise HTTPException(
+                    status_code=422,
+                    detail=f"PDF 第 {row.page} 页没有可用文字",
+                )
+            pages.append(
+                {"page": row.page, "text": text, "method": "browser_text_layer"}
+            )
+
+        clean_content = "\n".join(
+            f"【第{row['page']}页】\n{row['text']}" for row in pages
+        )
+        captured_at = datetime.now(TZ)
+        metadata = dict(announcement.source_metadata or {})
+        metadata.update(
+            {
+                "detail_status": "full",
+                "detail_fetched": True,
+                "detail_url": body.detail_url,
+                "content_format": "pdf_text",
+                "content_pages": pages,
+                "acquisition_mode": "browser_extension",
+                "message": f"已从常用浏览器读取 {len(pages)} 页 PDF.js 文字层",
+                "browser_capture": {
+                    "captured_at": captured_at.isoformat(),
+                    "page_count": body.page_count,
+                    "identity_basis": "official_origin+uuid+page_title",
+                    "cookies_received": False,
+                    "storage_state_received": False,
+                },
+            }
+        )
+        announcement.source_url = body.detail_url
+        announcement.detail_url = body.detail_url
+        announcement.clean_content = clean_content
+        announcement.raw_content = clean_content
+        announcement.detail_status = "full"
+        announcement.content_format = "pdf_text"
+        announcement.source_metadata = metadata
+        announcement.crawl_time = captured_at
+        announcement.extraction_data = await build_extraction_data_with_ai(
+            title=announcement.title,
+            clean_content=clean_content,
+            summary=announcement.summary or "",
+            region=announcement.region,
+            project_code=announcement.project_code,
+            publish_time=announcement.publish_time,
+            detail_status="full",
+            source_metadata=metadata,
+        )
+        announcement.extraction_data = apply_manual_corrections(
+            announcement.extraction_data,
+            await _manual_corrections_for(announcement.id, db),
+        )
+        announcement.extraction_version = "v2"
+        fields = (announcement.extraction_data or {}).get("fields") or {}
+        announcement.project_code = fields.get("project_code") or announcement.project_code
+        announcement.announcement_type = fields.get("announcement_type")
+        announcement.content_hash = _content_hash(announcement)
+        await _analysis_for(announcement, db)
+        await db.commit()
+        await db.refresh(announcement)
+        return {
+            "ok": True,
+            "message": f"已从浏览器采集 {len(pages)} 页正文并完成抽取分析",
+            "acquisition_mode": "browser_extension",
+            "page_count": len(pages),
+            "extraction_version": announcement.extraction_version,
+            "announcement": await _expanded_detail(announcement, db),
+        }
+    finally:
+        await _release_recrawl(announcement.id)
 
 
 @router.get("/{announcement_id}")

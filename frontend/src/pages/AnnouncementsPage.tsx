@@ -153,6 +153,9 @@ export default function AnnouncementsPage() {
   const importCompatible = Boolean(
     healthQuery.data?.capabilities?.includes("official-document-import-v1"),
   );
+  const browserCaptureCompatible = Boolean(
+    healthQuery.data?.capabilities?.includes("browser-rendered-detail-capture-v1"),
+  );
 
   const sourceQuery = useQuery({
     queryKey: ["sources"],
@@ -188,17 +191,28 @@ export default function AnnouncementsPage() {
   });
 
   const actionMutation = useMutation({
-    mutationFn: async (action: "recrawl" | "reextract" | "analyze") => {
+    mutationFn: async (
+      action: "recrawl" | "recrawlInteractive" | "reextract" | "analyze",
+    ) => {
+      const isRecrawl = action === "recrawl" || action === "recrawlInteractive";
+      const endpoint = action === "recrawlInteractive" ? "recrawl" : action;
       const { data } = await apiClient.post(
-        `/api/announcements/${selectedId}/${action}`,
-        action === "recrawl" ? { interactive_on_verification: false } : {},
-        { timeout: action === "recrawl" ? 90000 : 300000 },
+        `/api/announcements/${selectedId}/${endpoint}`,
+        isRecrawl
+          ? { interactive_on_verification: action === "recrawlInteractive" }
+          : {},
+        { timeout: action === "recrawlInteractive" ? 360000 : isRecrawl ? 90000 : 300000 },
       );
       return data;
     },
     onSuccess: (data, action) => {
-      if (action === "recrawl" && data.ok === false) {
-        message.warning(data.message || "本次未获得已验证详情");
+      if ((action === "recrawl" || action === "recrawlInteractive") && data.ok === false) {
+        const detail = [data.failure_reason, data.acquisition_mode]
+          .filter(Boolean)
+          .join(" / ");
+        message.warning(
+          `${data.message || "本次未获得已验证详情"}${detail ? `（${detail}）` : ""}`,
+        );
       } else {
         message.success(data.message || "操作完成");
       }
@@ -296,7 +310,18 @@ export default function AnnouncementsPage() {
         loading={actionMutation.isPending && actionMutation.variables === "recrawl"}
         onClick={() => actionMutation.mutate("recrawl")}
       >
-        自动重新采集
+        无头自动采集
+      </Button>
+      <Button
+        type={detail?.detail_status === "needs_human_verification" ? "primary" : "default"}
+        icon={<ReloadOutlined />}
+        disabled={!recrawlCompatible}
+        loading={
+          actionMutation.isPending && actionMutation.variables === "recrawlInteractive"
+        }
+        onClick={() => actionMutation.mutate("recrawlInteractive")}
+      >
+        可见浏览器采集
       </Button>
       <Button
         disabled={detail?.detail_status !== "full"}
@@ -456,6 +481,24 @@ export default function AnnouncementsPage() {
                   style={{ marginBottom: 16 }}
                   message="正在采集官方详情"
                   description="正在尝试公开详情链路，不会弹出临时浏览器；失败后可在常用浏览器打开官方页并导入下载的 PDF 或 HTML。"
+                />
+              ) : null}
+              {actionMutation.isPending && actionMutation.variables === "recrawlInteractive" ? (
+                <Alert
+                  type="info"
+                  showIcon
+                  style={{ marginBottom: 16 }}
+                  message="正在等待可见浏览器中的官方详情"
+                  description="浏览器最多保持 300 秒；只完成官方页面要求的验证。若站点仍显示空白，请改用常用 Chrome 的 FusionBid 采集扩展。"
+                />
+              ) : null}
+              {detail.detail_status !== "full" && browserCaptureCompatible ? (
+                <Alert
+                  type="warning"
+                  showIcon
+                  style={{ marginBottom: 16 }}
+                  message="自动化浏览器可能被官方站点限制"
+                  description="常用 Chrome 能正常显示公告时，可加载 browser_extension/ctbpsp_capture 扩展，在官方详情页点击扩展完成逐页采集；扩展不会读取或上传 Cookie。"
                 />
               ) : null}
               {!healthQuery.isLoading && (!recrawlCompatible || !importCompatible) ? (

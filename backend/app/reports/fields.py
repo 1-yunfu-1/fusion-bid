@@ -24,14 +24,15 @@ _EXTRACTION_FAILED = "提取失败，待复核"
 _FIELD_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
     ("purchaser", re.compile(
         r"(?:采购人名称|招标人名称|采购人|招标人|采购单位|建设单位|甲方|招标单位)"
-        r"[：:\s]*([^\n。；;]{2,80})"
+        r"(?:[：:][ \t]*|为[ \t]*|是[ \t]*|[ \t]*\n[ \t]*|[ \t]+)"
+        r"([^\n。；;]{2,80})"
     )),
     ("agency", re.compile(
         r"(?:招标代理机构|采购代理机构|委托代理机构|代理机构)"
         r"[：:\s]*([^\n。；;]{2,80})"
     )),
     ("project_code", re.compile(
-        r"(?:项目编号|招标编号|采购编号|公告编号|标段编号)"
+        r"(?:招标项目编号|项目编号|招标编号|采购编号|公告编号|标段编号)"
         r"[：:\s]*([A-Za-z0-9\-_／/（）()]{4,64})"
     )),
     ("budget", re.compile(
@@ -189,8 +190,24 @@ def _split_qualification_items(value: str) -> list[str]:
     if not value:
         return []
     without_page_markers = re.sub(r"(?m)^\s*【第\d+页】\s*$", "", value)
+    # The normalized qualification field is stored as ``3.1 …；3.2 …`` for
+    # display.  Re-extraction must be able to recover that structure instead of
+    # treating the whole joined string as one requirement.
+    without_page_markers = re.sub(
+        r"[；;]\s*(?=\d+\.\d+(?:\.\d+)?(?=\s|[（(“\"、，,:：]|$))",
+        "\n",
+        without_page_markers,
+    )
+    # PDF.js frequently renders the cell value before its label and may leave a
+    # leading colon (":3.1").  A clause number can also be followed immediately
+    # by a parenthesis/quote (for example ``3.2(“...``), so requiring whitespace
+    # after the number merges the whole section into one item.
     top_level = list(
-        re.finditer(r"(?m)^\s*\d+\.\d+(?:\.\d+)?(?:[、．.]|\s)", without_page_markers)
+        re.finditer(
+            r"(?m)^\s*:?[ \t]*(?P<number>\d+\.\d+(?:\.\d+)?)"
+            r"(?=\s|[（(“\"、，,:：]|$)",
+            without_page_markers,
+        )
     )
     if top_level:
         fragments = [
@@ -207,8 +224,14 @@ def _split_qualification_items(value: str) -> list[str]:
             without_page_markers,
         )
     items: list[str] = []
-    for fragment in fragments:
-        cleaned = _clean_capture(fragment)
+    for index, fragment in enumerate(fragments):
+        cleaned = re.sub(r"\s+", " ", fragment.strip())
+        if top_level:
+            number = top_level[index].group("number")
+            cleaned = re.sub(
+                rf"^\s*:?[ \t]*{re.escape(number)}\s*", f"{number} ", cleaned, count=1
+            ).strip()
+        cleaned = cleaned.strip("；;，,。")
         if not cleaned or cleaned in items:
             continue
         items.append(cleaned[:3000])
@@ -219,11 +242,18 @@ def _extract_qualification_section(text: str) -> tuple[str, str, str, list[str]]
     """Extract a multi-line qualification section with a conservative stop condition."""
     if not text:
         return "", "", "", []
+    # PDF 表格文字层常把“3”和“、投标人资格要求”拆成两行。先只在本函数
+    # 的工作副本中合并主章节编号，避免 4、5 等后续章节被资格段吞入。
+    text = re.sub(
+        r"(?m)^\s*(?P<number>[1-9]\d*)\s*\n\s*(?P<punctuation>[、．.])\s*",
+        r"\g<number>\g<punctuation>",
+        text,
+    )
     options = "|".join(
         re.escape(label) for label in sorted(_QUALIFICATION_LABELS, key=len, reverse=True)
     )
     match = re.search(
-        rf"(?m)^\s*(?:\d+[.、．]\s*)?(?P<label>{options})\s*"
+        rf"(?m)^\s*(?:(?:\d+[.、．])|[、．])?\s*(?P<label>{options})\s*"
         rf"(?:[：:]\s*)?(?P<value>.*)$",
         text,
     )
@@ -232,7 +262,10 @@ def _extract_qualification_section(text: str) -> tuple[str, str, str, list[str]]
     lines = [match.group("value").strip()]
     evidence_lines = [match.group(0).strip()]
     start = match.end()
-    for line in text[start:].splitlines()[:40]:
+    # Long international-tender notices routinely have 3.1—3.11 plus nested
+    # certificate clauses.  Forty rendered lines cut the last requirements in
+    # half, even though the next numbered section is an unambiguous boundary.
+    for line in text[start:].splitlines()[:240]:
         stripped = line.strip()
         if not stripped:
             if lines:
@@ -244,12 +277,12 @@ def _extract_qualification_section(text: str) -> tuple[str, str, str, list[str]]
             break
         lines.append(stripped)
         evidence_lines.append(stripped)
-        if sum(len(x) for x in lines) > 5000:
+        if sum(len(x) for x in lines) > 12000:
             break
     raw_value = "\n".join(lines).strip()
     items = _split_qualification_items(raw_value)
-    value = "；".join(items)[:5000] if items else _clean_capture(raw_value)
-    evidence = "\n".join(evidence_lines).strip()[:6000]
+    value = "；".join(items)[:12000] if items else re.sub(r"\s+", " ", raw_value)[:12000]
+    evidence = "\n".join(evidence_lines).strip()[:14000]
     return value or "", match.group("label"), evidence, items
 
 
@@ -278,7 +311,7 @@ def _extract_semantic_value(
     for label in labels:
         match = re.search(
             rf"(?P<label>{re.escape(label)})[ \t]*(?:[：:][ \t]*|为[ \t]*|"
-            rf"是[ \t]*|[ \t]+)"
+            rf"是[ \t]*|[ \t]*\n[ \t]*|[ \t]+)"
             rf"(?P<value>[^\n，,。；;]{{1,{limit}}})",
             text or "",
         )
@@ -287,6 +320,126 @@ def _extract_semantic_value(
                 _clean_capture(match.group("value")),
                 match.group("label"),
                 _clean_capture(match.group(0)),
+            )
+        # Coordinate-restored PDF cells may concatenate a label and value on a
+        # dedicated line (``招标人中国核电工程有限公司``).  Keep this fallback
+        # line-anchored so prose such as ``受招标人委托`` is never treated as a
+        # purchaser value.
+        concatenated = re.search(
+            rf"(?m)^\s*(?P<label>{re.escape(label)})(?P<value>[^\n，,。；;]{{2,{limit}}})\s*$",
+            text or "",
+        )
+        if concatenated:
+            return (
+                _clean_capture(concatenated.group("value")),
+                concatenated.group("label"),
+                _clean_capture(concatenated.group(0)),
+            )
+    return "", "", ""
+
+
+def _extract_date_around_field_label(
+    text: str, labels: Sequence[str]
+) -> tuple[str, str, str]:
+    """读取字段标签同一行或相邻行的日期，兼容 PDF 表格“值在标签上方”。"""
+    options = "|".join(re.escape(label) for label in sorted(labels, key=len, reverse=True))
+    label_pattern = re.compile(
+        rf"^\s*(?P<label>{options})"
+        r"(?:\s*[（(][^）)\n]{0,30}[）)])?\s*"
+        r"(?:为|是|定于|[：:])?\s*(?P<tail>.*)$"
+    )
+    date_pattern = re.compile(
+        r"(?P<value>20\d{2}\s*[年\-/]\s*\d{1,2}\s*[月\-/]\s*\d{1,2}日?"
+        r"(?:\s*\d{1,2}\s*[时:]\s*\d{1,2}\s*分?)?)"
+    )
+    lines = (text or "").splitlines()
+    for index, line in enumerate(lines):
+        label_match = label_pattern.match(line)
+        if not label_match:
+            continue
+        candidates = [(label_match.group("tail"), index)]
+        if index > 0:
+            candidates.append((lines[index - 1], index - 1))
+        if index + 1 < len(lines):
+            candidates.append((lines[index + 1], index + 1))
+        for candidate, candidate_index in candidates:
+            date_match = date_pattern.search(candidate)
+            if not date_match:
+                continue
+            start = min(index, candidate_index)
+            end = max(index, candidate_index)
+            quote = _clean_capture("\n".join(lines[start : end + 1]))
+            return (
+                _normalise_datetime_text(date_match.group("value")),
+                label_match.group("label"),
+                quote,
+            )
+    return "", "", ""
+
+
+def _extract_reversed_document_price(text: str) -> tuple[str, str, str]:
+    """兼容 PDF 表格中“:200/$30”位于“招标文件售价￥”上一行。"""
+    lines = (text or "").splitlines()
+    pattern = re.compile(r"^\s*(?P<label>招标文件售价|文件售价)")
+    amount = re.compile(
+        r"(?P<value>(?:[￥¥]\s*)?\d+(?:\.\d+)?(?:\s*(?:元|万元))?"
+        r"(?:\s*/\s*\$\s*\d+(?:\.\d+)?)?)"
+    )
+    for index, line in enumerate(lines):
+        label_match = pattern.match(line)
+        if not label_match:
+            continue
+        candidates = [line[label_match.end() :]]
+        if index > 0:
+            candidates.append(lines[index - 1])
+        if index + 1 < len(lines):
+            candidates.append(lines[index + 1])
+        for candidate in candidates:
+            value_match = amount.search(candidate.lstrip(":： "))
+            if value_match:
+                value = _clean_capture(value_match.group("value"))
+                if value:
+                    quote_start = max(0, index - 1)
+                    quote_end = min(len(lines), index + 2)
+                    return (
+                        value,
+                        label_match.group("label"),
+                        _clean_capture("\n".join(lines[quote_start:quote_end])),
+                    )
+    return "", "", ""
+
+
+def _extract_code_around_field_label(
+    text: str, labels: Sequence[str]
+) -> tuple[str, str, str]:
+    """读取编号标签同一行或相邻行的值，兼容 PDF 表格“值在标签上方”。"""
+    options = "|".join(re.escape(label) for label in sorted(labels, key=len, reverse=True))
+    label_pattern = re.compile(
+        rf"^\s*(?P<label>{options})\s*(?:[：:]\s*)?(?P<tail>.*)$"
+    )
+    code_pattern = re.compile(
+        r"(?<![A-Za-z0-9])(?P<value>[A-Za-z0-9][A-Za-z0-9_\-/]{3,63})(?![A-Za-z0-9])"
+    )
+    lines = (text or "").splitlines()
+    for index, line in enumerate(lines):
+        label_match = label_pattern.match(line)
+        if not label_match:
+            continue
+        candidates = [(label_match.group("tail"), index)]
+        if index > 0:
+            candidates.append((lines[index - 1], index - 1))
+        if index + 1 < len(lines):
+            candidates.append((lines[index + 1], index + 1))
+        for candidate, candidate_index in candidates:
+            code_match = code_pattern.search(candidate)
+            if not code_match:
+                continue
+            start = min(index, candidate_index)
+            end = max(index, candidate_index)
+            return (
+                code_match.group("value"),
+                label_match.group("label"),
+                _clean_capture("\n".join(lines[start : end + 1])),
             )
     return "", "", ""
 
@@ -469,7 +622,9 @@ def extract_fields(
         "tenderer_source_label": _MISSING,
         "agency": _MISSING,
         "transaction_platform": _MISSING,
-        "project_code": (project_code or "").strip() or _MISSING,
+        # The list API value is only a fallback.  A verified detail document's
+        # explicitly labelled project number has higher evidentiary priority.
+        "project_code": _MISSING,
         "budget": _MISSING,
         "document_price": _MISSING,
         "funding_source": _MISSING,
@@ -529,8 +684,6 @@ def extract_fields(
         out["project_name"] = title.strip()
 
     for key, pat in _FIELD_PATTERNS:
-        if key == "project_code" and out["project_code"] != _MISSING:
-            continue
         if key == "region_line" and out["region"] != _MISSING:
             continue
         if key == "purchaser" and out["purchaser"] != _MISSING:
@@ -566,6 +719,20 @@ def extract_fields(
                         "confidence": "pattern",
                     },
                 )
+
+    code_labels = ("招标项目编号", "项目编号", "招标编号", "采购编号", "公告编号", "标段编号")
+    value, label, quote = _extract_code_around_field_label(clean_content, code_labels)
+    if not value:
+        value, label, quote = _extract_code_around_field_label(blob, code_labels)
+    if value:
+        out["project_code"] = value
+        out["field_evidence"]["project_code"] = {
+            "source_label": label,
+            "quote": quote,
+            "confidence": "adjacent_pdf_cell",
+        }
+    if out["project_code"] == _MISSING and (project_code or "").strip():
+        out["project_code"] = str(project_code).strip()
 
     # v2 语义字段：相似名词必须分开提取，不使用「交易平台」作为代理机构，
     # 也不使用「公告结束时间」作为投标截止时间。
@@ -612,7 +779,6 @@ def extract_fields(
         ("agency", ("招标代理机构", "采购代理机构", "委托代理机构", "代理机构")),
         ("transaction_platform", ("交易平台", "电子招标投标交易平台", "发布媒介")),
         ("funding_source", ("项目资金来源", "资金来源")),
-        ("document_price", ("招标文件每套售价", "文件售价", "招标文件售价")),
         ("notice_end_time", ("公告结束时间", "公告截止时间")),
     ]
     for field_name, labels in semantic_specs:
@@ -674,6 +840,15 @@ def extract_fields(
                 "quote": _clean_capture(price_match.group(0)),
                 "confidence": "direct_label",
             }
+    if out["document_price"] == _MISSING:
+        price, label, quote = _extract_reversed_document_price(blob)
+        if price:
+            out["document_price"] = price
+            out["field_evidence"]["document_price"] = {
+                "source_label": label,
+                "quote": quote,
+                "confidence": "adjacent_pdf_cell",
+            }
 
     date_specs: list[tuple[str, Sequence[str]]] = [
         (
@@ -688,7 +863,7 @@ def extract_fields(
         ("opening_time", ("开标时间", "开标日期")),
     ]
     for field_name, labels in date_specs:
-        value, label, quote = _extract_date_after_labels(blob, labels)
+        value, label, quote = _extract_date_around_field_label(blob, labels)
         if not value:
             continue
         out[field_name] = value
@@ -697,6 +872,16 @@ def extract_fields(
             "quote": quote,
             "confidence": "direct_label",
         }
+    if (
+        out["opening_time"] == _MISSING
+        and out["bid_deadline"] != _MISSING
+        and re.search(r"(?m)^\s*投标截止时间\s*[（(]开标时间[）)]", blob)
+    ):
+        out["opening_time"] = out["bid_deadline"]
+        out["field_evidence"]["opening_time"] = dict(
+            out["field_evidence"]["bid_deadline"]
+        )
+        out["field_evidence"]["opening_time"]["source_label"] = "投标截止时间（开标时间）"
     if out["bid_deadline"] != _MISSING:
         out["deadline"] = out["bid_deadline"]
         out["field_evidence"]["deadline"] = dict(
@@ -725,6 +910,26 @@ def extract_fields(
                 "quote": quote,
                 "confidence": "direct_range",
             }
+    for field_name, labels in (
+        (
+            "document_acquisition_start",
+            ("招标文件领购开始时间", "招标文件获取开始时间"),
+        ),
+        (
+            "document_acquisition_end",
+            ("招标文件领购结束时间", "招标文件获取结束时间"),
+        ),
+    ):
+        if out[field_name] != _MISSING:
+            continue
+        value, label, quote = _extract_date_around_field_label(blob, labels)
+        if value:
+            out[field_name] = value
+            out["field_evidence"][field_name] = {
+                "source_label": label,
+                "quote": quote,
+                "confidence": "adjacent_pdf_cell",
+            }
 
     # 资格章节的强约束单独标准化，同时保留完整 3.1—3.n 原文条款。
     qualification_text = "\n".join(out.get("qualification_items") or [])
@@ -740,7 +945,11 @@ def extract_fields(
             out["agent_allowed"] = "允许"
         elif re.search(r"不接受.{0,15}(代理商|代理人)", qualification_text):
             out["agent_allowed"] = "不允许"
-        if re.search(r"平台.{0,20}(注册|登记)|(注册|登记).{0,20}平台", qualification_text):
+        if re.search(
+            r"(?:平台|招标网).{0,40}(?:注册|登记|核验)|"
+            r"(?:注册|登记|核验).{0,40}(?:平台|招标网)",
+            qualification_text,
+        ):
             out["platform_registration_required"] = "需要"
         if re.search(r"\bCA\b|数字证书|电子签章", qualification_text, re.I):
             out["ca_required"] = "需要"
@@ -976,6 +1185,31 @@ def _validate_ai_extraction_rows(
         if compact_value not in compact_quote and compact_value not in whole_compact:
             errors.append(f"{name}: value 无法在原文中定位")
             continue
+        if name in {"purchaser", "tenderer"}:
+            compact_label = re.sub(r"\s+", "", label)
+            allowed_labels = {re.sub(r"\s+", "", value) for value in _PURCHASER_LABELS}
+            if name == "tenderer":
+                allowed_labels.add("项目业主")
+            if compact_label not in allowed_labels:
+                errors.append(f"{name}: source_label 不是采购人/招标人原文标签")
+                continue
+        if name in {"bid_deadline", "opening_time"}:
+            labels = (
+                (
+                    "投标文件递交的截止时间",
+                    "投标截止时间",
+                    "递交投标文件截止时间",
+                    "投标截止",
+                )
+                if name == "bid_deadline"
+                else ("开标时间", "开标日期")
+            )
+            deterministic_value, _, _ = _extract_date_around_field_label(
+                clean_content, labels
+            )
+            if deterministic_value and _normalise_datetime_text(value) != deterministic_value:
+                errors.append(f"{name}: 与明确字段标签相邻的日期不一致")
+                continue
         valid.append(
             {
                 "name": name,
@@ -1149,6 +1383,8 @@ async def build_extraction_data_with_ai(
         ):
             continue
         fields[name] = value
+        if name in {"purchaser", "tenderer"}:
+            fields[f"{name}_source_label"] = row["source_label"]
         applied_fields.append(name)
         record = _evidence_record(
             field_name=name,
@@ -1171,16 +1407,29 @@ async def build_extraction_data_with_ai(
             evidence["deadline"] = dict(evidence["bid_deadline"])
             result["field_records"]["deadline"] = dict(evidence["bid_deadline"])
     if fields.get("qualification") not in {_MISSING, _DETAIL_UNAVAILABLE, "", None}:
-        fields["qualification_items"] = _split_qualification_items(fields["qualification"])
-    if fields.get("purchaser") in {
+        parsed_items = _split_qualification_items(fields["qualification"])
+        existing_items = fields.get("qualification_items") or []
+        # Rule extraction runs on the original line-preserving source and can be
+        # more complete than an AI quote or a display-normalized joined string.
+        if len(parsed_items) >= len(existing_items):
+            fields["qualification_items"] = parsed_items
+    purchaser_label = re.sub(
+        r"\s+", "", str(evidence.get("purchaser", {}).get("source_label") or "")
+    )
+    tenderer_available = fields.get("tenderer") not in {
+        _MISSING,
+        _DETAIL_UNAVAILABLE,
+        "",
+        None,
+    }
+    purchaser_needs_tenderer = fields.get("purchaser") in {
         _MISSING,
         _DETAIL_UNAVAILABLE,
         _EXTRACTION_FAILED,
         "",
         None,
-    } and fields.get(
-        "tenderer"
-    ) not in {_MISSING, _DETAIL_UNAVAILABLE, "", None}:
+    } or (tenderer_available and "采购人" not in purchaser_label)
+    if purchaser_needs_tenderer and tenderer_available:
         fields["purchaser"] = fields["tenderer"]
         fields["purchaser_source_label"] = (
             evidence.get("tenderer", {}).get("source_label") or "招标人"

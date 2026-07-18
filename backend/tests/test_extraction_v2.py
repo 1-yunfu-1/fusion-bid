@@ -8,10 +8,24 @@ from app.browser.pdf_detail import _extract_rendered_text_pages, restore_reading
 from app.deduplication.engine import CandidateRecord, is_duplicate
 from app.reports.fields import (
     _ai_source_chunks,
+    _split_qualification_items,
     _validate_ai_extraction_rows,
     build_extraction_data,
     enrich_report_item,
 )
+
+
+def test_joined_qualification_field_can_be_split_back_into_clauses():
+    items = _split_qualification_items(
+        "3.1 依法注册；3.2(‘合格来源国’)均可投标；3.10 应具备核级许可证；3.11 不得在黑名单内"
+    )
+
+    assert [item.split(maxsplit=1)[0] for item in items] == [
+        "3.1",
+        "3.2",
+        "3.10",
+        "3.11",
+    ]
 
 
 SAMPLE = """
@@ -114,6 +128,97 @@ def test_ai_value_without_exact_source_evidence_is_rejected():
     )
     assert valid == []
     assert errors
+
+
+def test_ai_purchaser_requires_real_source_label():
+    content = "中国原子能工业有限公司受招标人委托对下列产品进行招标"
+    valid, errors = _validate_ai_extraction_rows(
+        {
+            "fields": [
+                {
+                    "name": "purchaser",
+                    "value": "委托对下列产品进行招标",
+                    "source_label": "purchaser",
+                    "quote": "招标人委托对下列产品进行招标",
+                    "page": 1,
+                }
+            ]
+        },
+        clean_content=content,
+        source_metadata={"content_pages": [{"page": 1, "text": content}]},
+    )
+    assert valid == []
+    assert any("source_label" in error for error in errors)
+
+
+def test_international_pdf_reversed_cells_extract_complete_fields():
+    content = """
+【第1页】
+澄清或变更简要说明：修改投标截止时间
+2026-07-17
+中国原子能工业有限公司受招标人委托对下列产品及服务进行国际公开竞争性招标。
+:0739-264CNEIC2M09
+招标项目编号
+3
+、投标人资格要求
+:3.1
+投标人是响应招标并参加投标竞争的法人或其他组织。
+3.2
+来自合格来源国或地区的法人或其他组织均可投标。
+3.7
+投标人须在中国国际招标网成功注册并核验。
+3.8
+本次招标不接受联合体投标。
+3.9
+本次招标不接受代理商投标。
+3.10
+核级稳压器安全阀制造商应取得相应设计及制造许可证。
+3.11
+投标人不得处于供应商黑名单有效期内。
+4
+、招标文件的获取
+:2026-05-09
+招标文件领购开始时间
+:2026-05-15
+招标文件领购结束时间
+:200/$30
+招标文件售价￥
+5
+、投标文件的递交
+:2026-08-11 09:30
+投标截止时间（开标时间）
+6
+、联系方式
+:
+招标人中国核电工程有限公司
+:
+招标代理机构中国原子能工业有限公司
+【第2页】
+联系人：吴女士
+""".strip()
+    extraction = build_extraction_data(
+        title="华能霞浦核电项目安全阀设备国际招标澄清或变更公告(9)",
+        clean_content=content,
+        project_code="0739-264CNEIC2M09000",
+        detail_status="full",
+        source_metadata={"content_pages": [{"page": 1, "text": content}]},
+    )
+    fields = extraction["fields"]
+    assert fields["tenderer"] == "中国核电工程有限公司"
+    assert fields["purchaser"] == "中国核电工程有限公司"
+    assert fields["purchaser_source_label"] == "招标人"
+    assert fields["tenderer_source_label"] == "招标人"
+    assert fields["agency"] == "中国原子能工业有限公司"
+    assert fields["project_code"] == "0739-264CNEIC2M09"
+    assert fields["bid_deadline"] == "2026年8月11日 09:30"
+    assert fields["opening_time"] == "2026年8月11日 09:30"
+    assert fields["document_acquisition_start"] == "2026年5月9日"
+    assert fields["document_acquisition_end"] == "2026年5月15日"
+    assert fields["document_price"] == "200/$30"
+    assert fields["platform_registration_required"] == "需要"
+    assert len(fields["qualification_items"]) == 7
+    assert fields["qualification_items"][0].startswith("3.1")
+    assert fields["qualification_items"][-1].startswith("3.11")
 
 
 def test_pdf_reading_order_removes_same_coordinate_duplicates():

@@ -38,6 +38,7 @@ async def health_check() -> HealthResponse:
             "interactive-detail-recrawl-v1",
             "official-document-import-v1",
             "pdfjs-text-layer-capture-v1",
+            "browser-rendered-detail-capture-v1",
         ],
         message="服务正常" if db_ok else "数据库连接异常",
     )
