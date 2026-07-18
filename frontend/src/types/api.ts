@@ -15,6 +15,10 @@ export interface HealthResponse {
     engine?: string | null;
     profile_ready: boolean;
     last_error?: string | null;
+    pool_size?: number;
+    active_workers?: number;
+    queue_size?: number;
+    adaptive_mode?: boolean;
   };
   message: string;
 }

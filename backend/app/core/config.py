@@ -81,6 +81,15 @@ class Settings(BaseSettings):
     cebpub_browser_timeout_seconds: int = Field(
         default=60, ge=15, le=300, alias="CEBPUB_BROWSER_TIMEOUT_SECONDS"
     )
+    cebpub_browser_concurrency: int = Field(
+        default=2, ge=1, le=4, alias="CEBPUB_BROWSER_CONCURRENCY"
+    )
+    llm_extraction_concurrency: int = Field(
+        default=2, ge=1, le=8, alias="LLM_EXTRACTION_CONCURRENCY"
+    )
+    cebpub_site_block_threshold: int = Field(
+        default=2, ge=1, le=5, alias="CEBPUB_SITE_BLOCK_THRESHOLD"
+    )
 
     # --- 登录态数据源（Playwright 手动登录 + storage state）---
     login_source_enabled: bool = Field(default=True, alias="LOGIN_SOURCE_ENABLED")

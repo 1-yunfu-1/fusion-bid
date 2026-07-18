@@ -43,11 +43,13 @@ class ManagedPublicBrowserError(RuntimeError):
     """专用公开站点浏览器不可用。"""
 
 
-@dataclass(frozen=True)
+@dataclass
 class ManagedBrowserLease:
     context: Any
+    page: Any
     reused: bool
     engine: str
+    interactive: bool = False
 
 
 def _free_loopback_port() -> int:
@@ -108,7 +110,7 @@ def _process_executable(pid: int) -> Path | None:
 
 
 class ManagedPublicBrowser:
-    """延迟启动、串行复用并安全关闭专用 Chrome/Edge。"""
+    """延迟启动、有限并行复用并安全关闭专用 Chrome/Edge。"""
 
     def __init__(self) -> None:
         settings = get_settings()
@@ -122,8 +124,16 @@ class ManagedPublicBrowser:
         self._process: subprocess.Popen | None = None
         self._playwright: Any = None
         self._browser: Any = None
-        self._work_page: Any = None
-        self._operation_lock = asyncio.Lock()
+        self._pool_size = settings.cebpub_browser_concurrency
+        self._available_pages: list[Any] = []
+        self._leased_page_ids: set[int] = set()
+        self._page_lock = asyncio.Lock()
+        self._lease_condition = asyncio.Condition()
+        self._active_auto = 0
+        self._interactive_active = False
+        self._interactive_waiters = 0
+        self._queued_leases = 0
+        self._adaptive_mode = False
         self._lifecycle_lock = asyncio.Lock()
 
     @property
@@ -158,6 +168,10 @@ class ManagedPublicBrowser:
             "engine": self._engine,
             "profile_ready": profile_ready,
             "last_error": last_error,
+            "pool_size": self._pool_size,
+            "active_workers": self._active_auto + int(self._interactive_active),
+            "queue_size": self._queued_leases,
+            "adaptive_mode": self._adaptive_mode,
         }
 
     async def _cdp_ready(self, port: int, timeout_seconds: float = 20) -> bool:
@@ -198,7 +212,8 @@ class ManagedPublicBrowser:
             raise
         self._playwright = playwright
         self._browser = browser
-        self._work_page = None
+        self._available_pages.clear()
+        self._leased_page_ids.clear()
 
     def _read_runtime(self) -> dict[str, Any] | None:
         try:
@@ -337,26 +352,91 @@ class ManagedPublicBrowser:
                 await self._disconnect_playwright()
                 raise ManagedPublicBrowserError(self._last_error) from exc
 
-    async def get_work_page(self, context):
-        """复用固定工作页，避免每次采集都闪现并关闭一个浏览器窗口。"""
-        page = self._work_page
-        if page is not None:
+    async def _checkout_page(self, context):
+        """为每个租约分配独立工作页，杜绝并发公告共享同一 PDF iframe。"""
+        async with self._page_lock:
+            while self._available_pages:
+                page = self._available_pages.pop()
+                try:
+                    if page.is_closed():
+                        continue
+                except Exception:  # noqa: BLE001
+                    continue
+                self._leased_page_ids.add(id(page))
+                return page
+
             try:
-                if not page.is_closed():
-                    return page
+                candidates = [
+                    page
+                    for page in context.pages
+                    if id(page) not in self._leased_page_ids and not page.is_closed()
+                ]
             except Exception:  # noqa: BLE001
-                pass
-        available = []
+                candidates = []
+            page = candidates[0] if candidates else await context.new_page()
+            self._leased_page_ids.add(id(page))
+            return page
+
+    async def _return_page(self, page: Any) -> None:
+        async with self._page_lock:
+            self._leased_page_ids.discard(id(page))
+            try:
+                reusable = self.is_connected and not page.is_closed()
+            except Exception:  # noqa: BLE001
+                reusable = False
+            if reusable and all(existing is not page for existing in self._available_pages):
+                self._available_pages.append(page)
+
+    async def replace_page(self, lease: ManagedBrowserLease) -> Any:
+        """只重建发生失败的工作页，不影响同池的其他公告或浏览器进程。"""
+        old_page = lease.page
+        async with self._page_lock:
+            self._leased_page_ids.discard(id(old_page))
+            new_page = await lease.context.new_page()
+            self._leased_page_ids.add(id(new_page))
+            lease.page = new_page
         try:
-            available = [
-                candidate
-                for candidate in context.pages
-                if not candidate.is_closed()
-            ]
+            if not old_page.is_closed():
+                await old_page.close()
         except Exception:  # noqa: BLE001
-            available = []
-        self._work_page = available[0] if available else await context.new_page()
-        return self._work_page
+            pass
+        return new_page
+
+    async def _reserve_lease(self, *, interactive: bool) -> None:
+        async with self._lease_condition:
+            self._queued_leases += 1
+            if interactive:
+                self._interactive_waiters += 1
+            try:
+                if interactive:
+                    await self._lease_condition.wait_for(
+                        lambda: not self._interactive_active and self._active_auto == 0
+                    )
+                    self._interactive_waiters -= 1
+                    self._interactive_active = True
+                else:
+                    await self._lease_condition.wait_for(
+                        lambda: (
+                            not self._interactive_active
+                            and self._interactive_waiters == 0
+                            and self._active_auto < self._pool_size
+                        )
+                    )
+                    self._active_auto += 1
+            except BaseException:
+                if interactive:
+                    self._interactive_waiters = max(0, self._interactive_waiters - 1)
+                raise
+            finally:
+                self._queued_leases = max(0, self._queued_leases - 1)
+
+    async def _release_lease(self, *, interactive: bool) -> None:
+        async with self._lease_condition:
+            if interactive:
+                self._interactive_active = False
+            else:
+                self._active_auto = max(0, self._active_auto - 1)
+            self._lease_condition.notify_all()
 
     async def _bring_to_front(self) -> None:
         if os.name != "nt" or not self._pid:
@@ -385,29 +465,49 @@ class ManagedPublicBrowser:
 
     @asynccontextmanager
     async def acquire(self, *, interactive: bool = False) -> AsyncIterator[ManagedBrowserLease]:
-        """串行租用默认上下文，避免并发标签触发站点风控。"""
-        async with self._operation_lock:
+        """自动采集有界并行；人工验证独占整个专用浏览器。"""
+        await self._reserve_lease(interactive=interactive)
+        page = None
+        lease: ManagedBrowserLease | None = None
+        try:
             reused = await self.ensure_started()
             if interactive:
                 await self._bring_to_front()
+            context = self._browser.contexts[0]
+            page = await self._checkout_page(context)
             self._state = "busy"
-            try:
-                yield ManagedBrowserLease(
-                    context=self._browser.contexts[0],
-                    reused=reused,
-                    engine=self._engine or "chromium",
-                )
-            finally:
-                if self._state == "busy":
-                    self._state = "ready" if self.is_connected else "unavailable"
+            lease = ManagedBrowserLease(
+                context=context,
+                page=page,
+                reused=reused,
+                engine=self._engine or "chromium",
+                interactive=interactive,
+            )
+            yield lease
+        finally:
+            return_page = lease.page if lease is not None else page
+            if return_page is not None:
+                await self._return_page(return_page)
+            await self._release_lease(interactive=interactive)
+            if self._state != "needs_verification":
+                if not self.is_connected:
+                    self._state = "unavailable"
+                elif self._active_auto or self._interactive_active:
+                    self._state = "busy"
+                else:
+                    self._state = "ready"
 
     def mark_needs_verification(self) -> None:
         self._state = "needs_verification"
 
+    def set_adaptive_mode(self, enabled: bool) -> None:
+        self._adaptive_mode = bool(enabled)
+
     async def _disconnect_playwright(self, *, close_browser: bool = False) -> None:
         browser = self._browser
         playwright = self._playwright
-        self._work_page = None
+        self._available_pages.clear()
+        self._leased_page_ids.clear()
         self._browser = None
         self._playwright = None
         if close_browser and browser:

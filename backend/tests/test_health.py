@@ -18,6 +18,7 @@ async def test_health_ok(client: AsyncClient):
     assert "pdfjs-text-layer-capture-v1" in data["capabilities"]
     assert "browser-rendered-detail-capture-v1" in data["capabilities"]
     assert "managed-public-browser-v1" in data["capabilities"]
+    assert "managed-public-browser-pool-v2" in data["capabilities"]
     assert data["public_browser"]["state"] in {
         "not_started",
         "starting",
@@ -28,6 +29,8 @@ async def test_health_ok(client: AsyncClient):
     }
     assert "port" not in data["public_browser"]
     assert "profile_dir" not in data["public_browser"]
+    assert data["public_browser"]["pool_size"] == 2
+    assert data["public_browser"]["active_workers"] == 0
     assert "Asia/Shanghai" in data["timezone"]
     assert data["phase"] == "phase8-integration"
 

@@ -46,6 +46,10 @@ type AnnouncementRow = {
   attachment_links?: string[];
   related_sources?: unknown[];
   project_code?: string;
+  detail_attempt_state?: "not_attempted" | "attempted" | "blocked" | string;
+  failure_reason?: string | null;
+  failure_stage?: string | null;
+  source_metadata?: Record<string, unknown>;
 };
 
 type Evidence = {
@@ -148,7 +152,7 @@ export default function AnnouncementsPage() {
   const [correctionForm] = Form.useForm();
   const healthQuery = useQuery({ queryKey: ["health"], queryFn: fetchHealth });
   const recrawlCompatible = Boolean(
-    healthQuery.data?.capabilities?.includes("managed-public-browser-v1"),
+    healthQuery.data?.capabilities?.includes("managed-public-browser-pool-v2"),
   );
   const importCompatible = Boolean(
     healthQuery.data?.capabilities?.includes("official-document-import-v1"),
@@ -430,9 +434,14 @@ export default function AnnouncementsPage() {
             { title: "来源", dataIndex: "source_name", width: 100 },
             {
               title: "详情质量",
-              dataIndex: "detail_status",
               width: 150,
-              render: statusTag,
+              render: (_: unknown, row: AnnouncementRow) => (
+                row.detail_attempt_state === "not_attempted"
+                  ? <Tag>未尝试</Tag>
+                  : row.detail_attempt_state === "blocked"
+                    ? <Tag color="warning">站点阻断</Tag>
+                    : statusTag(row.detail_status)
+              ),
             },
             { title: "格式", dataIndex: "content_format", width: 100, render: valueText },
             { title: "项目编号", dataIndex: "project_code", width: 190, render: valueText },
@@ -499,6 +508,24 @@ export default function AnnouncementsPage() {
                   style={{ marginBottom: 16 }}
                   message="官方页面要求人工安全验证"
                   description="正常公开页会完全自动处理；仅在官方明确要求验证码时，使用上方按钮打开 FusionBid 专用浏览器完成一次验证。"
+                />
+              ) : null}
+              {detail.detail_attempt_state === "not_attempted" ? (
+                <Alert
+                  type="info"
+                  showIcon
+                  style={{ marginBottom: 16 }}
+                  message="该详情尚未实际尝试采集"
+                  description="这是旧记录或本轮断路后保留的列表元数据，不应计入真实采集失败。"
+                />
+              ) : null}
+              {detail.failure_reason ? (
+                <Alert
+                  type="warning"
+                  showIcon
+                  style={{ marginBottom: 16 }}
+                  message="最近一次采集诊断"
+                  description={`${detail.failure_stage || "unknown"} / ${detail.failure_reason}`}
                 />
               ) : null}
               {publicBrowserState === "unavailable" ? (

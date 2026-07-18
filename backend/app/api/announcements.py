@@ -131,6 +131,16 @@ def _normalise_capture_identity(value: str) -> str:
 
 
 def _base_item(announcement: TenderAnnouncement) -> dict[str, Any]:
+    metadata = announcement.source_metadata or {}
+    last_recrawl = metadata.get("last_recrawl") or {}
+    attempt_state = metadata.get("detail_attempt_state")
+    if not attempt_state:
+        if announcement.detail_status == "full":
+            attempt_state = "attempted"
+        elif last_recrawl:
+            attempt_state = "blocked" if last_recrawl.get("site_blocked") else "attempted"
+        else:
+            attempt_state = "not_attempted"
     return {
         "announcement_id": announcement.id,
         "id": announcement.id,
@@ -160,7 +170,12 @@ def _base_item(announcement: TenderAnnouncement) -> dict[str, Any]:
         "content_format": announcement.content_format,
         "extraction_version": announcement.extraction_version,
         "announcement_type": announcement.announcement_type,
-        "source_metadata": announcement.source_metadata or {},
+        "source_metadata": metadata,
+        "detail_attempt_state": attempt_state,
+        "failure_reason": last_recrawl.get("failure_reason")
+        or metadata.get("failure_reason"),
+        "failure_stage": last_recrawl.get("failure_stage")
+        or metadata.get("failure_stage"),
         "extraction_data": announcement.extraction_data or {},
         "analysis_data": announcement.analysis_data or {},
         "project_code": announcement.project_code,
@@ -677,6 +692,18 @@ async def _recrawl_announcement(
             "acquisition_mode": acquisition_mode,
             "browser_reused": browser_reused,
             "browser_state": browser_state,
+            "detail_attempt_state": (detail.source_metadata or {}).get(
+                "detail_attempt_state", "attempted"
+            ),
+            "failure_stage": (detail.source_metadata or {}).get("failure_stage"),
+            "attempt_count": (detail.source_metadata or {}).get("attempt_count", 0),
+            "duration_ms": (detail.source_metadata or {}).get("duration_ms", 0),
+            "validation_signals": (detail.source_metadata or {}).get(
+                "validation_signals", {}
+            ),
+            "site_blocked": bool(
+                (detail.source_metadata or {}).get("site_blocked", False)
+            ),
         }
         announcement.source_metadata = metadata
         if not previous_full:
@@ -705,6 +732,15 @@ async def _recrawl_announcement(
         "browser_state": browser_state,
         "verification_attempted": verification_attempted,
         "failure_reason": (detail.source_metadata or {}).get("failure_reason"),
+        "failure_stage": (detail.source_metadata or {}).get("failure_stage"),
+        "attempt_count": (detail.source_metadata or {}).get("attempt_count", 0),
+        "duration_ms": (detail.source_metadata or {}).get("duration_ms", 0),
+        "validation_signals": (detail.source_metadata or {}).get(
+            "validation_signals", {}
+        ),
+        "site_blocked": bool(
+            (detail.source_metadata or {}).get("site_blocked", False)
+        ),
         "announcement": await _expanded_detail(announcement, db),
     }
 

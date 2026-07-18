@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
+import sys
 from contextlib import asynccontextmanager
 from types import SimpleNamespace
 
@@ -15,9 +17,30 @@ from app.browser.managed_public import ManagedPublicBrowser
 from app.browser.pdf_detail import PublicPdfDetail
 
 
+class _FakePage:
+    def __init__(self) -> None:
+        self.closed = False
+
+    def is_closed(self) -> bool:
+        return self.closed
+
+    async def close(self) -> None:
+        self.closed = True
+
+
+class _FakeContext:
+    def __init__(self) -> None:
+        self.pages = [_FakePage()]
+
+    async def new_page(self):
+        page = _FakePage()
+        self.pages.append(page)
+        return page
+
+
 class _FakeBrowser:
     def __init__(self) -> None:
-        self.contexts = [object()]
+        self.contexts = [_FakeContext()]
         self.connected = True
         self.closed = False
 
@@ -73,6 +96,49 @@ def test_pdf_title_identity_rejects_unrelated_document():
     )
 
 
+@pytest.mark.parametrize(
+    ("outer_title", "pdf_text", "project_code"),
+    [
+        (
+            "华能霞浦核电项目压水堆一期工程高位排气阀设备采购项目重新招标澄清或变更公告(1)",
+            "项目名称：华能霞浦核电项目压水堆一期工程高位排气阀设备采购项目。招标编号：0739-264Z0008CNPE",
+            "0739-264Z0008CNPE000",
+        ),
+        (
+            "供销物流系统无卡化等项目服务器、电脑招标公告（电子标）",
+            "项目名称：供销物流系统无卡化等项目服务器、电脑。招标人：安徽海螺信息技术工程有限责任公司",
+            None,
+        ),
+        (
+            "中国融通集团信息技术有限公司纪检项目算力服务器采购项目招标公告",
+            "本项目 纪检项目算力服务器采购项目（项目编号：GKZB07202607150001），招标人为中国融通集团信息技术有限公司。",
+            "M1101085050001211001",
+        ),
+        (
+            "中国融通集团信息技术有限公司2025年纪检项目测试服务器采购项目询比采购公告",
+            "本项目 2025年纪检项目测试服务器采购项目（项目编号：XBCG07202607150001），采购人为中国融通集团信息技术有限公司。",
+            "M1101085050001205001",
+        ),
+        (
+            "中石化胜利石油工程有限公司2026年胜利工程钻井院存储设备和计算机配件采购方案内存条/工作站/服务器 32GB DDR5 6000MHZ招标公告",
+            "本招标项目 2026年胜利工程钻井院存储设备和计算机配件采购方案内存条/工作站/服务器 32GB DDR5 6000MHZ（招标编号：NWZ260715-3411-129552），招标人为中石化胜利石油工程有限公司。",
+            "WZ260715-3411-129552",
+        ),
+        (
+            "服务器、工作站、电脑临时采购项目项目公告",
+            "服务器、工作站、电脑临时采购项目已批准，采购人为中煤科工西安研究院（集团）有限公司。采购编号：XBXM-202607-10-0429",
+            "D1100005299XB2607429",
+        ),
+    ],
+)
+def test_pdf_identity_accepts_real_title_wrappers(outer_title, pdf_text, project_code):
+    signals = pdf_detail_module._pdf_identity_signals(
+        outer_title, pdf_text, expected_project_code=project_code
+    )
+    assert signals["accepted"] is True
+    assert signals["method"] != "unverified"
+
+
 @pytest.mark.asyncio
 async def test_pdf_collection_rejects_non_official_origin_before_navigation():
     class FakePage:
@@ -92,6 +158,72 @@ async def test_pdf_collection_rejects_non_official_origin_before_navigation():
     assert result.status == "failed"
     assert result.failure_reason == "invalid_detail_origin"
     assert page.goto_called is False
+
+
+@pytest.mark.asyncio
+async def test_pdf_collection_uses_blank_navigation_boundary_before_hash_route():
+    class Locator:
+        async def inner_text(self, **_kwargs):
+            return "测试服务器采购项目招标公告"
+
+    class Page:
+        def __init__(self):
+            self.gotos = []
+
+        async def goto(self, url, **_kwargs):
+            self.gotos.append(url)
+
+        async def wait_for_selector(self, *_args, **_kwargs):
+            raise TimeoutError
+
+        def locator(self, _selector):
+            return Locator()
+
+    page = Page()
+    detail_url = (
+        "https://ctbpsp.com/#/bulletinDetail?uuid=" + "a" * 32
+    )
+    result = await pdf_detail_module._collect_public_pdf_detail(
+        page,
+        detail_url=detail_url,
+        expected_id="a" * 32,
+        expected_title="测试服务器采购项目招标公告",
+    )
+
+    assert page.gotos == ["about:blank", detail_url]
+    assert result.failure_reason == "pdf_not_loaded"
+
+
+@pytest.mark.asyncio
+async def test_scanned_pdf_ocr_renders_loaded_pdfjs_document_without_dom_canvas(
+    monkeypatch,
+):
+    class Frame:
+        def __init__(self):
+            self.render_calls = 0
+
+        def locator(self, _selector):
+            return object()
+
+        async def evaluate(self, expression, *args):
+            if "numPages" in expression and not args:
+                return 1
+            self.render_calls += 1
+            assert args == (1,)
+            return base64.b64encode(b"rendered-png").decode()
+
+    frame = Frame()
+    monkeypatch.setitem(sys.modules, "rapidocr", SimpleNamespace(RapidOCR=object))
+    monkeypatch.setattr(
+        pdf_detail_module,
+        "_recognise_image_bytes",
+        lambda data: "采购人：测试单位" if data == b"rendered-png" else "",
+    )
+
+    pages = await pdf_detail_module._ocr_rendered_pages(frame, page_numbers={1})
+
+    assert pages == [{"page": 1, "text": "采购人：测试单位", "method": "ocr"}]
+    assert frame.render_calls == 1
 
 
 @pytest.mark.asyncio
@@ -190,7 +322,7 @@ async def test_start_falls_back_from_chrome_to_edge(tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_operation_queue_serializes_public_page_work(tmp_path, monkeypatch):
+async def test_operation_queue_limits_public_page_work_to_two(tmp_path, monkeypatch):
     browser = ManagedPublicBrowser()
     browser.profile_dir = tmp_path / "profile"
     browser.runtime_file = tmp_path / "runtime.json"
@@ -205,11 +337,13 @@ async def test_operation_queue_serializes_public_page_work(tmp_path, monkeypatch
     active = 0
     maximum_active = 0
     order: list[str] = []
+    page_ids: set[int] = set()
 
     async def worker(name: str):
         nonlocal active, maximum_active
         async with browser.acquire() as lease:
             assert lease.context is browser._browser.contexts[0]
+            page_ids.add(id(lease.page))
             active += 1
             maximum_active = max(maximum_active, active)
             order.append(f"start-{name}")
@@ -217,18 +351,77 @@ async def test_operation_queue_serializes_public_page_work(tmp_path, monkeypatch
             order.append(f"end-{name}")
             active -= 1
 
-    await asyncio.gather(worker("a"), worker("b"))
+    await asyncio.gather(worker("a"), worker("b"), worker("c"))
 
-    assert maximum_active == 1
-    assert order in (
-        ["start-a", "end-a", "start-b", "end-b"],
-        ["start-b", "end-b", "start-a", "end-a"],
-    )
+    assert maximum_active == 2
+    assert len(page_ids) == 2
+    assert sorted(value for value in order if value.startswith("start-")) == [
+        "start-a",
+        "start-b",
+        "start-c",
+    ]
     assert browser.status()["state"] == "ready"
 
 
 @pytest.mark.asyncio
-async def test_managed_browser_reuses_existing_work_page(tmp_path):
+async def test_interactive_lease_waits_for_workers_and_blocks_new_auto_work(
+    tmp_path, monkeypatch
+):
+    browser = ManagedPublicBrowser()
+    browser.profile_dir = tmp_path / "profile"
+    browser.runtime_file = tmp_path / "runtime.json"
+    browser._browser = _FakeBrowser()
+    browser._state = "ready"
+
+    async def already_started():
+        return True
+
+    monkeypatch.setattr(browser, "ensure_started", already_started)
+    monkeypatch.setattr(browser, "_bring_to_front", already_started)
+    auto_ready = asyncio.Event()
+    auto_release = asyncio.Event()
+    interactive_started = asyncio.Event()
+    interactive_release = asyncio.Event()
+    late_auto_started = asyncio.Event()
+    ready_count = 0
+
+    async def auto_worker():
+        nonlocal ready_count
+        async with browser.acquire():
+            ready_count += 1
+            if ready_count == 2:
+                auto_ready.set()
+            await auto_release.wait()
+
+    async def interactive_worker():
+        async with browser.acquire(interactive=True):
+            interactive_started.set()
+            await interactive_release.wait()
+
+    async def late_auto_worker():
+        async with browser.acquire():
+            late_auto_started.set()
+
+    first = asyncio.create_task(auto_worker())
+    second = asyncio.create_task(auto_worker())
+    await auto_ready.wait()
+    interactive = asyncio.create_task(interactive_worker())
+    await asyncio.sleep(0.01)
+    late = asyncio.create_task(late_auto_worker())
+    await asyncio.sleep(0.01)
+    assert interactive_started.is_set() is False
+    assert late_auto_started.is_set() is False
+
+    auto_release.set()
+    await interactive_started.wait()
+    assert late_auto_started.is_set() is False
+    interactive_release.set()
+    await asyncio.gather(first, second, interactive, late)
+    assert late_auto_started.is_set() is True
+
+
+@pytest.mark.asyncio
+async def test_managed_browser_reuses_two_independent_work_pages(tmp_path):
     class Page:
         def is_closed(self):
             return False
@@ -247,12 +440,40 @@ async def test_managed_browser_reuses_existing_work_page(tmp_path):
     browser.runtime_file = tmp_path / "runtime.json"
     context = Context()
 
-    first = await browser.get_work_page(context)
-    second = await browser.get_work_page(context)
+    first = await browser._checkout_page(context)
+    second = await browser._checkout_page(context)
+    await browser._return_page(first)
+    third = await browser._checkout_page(context)
 
     assert first is context.pages[0]
-    assert second is first
-    assert context.created == 0
+    assert second is not first
+    assert third is first
+    assert context.created == 1
+
+
+@pytest.mark.asyncio
+async def test_managed_browser_replaces_only_failed_lease_page(tmp_path, monkeypatch):
+    browser = ManagedPublicBrowser()
+    browser.profile_dir = tmp_path / "profile"
+    browser.runtime_file = tmp_path / "runtime.json"
+    browser._browser = _FakeBrowser()
+    browser._state = "ready"
+
+    async def already_started():
+        return True
+
+    monkeypatch.setattr(browser, "ensure_started", already_started)
+    async with browser.acquire() as lease:
+        original = lease.page
+        replacement = await browser.replace_page(lease)
+        assert original.closed is True
+        assert replacement is lease.page
+        assert replacement is not original
+        assert browser.status()["active_workers"] == 1
+
+    assert replacement in browser._available_pages
+    assert original not in browser._available_pages
+    assert browser.status()["state"] == "ready"
 
 
 @pytest.mark.asyncio
@@ -343,12 +564,14 @@ def test_public_status_never_exposes_port_or_local_profile(tmp_path):
 
     status = browser.status()
 
-    assert status == {
-        "state": "ready",
-        "engine": None,
-        "profile_ready": True,
-        "last_error": None,
-    }
+    assert status["state"] == "ready"
+    assert status["engine"] is None
+    assert status["profile_ready"] is True
+    assert status["last_error"] is None
+    assert status["pool_size"] == 2
+    assert status["active_workers"] == 0
+    assert status["queue_size"] == 0
+    assert status["adaptive_mode"] is False
     assert "44001" not in str(status)
     assert str(browser.profile_dir) not in str(status)
 
@@ -402,7 +625,8 @@ def test_public_error_redacts_local_path_and_loopback_port():
 @pytest.mark.asyncio
 async def test_pdf_collection_restarts_managed_browser_once_after_crash(monkeypatch):
     class FakePage:
-        pass
+        def __init__(self, crash=False):
+            self.crash = crash
 
     class FakeBroker:
         def __init__(self):
@@ -414,13 +638,11 @@ async def test_pdf_collection_restarts_managed_browser_once_after_crash(monkeypa
             self.acquire_count += 1
             attempt = self.acquire_count
             yield SimpleNamespace(
-                context=object(), reused=attempt > 1, engine="chrome"
+                context=object(),
+                page=FakePage(crash=attempt == 1),
+                reused=attempt > 1,
+                engine="chrome",
             )
-
-        async def get_work_page(self, _context):
-            if self.acquire_count == 1:
-                raise RuntimeError("browser process exited")
-            return FakePage()
 
         @property
         def is_connected(self):
@@ -441,6 +663,8 @@ async def test_pdf_collection_restarts_managed_browser_once_after_crash(monkeypa
     )
 
     async def collect(_page, **kwargs):
+        if _page.crash:
+            raise RuntimeError("browser process exited")
         return PublicPdfDetail(
             status="full",
             detail_url=kwargs["detail_url"],
@@ -463,4 +687,114 @@ async def test_pdf_collection_restarts_managed_browser_once_after_crash(monkeypa
     assert result.acquisition_mode == "managed_chrome"
     assert result.browser_reused is True
     assert broker.acquire_count == 2
-    assert broker.shutdown_count == 1
+    assert broker.shutdown_count == 0
+
+
+@pytest.mark.asyncio
+async def test_pdf_collection_timeout_releases_page_without_retrying(monkeypatch):
+    class FakeBroker:
+        acquire_count = 0
+
+        @asynccontextmanager
+        async def acquire(self, *, interactive=False):
+            self.acquire_count += 1
+            yield SimpleNamespace(
+                context=object(), page=object(), reused=False, engine="chrome"
+            )
+
+        @property
+        def is_connected(self):
+            return True
+
+        def status(self):
+            return {"state": "ready"}
+
+        def mark_needs_verification(self):
+            return None
+
+    broker = FakeBroker()
+    monkeypatch.setattr(managed_module, "get_managed_public_browser", lambda: broker)
+
+    async def collect(_page, **_kwargs):
+        raise TimeoutError
+
+    monkeypatch.setattr(pdf_detail_module, "_collect_public_pdf_detail", collect)
+    result = await pdf_detail_module._fetch_managed_public_pdf_detail(
+        detail_url="https://ctbpsp.com/#/bulletinDetail?uuid=" + "b" * 32,
+        expected_id="b" * 32,
+        expected_title="扫描公告",
+        timeout_ms=60_000,
+        headless=True,
+    )
+
+    assert result.failure_reason == "collector_timeout"
+    assert result.failure_stage == "pdf_pages"
+    assert result.attempt_count == 1
+    assert broker.acquire_count == 1
+
+
+@pytest.mark.asyncio
+async def test_identity_failure_rebuilds_only_current_page_then_succeeds(monkeypatch):
+    class Page:
+        pass
+
+    class FakeBroker:
+        acquire_count = 0
+        replace_count = 0
+
+        @asynccontextmanager
+        async def acquire(self, *, interactive=False):
+            self.acquire_count += 1
+            yield SimpleNamespace(
+                context=object(), page=Page(), reused=True, engine="chrome"
+            )
+
+        async def replace_page(self, lease):
+            self.replace_count += 1
+            lease.page = Page()
+            return lease.page
+
+        @property
+        def is_connected(self):
+            return True
+
+        def status(self):
+            return {"state": "ready"}
+
+        def mark_needs_verification(self):
+            return None
+
+    broker = FakeBroker()
+    monkeypatch.setattr(managed_module, "get_managed_public_browser", lambda: broker)
+    calls = 0
+
+    async def collect(_page, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return PublicPdfDetail(
+                status="failed",
+                detail_url=kwargs["detail_url"],
+                failure_reason="identity_mismatch",
+            )
+        return PublicPdfDetail(
+            status="full",
+            detail_url=kwargs["detail_url"],
+            content_format="pdf_text",
+            clean_content="【第1页】\n招标人：测试单位",
+            pages=[{"page": 1, "text": "招标人：测试单位"}],
+        )
+
+    monkeypatch.setattr(pdf_detail_module, "_collect_public_pdf_detail", collect)
+    result = await pdf_detail_module._fetch_managed_public_pdf_detail(
+        detail_url="https://ctbpsp.com/#/bulletinDetail?uuid=" + "c" * 32,
+        expected_id="c" * 32,
+        expected_title="测试公告",
+        timeout_ms=60_000,
+        headless=True,
+    )
+
+    assert result.status == "full"
+    assert result.attempt_count == 2
+    assert broker.acquire_count == 1
+    assert broker.replace_count == 1

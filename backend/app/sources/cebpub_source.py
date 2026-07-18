@@ -341,6 +341,9 @@ class CebpubSource(TenderSourceAdapter):
                 detail_url=detail_url,
                 expected_id=business_id,
                 expected_title=item.title,
+                expected_project_code=(
+                    str(raw.get("tenderProjectCode") or "").strip() or None
+                ),
                 timeout_ms=(
                     300_000
                     if interactive
@@ -355,7 +358,7 @@ class CebpubSource(TenderSourceAdapter):
                 "pdf_url": pdf_detail.pdf_url,
                 "business_id": business_id,
                 "tender_project_code": raw.get("tenderProjectCode") or None,
-                "verified_by": "official_origin+uuid+page_title+pdf_project_title_core+complete_pages",
+                "verified_by": "official_origin+uuid+outer_title+pdf_identity_signals+complete_pages",
                 "content_format": pdf_detail.content_format,
                 "content_pages": pdf_detail.pages,
                 "message": pdf_detail.message,
@@ -369,6 +372,14 @@ class CebpubSource(TenderSourceAdapter):
                 "browser_reused": pdf_detail.browser_reused,
                 "browser_state": pdf_detail.browser_state,
                 "interaction_requested": interactive,
+                "detail_attempt_state": (
+                    "blocked" if pdf_detail.site_blocked else "attempted"
+                ),
+                "failure_stage": pdf_detail.failure_stage,
+                "attempt_count": pdf_detail.attempt_count,
+                "duration_ms": pdf_detail.duration_ms,
+                "validation_signals": pdf_detail.validation_signals,
+                "site_blocked": pdf_detail.site_blocked,
             }
             if pdf_detail.status == "full":
                 raw_json = json.dumps(

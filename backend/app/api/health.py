@@ -41,6 +41,7 @@ async def health_check() -> HealthResponse:
             "pdfjs-text-layer-capture-v1",
             "browser-rendered-detail-capture-v1",
             "managed-public-browser-v1",
+            "managed-public-browser-pool-v2",
         ],
         public_browser=managed_public_browser_status(),
         message="服务正常" if db_ok else "数据库连接异常",

@@ -85,6 +85,52 @@ def test_extract_fields_no_fabrication():
     assert empty["budget"] == "原文未明确说明"
 
 
+def test_extract_fields_joins_wrapped_purchaser_name_without_crossing_section():
+    text = """（一）采购条件
+本项目测试服务器采购项目（项目编号：XBCG-2026-001），采购人为中国
+融通集团信息技术有限公司。项目资金来源为企业自筹资金。
+（二）项目概况和采购范围
+采购人指定地点。
+"""
+    fields = extract_fields(title="测试服务器采购项目", clean_content=text)
+    assert fields["purchaser"] == "中国融通集团信息技术有限公司"
+    assert fields["purchaser_source_label"] == "采购人"
+    assert fields["field_evidence"]["purchaser"]["quote"].endswith(
+        "中国融通集团信息技术有限公司"
+    )
+
+
+def test_parenthesized_qualification_section_keeps_all_numbered_clauses():
+    text = """（三）供应商资格条件
+1.供应商须具有独立法人资格，并提供有效营业执照。
+2.供应商应在中华人民共和国注册并合法运营。
+3.供应商具有良好的商业信誉和健全的财务制度。
+4.供应商不得被列入严重失信主体名单。
+5.近三年无重大违法记录。
+6.本项目不接受联合体。
+7.供应商应具有同类项目业绩。
+（四）采购文件获取方式
+获取时间：2026年7月15日至2026年7月20日。
+"""
+    fields = extract_fields(title="测试服务器询比采购公告", clean_content=text)
+    assert len(fields["qualification_items"]) == 7
+    assert fields["qualification_items"][0].startswith("1.")
+    assert fields["qualification_items"][-1].startswith("7.")
+    assert "采购文件获取方式" not in fields["qualification"]
+
+
+def test_qualification_split_does_not_treat_year_as_clause_number():
+    text = """供应商资格条件
+1.供应商应提供同类项目业绩，
+2023年至2025年的合同均可作为证明材料。
+2.本项目不接受联合体。
+联系方式：010-12345678
+"""
+    fields = extract_fields(title="测试采购公告", clean_content=text)
+    assert len(fields["qualification_items"]) == 2
+    assert "2023年至2025年" in fields["qualification_items"][0]
+
+
 def test_extract_fields_preserves_tenderer_label_and_multiline_qualifications():
     text = """
     招标人名称：福建某核电有限公司

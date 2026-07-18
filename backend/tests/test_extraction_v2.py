@@ -453,18 +453,16 @@ async def test_pdfjs_text_layer_fallback_scrolls_and_extracts_every_page():
 
 @pytest.mark.asyncio
 async def test_scanned_pdf_ocr_only_processes_missing_pages(monkeypatch):
-    fake_pil = ModuleType("PIL")
-    fake_pil.Image = SimpleNamespace(open=lambda _stream: object())
-    fake_tesseract = ModuleType("pytesseract")
-    calls: list[str] = []
+    fake_rapidocr = ModuleType("rapidocr")
+    fake_rapidocr.RapidOCR = object
+    calls: list[bytes] = []
 
-    def image_to_string(_image, *, lang):
-        calls.append(lang)
+    def recognise(image_bytes: bytes):
+        calls.append(image_bytes)
         return "第2页扫描正文：招标人 某研究所"
 
-    fake_tesseract.image_to_string = image_to_string
-    monkeypatch.setitem(sys.modules, "PIL", fake_pil)
-    monkeypatch.setitem(sys.modules, "pytesseract", fake_tesseract)
+    monkeypatch.setitem(sys.modules, "rapidocr", fake_rapidocr)
+    monkeypatch.setattr("app.browser.pdf_detail._recognise_image_bytes", recognise)
 
     class ScannedPage:
         def __init__(self, number: int) -> None:
@@ -493,7 +491,7 @@ async def test_scanned_pdf_ocr_only_processes_missing_pages(monkeypatch):
     assert scanned_pages[0].scrolled is False
     assert scanned_pages[1].scrolled is True
     assert scanned_pages[2].scrolled is False
-    assert calls == ["chi_sim+eng"]
+    assert calls == [b"page-2"]
 
 
 def test_different_project_codes_and_lifecycle_not_merged():

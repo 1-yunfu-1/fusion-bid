@@ -485,6 +485,8 @@ export default function NewTaskPage() {
                     <Col xs={12} md={6}><Statistic title="内容更新" value={executionResult.update_count} /></Col>
                     <Col xs={12} md={6}><Statistic title="已核验详情" value={executionResult.detail_success_count} /></Col>
                     <Col xs={12} md={6}><Statistic title="仅元数据" value={executionResult.detail_metadata_only_count} /></Col>
+                    <Col xs={12} md={6}><Statistic title="真实采集失败" value={executionResult.detail_failed_count} /></Col>
+                    <Col xs={12} md={6}><Statistic title="站点阻断未尝试" value={executionResult.detail_not_attempted_count} /></Col>
                   </Row>
                   <Descriptions size="small" column={{ xs: 1, md: 2 }} bordered>
                     <Descriptions.Item label="任务状态">
@@ -501,6 +503,25 @@ export default function NewTaskPage() {
                       {executionResult.report_mode === "full_snapshot" ? "未去重完整快照" : "增量交付"}
                     </Descriptions.Item>
                   </Descriptions>
+                  {Object.keys(executionResult.failure_breakdown || {}).length > 0 && (
+                    <Alert
+                      type="warning"
+                      showIcon
+                      message="详情采集质量分组"
+                      description={Object.entries(executionResult.failure_breakdown).map(([reason, count]) => {
+                        const labels: Record<string, string> = {
+                          not_attempted: "未尝试",
+                          site_blocked: "站点阻断",
+                          browser_failure: "浏览器失败",
+                          pdf_incomplete: "PDF 不完整",
+                          identity_conflict: "身份冲突",
+                          extraction_failure: "抽取失败（已规则降级）",
+                          metadata_only_other: "其他仅元数据",
+                        };
+                        return <Tag key={reason}>{labels[reason] || reason} {count}</Tag>;
+                      })}
+                    />
+                  )}
                   {executionResult.analysis_preview?.portfolio_summary && (
                     <Alert
                       type="info"

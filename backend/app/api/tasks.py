@@ -215,6 +215,12 @@ async def execute_task(
             detail_human_verification_count=getattr(
                 stats, "detail_human_verification_count", 0
             ),
+            detail_not_attempted_count=getattr(
+                stats, "detail_not_attempted_count", 0
+            ),
+            failure_breakdown=getattr(stats, "failure_breakdown", {}),
+            stage_durations_ms=getattr(stats, "stage_durations_ms", {}),
+            effective_concurrency=getattr(stats, "effective_concurrency", {}),
             filtered_out_count=stats.filtered_out_count,
             duplicate_count=stats.duplicate_count,
             cross_source_merge_count=stats.cross_source_merge_count,
@@ -340,6 +346,7 @@ async def list_executions(
     items: list[TaskExecutionItem] = []
     for e in rows:
         report_filename, report_download_url = _report_fields(e.report_path)
+        diagnostics = getattr(e, "crawl_diagnostics", None) or {}
         items.append(
             TaskExecutionItem(
                 id=e.id,
@@ -363,6 +370,14 @@ async def list_executions(
                 detail_failed_count=getattr(e, "detail_failed_count", 0),
                 detail_human_verification_count=getattr(
                     e, "detail_human_verification_count", 0
+                ),
+                detail_not_attempted_count=int(
+                    diagnostics.get("detail_not_attempted_count") or 0
+                ),
+                failure_breakdown=dict(diagnostics.get("failure_breakdown") or {}),
+                stage_durations_ms=dict(diagnostics.get("stage_durations_ms") or {}),
+                effective_concurrency=dict(
+                    diagnostics.get("effective_concurrency") or {}
                 ),
                 report_filename=report_filename,
                 report_download_url=report_download_url,

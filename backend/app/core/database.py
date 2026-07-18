@@ -116,6 +116,10 @@ def _sqlite_add_missing_columns(sync_conn) -> None:
             )
         if "analysis_data" not in ecols:
             exec_alters.append("ALTER TABLE task_executions ADD COLUMN analysis_data JSON")
+        if "crawl_diagnostics" not in ecols:
+            exec_alters.append(
+                "ALTER TABLE task_executions ADD COLUMN crawl_diagnostics JSON"
+            )
         if "report_mode" not in ecols:
             exec_alters.append(
                 "ALTER TABLE task_executions ADD COLUMN "

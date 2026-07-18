@@ -44,6 +44,10 @@ export interface TaskExecutionResponse {
   detail_metadata_only_count: number;
   detail_failed_count: number;
   detail_human_verification_count: number;
+  detail_not_attempted_count: number;
+  failure_breakdown: Record<string, number>;
+  stage_durations_ms: Record<string, number>;
+  effective_concurrency: Record<string, unknown>;
   filtered_out_count: number;
   duplicate_count: number;
   cross_source_merge_count: number;
@@ -94,6 +98,10 @@ export interface TaskExecutionItem {
   detail_metadata_count: number;
   detail_failed_count: number;
   detail_human_verification_count: number;
+  detail_not_attempted_count: number;
+  failure_breakdown: Record<string, number>;
+  stage_durations_ms: Record<string, number>;
+  effective_concurrency: Record<string, unknown>;
   report_filename?: string | null;
   report_download_url?: string | null;
   analysis_status: string;

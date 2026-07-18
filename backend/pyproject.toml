@@ -36,7 +36,8 @@ full = [
     "playwright>=1.61.0",
     "PyMuPDF>=1.24.0",
     "Pillow>=11.0.0",
-    "pytesseract>=0.3.13",
+    "rapidocr>=3.9.0",
+    "onnxruntime>=1.24.0",
 ]
 
 [build-system]

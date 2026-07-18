@@ -162,6 +162,61 @@ def _clean_capture(text: str) -> str:
     return t[:200] if t else ""
 
 
+_ORGANISATION_SUFFIX_RE = re.compile(
+    r"(?:有限责任公司|股份有限公司|有限公司|集团公司|集团|公司|"
+    r"委员会|人民政府|研究院|研究所|设计院|事务所|招标中心|中心|"
+    r"大学|学院|医院|银行|学校|厂|局|院|所|部)$"
+)
+_ENTITY_LABELS = {
+    "采购人名称",
+    "采购人",
+    "采购单位",
+    "招标人名称",
+    "招标人",
+    "项目业主",
+    "建设单位",
+    "招标单位",
+    "招标代理机构",
+    "采购代理机构",
+    "委托代理机构",
+    "代理机构",
+}
+
+
+def _clean_entity_capture(text: str) -> str:
+    """合并 PDF 排版造成的机构名称软换行，同时保留普通词间空格。"""
+    value = re.sub(
+        r"(?<=[0-9A-Za-z\u4e00-\u9fff）)])\s*\n\s*"
+        r"(?=[0-9A-Za-z\u4e00-\u9fff（(])",
+        "",
+        text or "",
+    )
+    return _clean_capture(value)
+
+
+def _extend_wrapped_entity(text: str, *, end: int, value: str) -> tuple[str, int]:
+    """在实体尚未以机构后缀结束时，最多补一条 PDF 视觉换行。"""
+    cleaned = _clean_entity_capture(value)
+    if not cleaned or _ORGANISATION_SUFFIX_RE.search(cleaned):
+        return value, end
+    remainder = text[end:]
+    match = re.match(r"[ \t]*\n[ \t]*(?P<next>[^\n，,。；;]{1,120})", remainder)
+    if not match:
+        return value, end
+    next_value = match.group("next").strip()
+    if not next_value or re.match(
+        r"^(?:【第\d+页】|[（(]?\d+(?:\.\d+)*[）).、．]|"
+        r"[一二三四五六七八九十]+[、．.]|项目资金|联系方式|地址|电话)",
+        next_value,
+    ):
+        return value, end
+    combined = f"{value}\n{next_value}"
+    # 只在合并后形成明确机构名时接受，避免跨段吞入下一字段。
+    if not _ORGANISATION_SUFFIX_RE.search(_clean_entity_capture(combined)):
+        return value, end
+    return combined, end + match.end()
+
+
 def _extract_labeled_line(
     text: str, labels: Sequence[str], *, limit: int = 240
 ) -> tuple[str, str, str]:
@@ -194,7 +249,8 @@ def _split_qualification_items(value: str) -> list[str]:
     # display.  Re-extraction must be able to recover that structure instead of
     # treating the whole joined string as one requirement.
     without_page_markers = re.sub(
-        r"[；;]\s*(?=\d+\.\d+(?:\.\d+)?(?=\s|[\u4e00-\u9fff]|[（(“\"、，,:：]|$))",
+        r"[；;]\s*(?=(?:\d+\.\d+(?:\.\d+)?|\d+[.、．])"
+        r"(?=\s|[\u4e00-\u9fff]|[（(“\"、，,:：]|$))",
         "\n",
         without_page_markers,
     )
@@ -204,7 +260,7 @@ def _split_qualification_items(value: str) -> list[str]:
     # after the number merges the whole section into one item.
     top_level = list(
         re.finditer(
-            r"(?m)^\s*:?[ \t]*(?P<number>\d+\.\d+(?:\.\d+)?)"
+            r"(?m)^\s*:?[ \t]*(?P<number>\d+\.\d+(?:\.\d+)?|\d+[.、．])"
             r"(?=\s|[\u4e00-\u9fff]|[（(“\"、，,:：]|$)",
             without_page_markers,
         )
@@ -232,7 +288,10 @@ def _split_qualification_items(value: str) -> list[str]:
         if top_level:
             number = top_level[index].group("number")
             cleaned = re.sub(
-                rf"^\s*:?[ \t]*{re.escape(number)}\s*", f"{number} ", cleaned, count=1
+                rf"^\s*:?[ \t]*{re.escape(number)}\s*",
+                f"{number} ",
+                cleaned,
+                count=1,
             ).strip()
         cleaned = cleaned.strip("；;，,。")
         if not cleaned or cleaned in items:
@@ -256,7 +315,10 @@ def _extract_qualification_section(text: str) -> tuple[str, str, str, list[str]]
         re.escape(label) for label in sorted(_QUALIFICATION_LABELS, key=len, reverse=True)
     )
     match = re.search(
-        rf"(?m)^\s*(?:(?:\d+[.、．])|[、．])?\s*(?P<label>{options})\s*"
+        rf"(?m)^\s*(?P<prefix>(?:(?:\d+[.、．])|"
+        rf"[（(][一二三四五六七八九十百0-9]+[）)]|"
+        rf"[一二三四五六七八九十百]+[、．.]|[、．]))?\s*"
+        rf"(?P<label>{options})\s*"
         rf"(?:[：:]\s*)?(?P<value>.*)$",
         text,
     )
@@ -265,6 +327,11 @@ def _extract_qualification_section(text: str) -> tuple[str, str, str, list[str]]
     lines = [match.group("value").strip()]
     evidence_lines = [match.group(0).strip()]
     start = match.end()
+    prefix = (match.group("prefix") or "").strip()
+    numeric_section = re.match(r"^(?P<number>\d+)[.、．]$", prefix)
+    chinese_section = re.match(
+        r"^[（(](?P<number>[一二三四五六七八九十百]+)[）)]$", prefix
+    )
     # Long international-tender notices routinely have 3.1—3.11 plus nested
     # certificate clauses.  Forty rendered lines cut the last requirements in
     # half, even though the next numbered section is an unambiguous boundary.
@@ -276,8 +343,25 @@ def _extract_qualification_section(text: str) -> tuple[str, str, str, list[str]]
             continue
         if re.fullmatch(r"【第\d+页】", stripped):
             continue
-        if _SECTION_STOP_RE.match(stripped) or re.match(r"^\s*[4-9][.、．]\s*\S", stripped):
+        if _SECTION_STOP_RE.match(stripped):
             break
+        if numeric_section:
+            next_section = re.match(r"^(?P<number>\d+)[.、．](?!\d)\s*\S", stripped)
+            if (
+                next_section
+                and int(next_section.group("number"))
+                > int(numeric_section.group("number"))
+            ):
+                break
+        if chinese_section:
+            next_section = re.match(
+                r"^[（(](?P<number>[一二三四五六七八九十百]+)[）)]\s*\S",
+                stripped,
+            )
+            if next_section and next_section.group("number") != chinese_section.group(
+                "number"
+            ):
+                break
         lines.append(stripped)
         evidence_lines.append(stripped)
         if sum(len(x) for x in lines) > 12000:
@@ -319,10 +403,20 @@ def _extract_semantic_value(
             text or "",
         )
         if match:
+            raw_value = match.group("value")
+            evidence_end = match.end()
+            if label in _ENTITY_LABELS:
+                raw_value, evidence_end = _extend_wrapped_entity(
+                    text or "", end=match.end(), value=raw_value
+                )
             return (
-                _clean_capture(match.group("value")),
+                _clean_entity_capture(raw_value)
+                if label in _ENTITY_LABELS
+                else _clean_capture(raw_value),
                 match.group("label"),
-                _clean_capture(match.group(0)),
+                _clean_entity_capture((text or "")[match.start() : evidence_end])
+                if label in _ENTITY_LABELS
+                else _clean_capture(match.group(0)),
             )
         # Coordinate-restored PDF cells may concatenate a label and value on a
         # dedicated line (``招标人中国核电工程有限公司``).  Keep this fallback
@@ -1375,6 +1469,7 @@ async def build_extraction_data_with_ai(
         return result
 
     from app.llm.client import call_json_llm_chain
+    from app.llm.limits import extraction_slot
 
     source_chunks, chunks_truncated = _ai_source_chunks(clean_content, source_metadata)
     if not source_chunks:
@@ -1392,45 +1487,46 @@ async def build_extraction_data_with_ai(
     rejected: list[str] = []
     successful_result = None
     provider_unavailable = False
-    for chunk_index, source_text in enumerate(source_chunks, start=1):
-        chunk_rejected: list[str] = []
-        chunk_valid: list[dict[str, Any]] = []
-        for _attempt in range(2):
-            user = (
-                f"公告标题：{title}\n"
-                f"当前正文块：{chunk_index}/{len(source_chunks)}\n"
-                f"可抽取字段：{sorted(_AI_EXTRACTABLE_FIELDS)}\n"
-                f"公告原文：\n{source_text}"
-            )
-            messages = [
-                {"role": "system", "content": system},
-                {
-                    "role": "user",
-                    "content": user
-                    + (
-                        "\n上次结果未通过证据校验，请仅修正这些问题："
-                        + "；".join(chunk_rejected[:12])
-                        if chunk_rejected
-                        else ""
-                    ),
-                },
-            ]
-            llm_result = await call_json_llm_chain(messages)
-            if not llm_result.success:
-                provider_unavailable = True
+    async with extraction_slot():
+        for chunk_index, source_text in enumerate(source_chunks, start=1):
+            chunk_rejected: list[str] = []
+            chunk_valid: list[dict[str, Any]] = []
+            for _attempt in range(2):
+                user = (
+                    f"公告标题：{title}\n"
+                    f"当前正文块：{chunk_index}/{len(source_chunks)}\n"
+                    f"可抽取字段：{sorted(_AI_EXTRACTABLE_FIELDS)}\n"
+                    f"公告原文：\n{source_text}"
+                )
+                messages = [
+                    {"role": "system", "content": system},
+                    {
+                        "role": "user",
+                        "content": user
+                        + (
+                            "\n上次结果未通过证据校验，请仅修正这些问题："
+                            + "；".join(chunk_rejected[:12])
+                            if chunk_rejected
+                            else ""
+                        ),
+                    },
+                ]
+                llm_result = await call_json_llm_chain(messages)
+                if not llm_result.success:
+                    provider_unavailable = True
+                    break
+                successful_result = llm_result
+                chunk_valid, chunk_rejected = _validate_ai_extraction_rows(
+                    llm_result.data,
+                    clean_content=clean_content,
+                    source_metadata=source_metadata,
+                )
+                if chunk_valid and not chunk_rejected:
+                    break
+            valid.extend(chunk_valid)
+            rejected.extend(f"块{chunk_index}: {value}" for value in chunk_rejected)
+            if provider_unavailable:
                 break
-            successful_result = llm_result
-            chunk_valid, chunk_rejected = _validate_ai_extraction_rows(
-                llm_result.data,
-                clean_content=clean_content,
-                source_metadata=source_metadata,
-            )
-            if chunk_valid and not chunk_rejected:
-                break
-        valid.extend(chunk_valid)
-        rejected.extend(f"块{chunk_index}: {value}" for value in chunk_rejected)
-        if provider_unavailable:
-            break
 
     selected: dict[str, dict[str, Any]] = {}
     for row in valid:

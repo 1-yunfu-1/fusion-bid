@@ -12,6 +12,10 @@ class PublicBrowserStatus(BaseModel):
     engine: str | None = None
     profile_ready: bool = False
     last_error: str | None = None
+    pool_size: int = 1
+    active_workers: int = 0
+    queue_size: int = 0
+    adaptive_mode: bool = False
 
 
 class HealthResponse(BaseModel):

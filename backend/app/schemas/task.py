@@ -89,6 +89,10 @@ class TaskExecutionResponse(BaseModel):
     detail_metadata_only_count: int = 0
     detail_failed_count: int = 0
     detail_human_verification_count: int = 0
+    detail_not_attempted_count: int = 0
+    failure_breakdown: dict[str, int] = Field(default_factory=dict)
+    stage_durations_ms: dict[str, int] = Field(default_factory=dict)
+    effective_concurrency: dict[str, Any] = Field(default_factory=dict)
     filtered_out_count: int = 0
     duplicate_count: int = 0
     cross_source_merge_count: int = 0
@@ -128,6 +132,10 @@ class TaskExecutionItem(BaseModel):
     detail_metadata_count: int = 0
     detail_failed_count: int = 0
     detail_human_verification_count: int = 0
+    detail_not_attempted_count: int = 0
+    failure_breakdown: dict[str, int] = Field(default_factory=dict)
+    stage_durations_ms: dict[str, int] = Field(default_factory=dict)
+    effective_concurrency: dict[str, Any] = Field(default_factory=dict)
     report_filename: str | None = None
     report_download_url: str | None = None
     analysis_status: str = "rule_only"

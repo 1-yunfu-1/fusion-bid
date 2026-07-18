@@ -50,6 +50,8 @@ class TaskExecution(Base):
     report_path: Mapped[str | None] = mapped_column(String(1024), nullable=True)
     # 规则分析始终可用；LLM 仅在通过证据校验后补充，不保存任何密钥或原始提示词。
     analysis_data: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    # 只保存分阶段计数、耗时与公开失败代码；不保存浏览器端口、本机路径或站点状态。
+    crawl_diagnostics: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     created_at: Mapped[datetime] = mapped_column(
