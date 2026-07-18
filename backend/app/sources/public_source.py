@@ -1,4 +1,4 @@
-"""公开数据源占位（阶段三实现真实抓取，阶段一不返回伪造业务数据）."""
+"""已弃用的公开数据源占位；真实抓取由 ccgp/cebpub 提供."""
 
 from __future__ import annotations
 
@@ -17,6 +17,7 @@ class PublicSourcePlaceholder(TenderSourceAdapter):
     source_name = "public_source_placeholder"
     requires_login = False
     enabled = False
+    visible = False
 
     async def health_check(self) -> HealthResult:
         return HealthResult(
@@ -28,7 +29,9 @@ class PublicSourcePlaceholder(TenderSourceAdapter):
     async def search(self, query: SearchQuery) -> list[ListItem]:
         return []
 
-    async def fetch_detail(self, item: ListItem) -> DetailResult:
+    async def fetch_detail(
+        self, item: ListItem, *, interactive: bool = False
+    ) -> DetailResult:
         raise NotImplementedError("请使用 ccgp 或 cebpub 适配器")
 
     async def extract_attachments(self, detail: DetailResult) -> list[str]:

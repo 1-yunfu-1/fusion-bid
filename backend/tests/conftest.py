@@ -14,6 +14,8 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_asyn
 # 测试库（内存）必须在导入 app 前设置
 os.environ.setdefault("APP_ENV", "test")
 os.environ.setdefault("APP_DEBUG", "false")
+os.environ["APP_VERSION"] = "1.0.0"
+os.environ["APP_PHASE"] = "phase8-integration"
 os.environ["DATABASE_URL"] = "sqlite+aiosqlite:///:memory:"
 
 from app.core.config import get_settings

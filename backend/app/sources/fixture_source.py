@@ -12,11 +12,12 @@ from app.sources.base import (
 
 
 class FixtureSourcePlaceholder(TenderSourceAdapter):
-    """演示/测试源骨架：阶段一不加载任何假业务数据."""
+    """隐藏的离线测试占位源，不加载任何假业务数据."""
 
     source_name = "fixture_source_placeholder"
     requires_login = False
     enabled = False
+    visible = False
 
     async def health_check(self) -> HealthResult:
         return HealthResult(
@@ -29,7 +30,9 @@ class FixtureSourcePlaceholder(TenderSourceAdapter):
         # 明确返回空列表，不伪造招投标结果
         return []
 
-    async def fetch_detail(self, item: ListItem) -> DetailResult:
+    async def fetch_detail(
+        self, item: ListItem, *, interactive: bool = False
+    ) -> DetailResult:
         raise NotImplementedError("无 fixture 条目可解析")
 
     async def extract_attachments(self, detail: DetailResult) -> list[str]:

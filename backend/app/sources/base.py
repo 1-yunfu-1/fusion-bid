@@ -1,4 +1,4 @@
-"""统一招投标数据源适配器接口（阶段一仅定义契约，不实现抓取）."""
+"""统一招投标数据源适配器接口."""
 
 from __future__ import annotations
 
@@ -46,6 +46,12 @@ class DetailResult:
     raw_content: str = ""
     clean_content: str = ""
     attachment_links: list[str] = field(default_factory=list)
+    detail_fetched: bool = True
+    # 与 detail_fetched 并存，便于区分“明确只有列表元数据”和“请求异常”。
+    detail_status: str = "full"  # full | metadata_only | failed | needs_human_verification
+    detail_url: str | None = None
+    content_format: str | None = None  # html | json | pdf_text | pdf_ocr
+    source_metadata: dict[str, Any] = field(default_factory=dict)
     raw: dict[str, Any] = field(default_factory=dict)
 
 
@@ -65,7 +71,9 @@ class TenderSourceAdapter(ABC):
         raise NotImplementedError
 
     @abstractmethod
-    async def fetch_detail(self, item: ListItem) -> DetailResult:
+    async def fetch_detail(
+        self, item: ListItem, *, interactive: bool = False
+    ) -> DetailResult:
         raise NotImplementedError
 
     @abstractmethod

@@ -5,6 +5,7 @@ import {
   Card,
   Col,
   DatePicker,
+  Drawer,
   Form,
   Input,
   Modal,
@@ -20,13 +21,51 @@ import {
 } from "antd";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import dayjs, { type Dayjs } from "dayjs";
-import { apiClient } from "../api/client";
-import { listTasks, updateTask } from "../api/tasks";
+import { apiClient, apiResourceUrl } from "../api/client";
+import { executeTask, listTaskExecutions, listTasks, updateTask } from "../api/tasks";
 import type { ParsedIntent } from "../types/intent";
-import type { TaskOut } from "../types/task";
+import type { TaskExecutionResponse, TaskOut } from "../types/task";
 import { formatDateTime } from "../utils/format";
 
 const { TextArea } = Input;
+
+const taskStatusMeta: Record<string, { label: string; color: string }> = {
+  confirmed: { label: "待执行", color: "blue" },
+  scheduled: { label: "已计划", color: "purple" },
+  running: { label: "执行中", color: "processing" },
+  done: { label: "已完成", color: "success" },
+  failed: { label: "执行失败", color: "error" },
+  paused: { label: "已暂停", color: "default" },
+  expired: { label: "已过期", color: "warning" },
+};
+
+const executionStatusMeta: Record<string, { label: string; color: string }> = {
+  success: { label: "成功", color: "success" },
+  partial: { label: "部分成功", color: "warning" },
+  failed: { label: "失败", color: "error" },
+  running: { label: "执行中", color: "processing" },
+};
+
+const triggerLabels: Record<string, string> = {
+  initial: "创建后首轮",
+  manual: "手工执行",
+  scheduled: "定时执行",
+};
+
+const scheduleLabels: Record<string, string> = {
+  once: "单次",
+  daily: "每日",
+  weekly: "每周",
+  monthly: "每月",
+};
+
+function statusTag(status: string, execution = false) {
+  const meta = (execution ? executionStatusMeta : taskStatusMeta)[status] || {
+    label: status,
+    color: "default",
+  };
+  return <Tag color={meta.color}>{meta.label}</Tag>;
+}
 
 function taskToForm(task: TaskOut) {
   const pi = (task.parsed_intent || {}) as Record<string, unknown>;
@@ -82,6 +121,8 @@ export default function TasksPage() {
   const qc = useQueryClient();
   const [editOpen, setEditOpen] = useState(false);
   const [editing, setEditing] = useState<TaskOut | null>(null);
+  const [historyTask, setHistoryTask] = useState<TaskOut | null>(null);
+  const [lastExecution, setLastExecution] = useState<TaskExecutionResponse | null>(null);
   const [form] = Form.useForm();
 
   const { data, isLoading, isError } = useQuery({
@@ -89,10 +130,17 @@ export default function TasksPage() {
     queryFn: listTasks,
   });
 
+  const historyQuery = useQuery({
+    queryKey: ["task-executions", historyTask?.id],
+    queryFn: () => listTaskExecutions(historyTask!.id),
+    enabled: Boolean(historyTask),
+  });
+
   const refresh = () => {
     qc.invalidateQueries({ queryKey: ["tasks"] });
     qc.invalidateQueries({ queryKey: ["announcements"] });
     qc.invalidateQueries({ queryKey: ["reports"] });
+    qc.invalidateQueries({ queryKey: ["task-executions"] });
   };
 
   const openEdit = (task: TaskOut) => {
@@ -145,40 +193,13 @@ export default function TasksPage() {
   });
 
   const execMutation = useMutation({
-    mutationFn: async (taskId: string) => {
-      const { data } = await apiClient.post(`/api/tasks/${taskId}/execute`, null, {
-        timeout: 300000,
-      });
-      return data as {
-        status: string;
-        saved_count: number;
-        raw_result_count: number;
-        duplicate_count?: number;
-        incremental_count?: number;
-        update_count?: number;
-        skipped_already_delivered?: number;
-        sources_succeeded: string[];
-        sources_failed: Record<string, string>;
-        message: string;
-        error_message?: string;
-        report_path?: string;
-      };
-    },
+    mutationFn: ({ taskId, reportMode }: { taskId: string; reportMode: "incremental" | "full_snapshot" }) =>
+      executeTask(taskId, "manual", reportMode),
     onSuccess: (res) => {
-      const reportName = res.report_path ? res.report_path.replace(/^.*[\\/]/, "") : "";
-      message.success(
-        `${res.message}：库新增 ${res.saved_count}，原始 ${res.raw_result_count}，` +
-          `去重 ${res.duplicate_count ?? 0}，本次增量 ${res.incremental_count ?? 0}` +
-          (res.update_count ? `，内容更新 ${res.update_count}` : "") +
-          (res.skipped_already_delivered
-            ? `，已推送跳过 ${res.skipped_already_delivered}`
-            : "") +
-          `，源 ${res.sources_succeeded?.join(",") || "无"}` +
-          (reportName ? `；报告：${reportName}` : ""),
-      );
-      if (res.sources_failed && Object.keys(res.sources_failed).length) {
-        message.warning(`部分源失败：${JSON.stringify(res.sources_failed)}`);
-      }
+      setLastExecution(res);
+      if (res.status === "success") message.success("任务执行成功");
+      else if (res.status === "partial") message.warning("任务部分成功，请查看失败来源");
+      else message.error("任务执行失败，可查看执行记录后重试");
       refresh();
     },
     onError: (e: unknown) => {
@@ -235,7 +256,10 @@ export default function TasksPage() {
   });
 
   return (
-    <Card title="任务列表" className="page-card">
+    <Card
+      title={<Typography.Title level={1} style={{ margin: 0, fontSize: 26 }}>任务列表</Typography.Title>}
+      className="page-card"
+    >
       <Alert
         type="info"
         showIcon
@@ -244,6 +268,58 @@ export default function TasksPage() {
         description="支持编辑已创建任务、立即执行、暂停/恢复定时、软删除。编辑后调度会自动同步；定时任务到点自动执行并生成增量 Word 报告。"
       />
       {isError && <Alert type="error" message="加载失败，请确认后端已启动" />}
+      {lastExecution && (
+        <Alert
+          type={
+            lastExecution.status === "success"
+              ? "success"
+              : lastExecution.status === "partial"
+                ? "warning"
+                : "error"
+          }
+          showIcon
+          closable
+          onClose={() => setLastExecution(null)}
+          style={{ marginBottom: 16 }}
+          message={
+            <Space wrap>
+              <span>最近手工执行：{executionStatusMeta[lastExecution.status]?.label || lastExecution.status}</span>
+              <Tag>原始 {lastExecution.raw_result_count}</Tag>
+              <Tag>入库 {lastExecution.saved_count}</Tag>
+              <Tag>增量 {lastExecution.incremental_count}</Tag>
+              <Tag>{lastExecution.report_mode === "full_snapshot" ? "未去重完整快照" : "增量交付"}</Tag>
+              {lastExecution.truncated && <Tag color="error">已达安全上限，结果截断</Tag>}
+            </Space>
+          }
+          description={
+            <Space direction="vertical" size="small">
+              {Object.keys(lastExecution.sources_failed).length > 0 && (
+                <span>
+                  失败来源：
+                  {Object.entries(lastExecution.sources_failed)
+                    .map(([source, reason]) => `${source}（${reason}）`)
+                    .join("；")}
+                </span>
+              )}
+              {lastExecution.error_message && <span>{lastExecution.error_message}</span>}
+              {lastExecution.analysis_preview?.portfolio_summary && (
+                <span>
+                  投标决策分析：{lastExecution.analysis_preview.portfolio_summary}
+                </span>
+              )}
+              {lastExecution.report_download_url && (
+                <Button
+                  type="link"
+                  style={{ padding: 0 }}
+                  href={apiResourceUrl(lastExecution.report_download_url)}
+                >
+                  下载本次 Word 报告
+                </Button>
+              )}
+            </Space>
+          }
+        />
+      )}
       <Table
         loading={isLoading}
         rowKey="id"
@@ -291,7 +367,7 @@ export default function TasksPage() {
               r.schedule_enabled ? (
                 <Space direction="vertical" size={0}>
                   <Tag color={r.is_paused ? "default" : "purple"}>
-                    {r.schedule_type} {r.execute_time}
+                    {scheduleLabels[r.schedule_type || ""] || r.schedule_type} {r.execute_time}
                     {r.is_paused ? "（暂停）" : ""}
                   </Tag>
                   {r.next_run_at && (
@@ -308,7 +384,7 @@ export default function TasksPage() {
             title: "状态",
             dataIndex: "status",
             width: 100,
-            render: (s: string) => <Tag color="blue">{s}</Tag>,
+            render: (s: string) => statusTag(s),
           },
           {
             title: "上次运行",
@@ -320,7 +396,7 @@ export default function TasksPage() {
             title: "操作",
             key: "act",
             fixed: "right",
-            width: 300,
+            width: 430,
             render: (_: unknown, r: TaskOut) => (
               <Space wrap size={0}>
                 <Button type="link" size="small" onClick={() => openEdit(r)}>
@@ -329,10 +405,23 @@ export default function TasksPage() {
                 <Button
                   type="link"
                   size="small"
-                  loading={execMutation.isPending}
-                  onClick={() => execMutation.mutate(r.id)}
+                  loading={execMutation.isPending && execMutation.variables?.taskId === r.id}
+                  disabled={execMutation.isPending && execMutation.variables?.taskId !== r.id}
+                  onClick={() => execMutation.mutate({ taskId: r.id, reportMode: "incremental" })}
                 >
                   立即执行
+                </Button>
+                <Button
+                  type="link"
+                  size="small"
+                  loading={execMutation.isPending && execMutation.variables?.taskId === r.id && execMutation.variables?.reportMode === "full_snapshot"}
+                  disabled={execMutation.isPending && execMutation.variables?.taskId !== r.id}
+                  onClick={() => execMutation.mutate({ taskId: r.id, reportMode: "full_snapshot" })}
+                >
+                  重新采集未去重完整报告
+                </Button>
+                <Button type="link" size="small" onClick={() => setHistoryTask(r)}>
+                  执行记录
                 </Button>
                 {r.schedule_enabled && !r.is_paused && (
                   <Button
@@ -384,7 +473,12 @@ export default function TasksPage() {
             type="info"
             showIcon
             style={{ marginBottom: 12 }}
-            message={`任务 ID：${editing.id.slice(0, 8)}… · 状态 ${editing.status}`}
+            message={
+              <Space>
+                <span>任务 ID：{editing.id.slice(0, 8)}…</span>
+                {statusTag(editing.status)}
+              </Space>
+            }
             description="可修改查询条件与调度。保存后立即生效；若启用定时且未暂停，将重新计算下次运行时间。"
           />
         )}
@@ -475,14 +569,95 @@ export default function TasksPage() {
                 <DatePicker style={{ width: "100%" }} />
               </Form.Item>
             </Col>
-            <Col xs={24} md={8}>
-              <Form.Item name="execute_immediately" label="创建时立即执行标记" valuePropName="checked">
-                <Switch />
-              </Form.Item>
-            </Col>
           </Row>
+          <Form.Item name="execute_immediately" hidden valuePropName="checked">
+            <Switch />
+          </Form.Item>
         </Form>
       </Modal>
+
+      <Drawer
+        title={historyTask ? `执行记录 · ${historyTask.original_query}` : "执行记录"}
+        open={Boolean(historyTask)}
+        onClose={() => setHistoryTask(null)}
+        width="min(760px, 100vw)"
+      >
+        <Alert
+          type="info"
+          showIcon
+          style={{ marginBottom: 16 }}
+          message="每次首轮、手工和定时执行都会单独留痕"
+          description="定时任务的任务状态保持“已计划”，最近一次成功或失败以这里的执行状态为准。"
+        />
+        <Table
+          loading={historyQuery.isLoading}
+          rowKey="id"
+          dataSource={historyQuery.data?.items || []}
+          pagination={{ pageSize: 10, total: historyQuery.data?.total || 0 }}
+          scroll={{ x: 780 }}
+          columns={[
+            {
+              title: "触发方式",
+              dataIndex: "trigger_type",
+              width: 110,
+              render: (value: string, row) => (
+                <Space direction="vertical" size={0}>
+                  <span>{triggerLabels[value] || value}</span>
+                  <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+                    {row.report_mode === "full_snapshot" ? "未去重快照" : "增量"}
+                  </Typography.Text>
+                </Space>
+              ),
+            },
+            {
+              title: "状态",
+              dataIndex: "status",
+              width: 100,
+              render: (value: string) => statusTag(value, true),
+            },
+            {
+              title: "开始时间",
+              dataIndex: "started_at",
+              width: 170,
+              render: (value?: string | null) => formatDateTime(value || undefined),
+            },
+            {
+              title: "结果",
+              key: "counts",
+              width: 150,
+              render: (_: unknown, row) => (
+                <Typography.Text type="secondary">
+                  原始 {row.raw_result_count} / 增量 {row.incremental_count}
+                </Typography.Text>
+              ),
+            },
+            {
+              title: "说明",
+              key: "note",
+              ellipsis: true,
+              render: (_: unknown, row) => row.error_message || row.analysis_preview?.portfolio_summary || "—",
+            },
+            {
+              title: "报告",
+              key: "report",
+              fixed: "right",
+              width: 90,
+              render: (_: unknown, row) =>
+                row.report_download_url ? (
+                  <Button
+                    type="link"
+                    size="small"
+                    href={apiResourceUrl(row.report_download_url)}
+                  >
+                    下载
+                  </Button>
+                ) : (
+                  "—"
+                ),
+            },
+          ]}
+        />
+      </Drawer>
     </Card>
   );
 }

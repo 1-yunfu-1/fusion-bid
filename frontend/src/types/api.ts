@@ -7,6 +7,9 @@ export interface HealthResponse {
   time: string;
   database: string;
   database_ok: boolean;
+  database_revision?: string;
+  extraction_version?: string;
+  capabilities?: string[];
   message: string;
 }
 

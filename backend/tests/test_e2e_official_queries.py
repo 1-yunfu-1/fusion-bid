@@ -62,6 +62,8 @@ async def test_sources_and_reports_endpoints(client: AsyncClient):
     assert s.status_code == 200
     names = {i["source_name"] for i in s.json()["items"]}
     assert "ccgp" in names and "cebpub" in names and "login_portal" in names
+    assert "public_source_placeholder" not in names
+    assert "fixture_source_placeholder" not in names
 
     login = await client.get("/api/login/status")
     assert login.status_code == 200
@@ -69,3 +71,4 @@ async def test_sources_and_reports_endpoints(client: AsyncClient):
 
     rep = await client.get("/api/reports")
     assert rep.status_code == 200
+    assert "reports_dir" not in rep.json()

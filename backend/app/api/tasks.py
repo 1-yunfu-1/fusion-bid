@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 from datetime import datetime
+from pathlib import Path
+from urllib.parse import quote
 from zoneinfo import ZoneInfo
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -14,7 +16,17 @@ from app.core.database import get_db
 from app.models.execution import TaskExecution
 from app.models.task import SearchTask
 from app.parsers.validator import validate_intent
-from app.schemas.task import TaskListResponse, TaskOut, TaskUpdateRequest, TaskUpdateResponse
+from app.schemas.task import (
+    TaskExecuteRequest,
+    TaskExecutionItem,
+    TaskExecutionListResponse,
+    TaskExecutionResponse,
+    TaskListResponse,
+    TaskOut,
+    TaskUpdateRequest,
+    TaskUpdateResponse,
+)
+from app.reports.analysis import analysis_preview
 from app.services.crawl_service import execute_search_task
 
 router = APIRouter(prefix="/tasks", tags=["tasks"])
@@ -126,8 +138,22 @@ async def update_task(
     )
 
 
-@router.post("/{task_id}/execute")
-async def execute_task(task_id: str, db: AsyncSession = Depends(get_db)) -> dict:
+def _report_fields(report_path: str | None) -> tuple[str | None, str | None]:
+    if not report_path:
+        return None, None
+    path = Path(report_path)
+    filename = path.name
+    if not filename or not path.is_file():
+        return filename or None, None
+    return filename, f"/api/reports/download/{quote(filename)}"
+
+
+@router.post("/{task_id}/execute", response_model=TaskExecutionResponse)
+async def execute_task(
+    task_id: str,
+    body: TaskExecuteRequest | None = None,
+    db: AsyncSession = Depends(get_db),
+) -> TaskExecutionResponse:
     """立即执行多源采集（防并发；登录源失败不阻塞公开源）."""
     from app.scheduler import manager as sched
 
@@ -144,32 +170,69 @@ async def execute_task(task_id: str, db: AsyncSession = Depends(get_db)) -> dict
             raise HTTPException(status_code=409, detail="该任务正在执行中，请勿重复触发")
         sched._running_tasks.add(task_id)
     try:
-        execution, stats = await execute_search_task(db, task)
+        trigger_type = body.trigger_type if body else "manual"
+        report_mode = body.report_mode if body else "incremental"
+        report_scope = "snapshot" if report_mode == "full_snapshot" else "incremental"
+        execution, stats = await execute_search_task(
+            db,
+            task,
+            trigger_type=trigger_type,
+            report_mode=report_mode,
+            report_scope=report_scope,
+        )
+        # 接口语义以当次请求为准；同时保留 report_scope 供旧客户端读取。
+        execution.report_mode = report_mode
+        execution.report_scope = report_scope
+        execution.deduplicate = report_mode != "full_snapshot"
+        execution.truncated = getattr(stats, "truncated", False)
         task.last_run_at = datetime.now(ZoneInfo(task.timezone or "Asia/Shanghai"))
         await db.commit()
-        return {
-            "execution_id": execution.id,
-            "task_id": task.id,
-            "status": execution.status,
-            "sources_requested": stats.sources_requested,
-            "sources_succeeded": stats.sources_succeeded,
-            "sources_failed": stats.sources_failed,
-            "raw_result_count": stats.raw_result_count,
-            "detail_success_count": stats.detail_success_count,
-            "filtered_out_count": stats.filtered_out_count,
-            "duplicate_count": stats.duplicate_count,
-            "cross_source_merge_count": stats.cross_source_merge_count,
-            "saved_count": stats.saved_count,
-            "incremental_count": stats.incremental_count,
-            "update_count": stats.update_count,
-            "skipped_already_delivered": stats.skipped_already_delivered,
-            "announcement_ids": stats.announcement_ids,
-            "output_items": stats.output_items,
-            "dedupe_reasons": stats.dedupe_reasons[:20],
-            "report_path": stats.report_path or execution.report_path,
-            "error_message": execution.error_message,
-            "message": "采集完成" if execution.status != "failed" else "采集失败",
-        }
+        await db.refresh(task)
+        report_filename, report_download_url = _report_fields(
+            stats.report_path or execution.report_path
+        )
+        return TaskExecutionResponse(
+            execution_id=execution.id,
+            task_id=task.id,
+            status=execution.status,
+            task_status=task.status,
+            trigger_type=execution.trigger_type,
+            report_scope=execution.report_scope,
+            report_mode=report_mode,
+            deduplicate=getattr(stats, "deduplicate", report_mode != "full_snapshot"),
+            truncated=getattr(stats, "truncated", False),
+            next_run_at=task.next_run_at,
+            sources_requested=stats.sources_requested,
+            sources_succeeded=stats.sources_succeeded,
+            sources_failed=stats.sources_failed,
+            raw_result_count=stats.raw_result_count,
+            detail_success_count=stats.detail_success_count,
+            detail_metadata_only_count=stats.detail_metadata_only_count,
+            detail_failed_count=(
+                getattr(stats, "detail_failed", 0)
+                + getattr(stats, "detail_status_failed_count", 0)
+            ),
+            detail_human_verification_count=getattr(
+                stats, "detail_human_verification_count", 0
+            ),
+            filtered_out_count=stats.filtered_out_count,
+            duplicate_count=stats.duplicate_count,
+            cross_source_merge_count=stats.cross_source_merge_count,
+            saved_count=stats.saved_count,
+            incremental_count=stats.incremental_count,
+            update_count=stats.update_count,
+            skipped_already_delivered=stats.skipped_already_delivered,
+            announcement_ids=stats.announcement_ids,
+            output_items=stats.output_items,
+            dedupe_reasons=stats.dedupe_reasons[:20],
+            report_filename=report_filename,
+            report_download_url=report_download_url,
+            analysis_status=(stats.analysis_data or execution.analysis_data or {}).get("status", "rule_only"),
+            analysis_provider=(stats.analysis_data or execution.analysis_data or {}).get("provider", "rules"),
+            analysis_preview=analysis_preview(stats.analysis_data or execution.analysis_data),
+            error_message=execution.error_message,
+            message="采集完成" if execution.status != "failed" else "采集失败",
+        )
     finally:
         async with sched._run_lock:
             sched._running_tasks.discard(task_id)
@@ -260,8 +323,10 @@ async def scheduler_jobs() -> dict:
     }
 
 
-@router.get("/{task_id}/executions")
-async def list_executions(task_id: str, db: AsyncSession = Depends(get_db)) -> dict:
+@router.get("/{task_id}/executions", response_model=TaskExecutionListResponse)
+async def list_executions(
+    task_id: str, db: AsyncSession = Depends(get_db)
+) -> TaskExecutionListResponse:
     task = await db.get(SearchTask, task_id)
     if not task:
         raise HTTPException(status_code=404, detail="任务不存在")
@@ -272,22 +337,39 @@ async def list_executions(task_id: str, db: AsyncSession = Depends(get_db)) -> d
             .order_by(TaskExecution.created_at.desc())
         )
     ).scalars().all()
-    items = []
+    items: list[TaskExecutionItem] = []
     for e in rows:
+        report_filename, report_download_url = _report_fields(e.report_path)
         items.append(
-            {
-                "id": e.id,
-                "status": e.status,
-                "started_at": e.started_at.isoformat() if e.started_at else None,
-                "finished_at": e.finished_at.isoformat() if e.finished_at else None,
-                "sources_requested": e.sources_requested,
-                "sources_succeeded": e.sources_succeeded,
-                "raw_result_count": e.raw_result_count,
-                "filtered_result_count": e.filtered_result_count,
-                "duplicate_count": e.duplicate_count,
-                "incremental_count": e.incremental_count,
-                "report_path": e.report_path,
-                "error_message": e.error_message,
-            }
+            TaskExecutionItem(
+                id=e.id,
+                status=e.status,
+                trigger_type=e.trigger_type,
+                report_scope=e.report_scope,
+                report_mode=getattr(e, "report_mode", None)
+                or ("full_snapshot" if e.report_scope == "snapshot" else "incremental"),
+                deduplicate=getattr(e, "deduplicate", e.report_scope != "snapshot"),
+                truncated=getattr(e, "truncated", False),
+                started_at=e.started_at,
+                finished_at=e.finished_at,
+                sources_requested=e.sources_requested or [],
+                sources_succeeded=e.sources_succeeded or [],
+                raw_result_count=e.raw_result_count,
+                filtered_result_count=e.filtered_result_count,
+                duplicate_count=e.duplicate_count,
+                incremental_count=e.incremental_count,
+                detail_full_count=getattr(e, "detail_full_count", 0),
+                detail_metadata_count=getattr(e, "detail_metadata_count", 0),
+                detail_failed_count=getattr(e, "detail_failed_count", 0),
+                detail_human_verification_count=getattr(
+                    e, "detail_human_verification_count", 0
+                ),
+                report_filename=report_filename,
+                report_download_url=report_download_url,
+                analysis_status=(e.analysis_data or {}).get("status", "rule_only"),
+                analysis_provider=(e.analysis_data or {}).get("provider", "rules"),
+                analysis_preview=analysis_preview(e.analysis_data),
+                error_message=e.error_message,
+            )
         )
-    return {"items": items, "total": len(items)}
+    return TaskExecutionListResponse(items=items, total=len(items))

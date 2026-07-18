@@ -17,6 +17,8 @@ TZ = ZoneInfo("Asia/Shanghai")
 async def list_sources() -> dict:
     items = []
     for s in build_sources(only_enabled=False):
+        if not getattr(s, "visible", True):
+            continue
         items.append(
             {
                 "source_name": s.source_name,
@@ -24,7 +26,7 @@ async def list_sources() -> dict:
                 "requires_login": s.requires_login,
                 "enabled": s.enabled,
                 "official": getattr(s, "official", False),
-                "data_mode": "live" if s.enabled and not isinstance(s.source_name, type) else "live",
+                "data_mode": getattr(s, "data_mode", "live"),
             }
         )
     return {"items": items, "checked_at": datetime.now(TZ).isoformat()}
@@ -50,15 +52,7 @@ async def source_health(source_name: str) -> dict:
 async def health_all() -> dict:
     results = []
     for s in build_sources(only_enabled=False):
-        if not s.enabled and s.requires_login:
-            results.append(
-                {
-                    "source_name": s.source_name,
-                    "ok": False,
-                    "message": "未启用（登录源待阶段四）",
-                    "requires_login": True,
-                }
-            )
+        if not getattr(s, "visible", True):
             continue
         try:
             r = await s.health_check()

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import re
 from pathlib import Path
+from urllib.parse import quote
 
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import FileResponse
@@ -61,7 +62,6 @@ async def list_reports(db: AsyncSession = Depends(get_db)) -> dict:
         name = Path(ex.report_path).name
         by_name[name] = {
             "filename": name,
-            "path": ex.report_path,
             "execution_id": ex.id,
             "task_id": task.id,
             "original_query": task.original_query,
@@ -95,7 +95,7 @@ async def list_reports(db: AsyncSession = Depends(get_db)) -> dict:
         if name not in seen:
             items.append({**meta, "size": 0, "modified_at": None, "exists": False})
 
-    return {"items": items, "total": len(items), "reports_dir": str(base)}
+    return {"items": items, "total": len(items)}
 
 
 @router.get("/download/{filename}")
@@ -120,7 +120,6 @@ async def report_by_execution(
     return {
         "execution_id": ex.id,
         "filename": name,
-        "report_path": ex.report_path,
         "exists": exists,
-        "download_url": f"/api/reports/download/{name}" if exists else None,
+        "download_url": f"/api/reports/download/{quote(name)}" if exists else None,
     }

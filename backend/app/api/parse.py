@@ -74,11 +74,8 @@ async def confirm_parse(
 
     schedule_enabled = intent.schedule.enabled
 
-    status = "confirmed"
-    if schedule_enabled and not intent.execute_immediately:
-        status = "scheduled"
-    elif intent.execute_immediately:
-        status = "confirmed"
+    # 定时任务始终保留 scheduled 语义；execute_immediately 仅表示是否执行创建后的首轮。
+    status = "scheduled" if schedule_enabled else "confirmed"
 
     task = SearchTask(
         original_query=intent.original_query,
@@ -126,7 +123,7 @@ async def confirm_parse(
     if schedule_enabled:
         msg += "，已注册定时调度" if schedule_info and schedule_info.get("scheduled") else "（定时注册见 schedule_info）"
     if intent.execute_immediately:
-        msg += "；可立即在任务列表点击执行采集"
+        msg += "；将立即执行首轮检索"
 
     return ConfirmParseResponse(
         task_id=task.id,

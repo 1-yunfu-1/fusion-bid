@@ -14,13 +14,24 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.browser.session import LoginRequiredError
 from app.cleaners.filters import FilterContext, filter_detail, filter_list_item, simple_summary
 from app.core.config import get_settings
-from app.deduplication.engine import CandidateRecord, deduplicate_candidates
-from app.deduplication.incremental import mark_delivered, plan_incremental_delivery
+from app.deduplication.engine import CandidateRecord, deduplicate_candidates, is_duplicate
+from app.deduplication.incremental import (
+    IncrementalPlan,
+    mark_delivered,
+    plan_incremental_delivery,
+)
 from app.deduplication.normalize import normalize_bid_code
 from app.models.announcement import TenderAnnouncement
+from app.models.company import CompanyProfile
+from app.models.company import AnnouncementFieldCorrection
 from app.models.execution import TaskExecution
 from app.models.task import SearchTask
-from app.reports.fields import source_display_name
+from app.reports.analysis import build_execution_analysis
+from app.reports.fields import (
+    apply_manual_corrections,
+    build_extraction_data_with_ai,
+    source_display_name,
+)
 from app.reports.word_report import ReportContext, SourceRunStat, generate_report_file
 from app.sources.base import SearchQuery
 from app.sources.registry import build_sources
@@ -39,7 +50,10 @@ class CrawlStats:
     list_filtered_out: int = 0
     detail_cap_skipped: int = 0
     detail_failed: int = 0
+    detail_status_failed_count: int = 0
     detail_success_count: int = 0
+    detail_metadata_only_count: int = 0
+    detail_human_verification_count: int = 0
     detail_filtered_out: int = 0
     candidates_count: int = 0
     filtered_out_count: int = 0  # list + detail 过滤合计（兼容）
@@ -55,6 +69,11 @@ class CrawlStats:
     output_items: list[dict] = field(default_factory=list)
     dedupe_reasons: list[str] = field(default_factory=list)
     report_path: str | None = None
+    report_scope: str = "incremental"
+    report_mode: str = "incremental"
+    deduplicate: bool = True
+    truncated: bool = False
+    analysis_data: dict = field(default_factory=dict)
 
 
 def _content_hash(title: str, content: str, url: str) -> str:
@@ -68,20 +87,149 @@ def _source_dedupe_key(source_name: str, item_id: str | None, url: str, title: s
     return f"{source_name}:{hashlib.md5((url or title).encode()).hexdigest()}"
 
 
+def _snapshot_record_id(record: CandidateRecord, index: int) -> str:
+    """Return an opaque report-row identifier without pretending it is a DB ID."""
+    identity = "|".join(
+        [
+            record.source_name or "",
+            record.source_item_id or "",
+            record.source_url or "",
+            record.content_hash or "",
+            str(index),
+        ]
+    )
+    digest = hashlib.sha256(identity.encode("utf-8")).hexdigest()[:16]
+    return f"snapshot:{index + 1}:{digest}"
+
+
+def _snapshot_duplicate_hints(records: list[CandidateRecord]) -> list[dict[str, object]]:
+    """Describe possible same-batch duplicates without removing any record.
+
+    ``deduplicate_candidates`` mutates primary records while merging.  The
+    snapshot report needs the pre-merge source records, so it uses the same
+    duplicate predicate only to disclose possible duplicates to the reader.
+    """
+    reasons: list[list[str]] = [[] for _ in records]
+    for right_index, right in enumerate(records):
+        for left_index in range(right_index):
+            is_same, reason = is_duplicate(records[left_index], right)
+            if not is_same:
+                continue
+            if reason:
+                reasons[left_index].append(reason)
+                reasons[right_index].append(reason)
+
+    hints: list[dict[str, object]] = []
+    for item_reasons in reasons:
+        unique_reasons = list(dict.fromkeys(item_reasons))
+        hints.append(
+            {
+                "dedupe_status": "保留（同批疑似重复）"
+                if unique_reasons
+                else "保留（未发现同批重复）",
+                "dedupe_hint": "；".join(unique_reasons),
+                "dedupe_reasons": unique_reasons,
+            }
+        )
+    return hints
+
+
+def _build_snapshot_output_items(
+    records: list[CandidateRecord], detail_meta: dict[str, dict],
+) -> list[dict]:
+    """Build a report-only, non-deduplicated view of this crawl batch.
+
+    This intentionally runs *before* the database and cross-source merge
+    steps.  Each accepted source record remains a separate report item, while
+    the durable announcement store and DeliveryHistory continue to use their
+    existing deduplicated primary records.
+    """
+    hints = _snapshot_duplicate_hints(records)
+    items: list[dict] = []
+    for index, (record, hint) in enumerate(zip(records, hints, strict=True)):
+        meta = detail_meta.get(record.source_url) or {}
+        row_id = _snapshot_record_id(record, index)
+        items.append(
+            {
+                "announcement_id": row_id,
+                "report_item_id": row_id,
+                "snapshot_record": True,
+                "source_item_id": record.source_item_id,
+                "title": record.title,
+                "source_name": record.source_name,
+                "source_url": record.source_url,
+                "related_urls": [record.source_url] if record.source_url else [],
+                "related_sources": [],
+                "dedupe_reasons": hint["dedupe_reasons"],
+                "dedupe_status": hint["dedupe_status"],
+                "dedupe_hint": hint["dedupe_hint"],
+                "is_new": False,
+                "is_update": False,
+                "change_label": "本轮原始记录（未去重）",
+                "content_hash": record.content_hash,
+                "summary": record.summary,
+                "clean_content": (record.clean_content or "")[:8000],
+                "publish_time": record.publish_time.isoformat() if record.publish_time else None,
+                "region": record.region,
+                "project_code": record.project_code,
+                "announcement_type": record.announcement_type,
+                "detail_status": record.detail_status or meta.get("detail_status", "unknown"),
+                "source_metadata": record.source_metadata
+                or meta.get("source_metadata")
+                or {},
+                "extraction_data": record.extraction_data or {},
+                "attachment_links": record.attachment_links or [],
+                "data_mode": record.data_mode,
+                "requires_login": record.requires_login,
+                "detail_fetched": meta.get(
+                    "detail_fetched", record.detail_status == "full"
+                ),
+                "attachment_extract_failed": meta.get(
+                    "attachment_extract_failed", False
+                ),
+                "detail_url": meta.get("detail_url") or record.source_url,
+                "content_format": meta.get("content_format"),
+            }
+        )
+    return items
+
+
 async def execute_search_task(
     db: AsyncSession,
     task: SearchTask,
     *,
-    max_details_per_source: int = 8,
+    max_details_per_source: int | None = None,
+    trigger_type: str = "manual",
+    report_mode: str | None = None,
+    report_scope: str | None = None,
 ) -> tuple[TaskExecution, CrawlStats]:
     get_settings()
-    stats = CrawlStats()
+    if report_mode is None:
+        report_mode = "full_snapshot" if report_scope == "snapshot" else "incremental"
+    report_mode = (
+        report_mode if report_mode in {"incremental", "full_snapshot"} else "incremental"
+    )
+    report_scope = "snapshot" if report_mode == "full_snapshot" else "incremental"
+    detail_cap = max_details_per_source
+    if detail_cap is None:
+        detail_cap = 500 if report_mode == "full_snapshot" else 8
+    detail_cap = min(max(int(detail_cap), 1), 500)
+    stats = CrawlStats(
+        report_scope=report_scope,
+        report_mode=report_mode,
+        deduplicate=report_mode != "full_snapshot",
+    )
     now = datetime.now(TZ)
 
     execution = TaskExecution(
         task_id=task.id,
         started_at=now,
         status="running",
+        trigger_type=trigger_type,
+        report_scope=report_scope,
+        report_mode=report_mode,
+        deduplicate=report_mode != "full_snapshot",
+        truncated=False,
         sources_requested=[],
         sources_succeeded=[],
         raw_result_count=0,
@@ -146,10 +294,12 @@ async def execute_search_task(
                     stats.filtered_out_count += 1
 
             src_stat.list_kept = len(kept)
-            if len(kept) > max_details_per_source:
-                stats.detail_cap_skipped += len(kept) - max_details_per_source
+            if len(kept) > detail_cap:
+                stats.detail_cap_skipped += len(kept) - detail_cap
+            if report_mode == "full_snapshot" and len(kept) >= 500:
+                stats.truncated = True
 
-            for it in kept[:max_details_per_source]:
+            for it in kept[:detail_cap]:
                 att_extract_failed = False
                 try:
                     detail = await source.fetch_detail(it)
@@ -165,8 +315,18 @@ async def execute_search_task(
                         )
                         detail.attachment_links = list(detail.attachment_links or [])
                         att_extract_failed = True
-                    stats.detail_success_count += 1
-                    src_stat.detail_success += 1
+                    if detail.detail_fetched and detail.detail_status == "full":
+                        stats.detail_success_count += 1
+                        src_stat.detail_success += 1
+                    elif detail.detail_status == "needs_human_verification":
+                        stats.detail_human_verification_count += 1
+                        src_stat.detail_metadata_only += 1
+                    elif detail.detail_status == "failed":
+                        stats.detail_status_failed_count += 1
+                        src_stat.detail_metadata_only += 1
+                    else:
+                        stats.detail_metadata_only_count += 1
+                        src_stat.detail_metadata_only += 1
                 except Exception as exc:  # noqa: BLE001
                     logger.warning("%s detail fail %s: %s", source.source_name, it.source_url, exc)
                     stats.detail_failed += 1
@@ -188,11 +348,29 @@ async def execute_search_task(
                 chash = _content_hash(detail.title, detail.clean_content, detail.source_url)
                 summary = simple_summary(detail.title, detail.clean_content)
                 code = normalize_bid_code(f"{detail.title} {detail.clean_content or ''}")
+                extraction_data = await build_extraction_data_with_ai(
+                    title=detail.title,
+                    clean_content=detail.clean_content,
+                    summary=summary,
+                    region=detail.region or it.region,
+                    project_code=code,
+                    publish_time=detail.publish_time,
+                    detail_status=detail.detail_status,
+                    source_metadata=detail.source_metadata,
+                )
                 detail_meta[detail.source_url] = {
-                    "detail_fetched": True,
+                    "detail_fetched": detail.detail_fetched,
+                    "detail_status": detail.detail_status,
+                    "source_metadata": detail.source_metadata,
                     "attachment_extract_failed": att_extract_failed,
                     "requires_login": source.requires_login,
+                    "detail_url": detail.detail_url or detail.source_url,
+                    "content_format": detail.content_format,
                 }
+
+                announcement_type = (extraction_data.get("fields") or {}).get(
+                    "announcement_type"
+                )
 
                 candidates.append(
                     CandidateRecord(
@@ -209,10 +387,14 @@ async def execute_search_task(
                         summary=summary,
                         clean_content=detail.clean_content,
                         raw_content=(detail.raw_content or "")[:500000],
+                        detail_status=detail.detail_status,
+                        source_metadata=detail.source_metadata,
+                        extraction_data=extraction_data,
                         attachment_links=list(detail.attachment_links or []),
                         content_hash=chash,
                         deduplication_key=dkey,
                         project_code=code,
+                        announcement_type=announcement_type,
                     )
                 )
 
@@ -238,6 +420,13 @@ async def execute_search_task(
 
     # ---- 跨源去重（本批次）----
     stats.candidates_count = len(candidates)
+    # ``snapshot`` is a report-only, source-record view.  Build it before the
+    # dedupe engine mutates and merges candidate records.
+    snapshot_output_items = (
+        _build_snapshot_output_items(candidates, detail_meta)
+        if report_mode == "full_snapshot"
+        else []
+    )
     deduped = deduplicate_candidates(candidates)
     stats.cross_source_merge_count = deduped.merged_count
     stats.duplicate_count = deduped.merged_count
@@ -256,10 +445,21 @@ async def execute_search_task(
     for rec in deduped.primaries:
         # 库内：按全局内容/项目编号/标准化去重键查找已有主记录
         existing = None
+        lifecycle_siblings: list[TenderAnnouncement] = []
         if rec.project_code:
+            sibling_stmt = select(TenderAnnouncement).where(
+                TenderAnnouncement.project_code == rec.project_code,
+                TenderAnnouncement.is_primary.is_(True),
+            )
+            if rec.announcement_type:
+                sibling_stmt = sibling_stmt.where(
+                    TenderAnnouncement.announcement_type != rec.announcement_type
+                )
+            lifecycle_siblings = list((await db.execute(sibling_stmt)).scalars().all())
             existing = await db.scalar(
                 select(TenderAnnouncement).where(
                     TenderAnnouncement.project_code == rec.project_code,
+                    TenderAnnouncement.announcement_type == rec.announcement_type,
                     TenderAnnouncement.is_primary.is_(True),
                 )
             )
@@ -302,11 +502,43 @@ async def execute_search_task(
             existing.dedupe_reasons = list(
                 set((existing.dedupe_reasons or []) + (rec.dedupe_reasons or ["库内重复"]))
             )
-            # 内容更完整则更新
-            if rec.clean_content and len(rec.clean_content) > len(existing.clean_content or ""):
+            # 已核验的详情优先于列表元数据；同等详情质量时才按内容长度更新。
+            rec_is_full = rec.detail_status == "full"
+            existing_is_full = existing.detail_status == "full"
+            if rec.clean_content and (
+                (rec_is_full and not existing_is_full)
+                or (
+                    rec.detail_status == existing.detail_status
+                    and len(rec.clean_content) > len(existing.clean_content or "")
+                )
+            ):
                 existing.clean_content = rec.clean_content
                 existing.summary = rec.summary
                 existing.raw_content = rec.raw_content
+                existing.detail_status = rec.detail_status
+                existing.source_metadata = rec.source_metadata
+                existing.extraction_data = rec.extraction_data
+                existing.extraction_version = "v2"
+                existing.announcement_type = rec.announcement_type
+                existing.detail_url = rec.source_metadata.get("detail_url") if rec.source_metadata else rec.source_url
+                existing.content_format = rec.source_metadata.get("content_format") if rec.source_metadata else None
+            elif existing.detail_status in {"unknown", "failed"} and rec.detail_status:
+                existing.detail_status = rec.detail_status
+                existing.source_metadata = rec.source_metadata
+                existing.extraction_data = rec.extraction_data
+                existing.extraction_version = "v2"
+                existing.announcement_type = rec.announcement_type
+            corrections = (
+                await db.execute(
+                    select(AnnouncementFieldCorrection)
+                    .where(AnnouncementFieldCorrection.announcement_id == existing.id)
+                    .order_by(AnnouncementFieldCorrection.corrected_at.asc())
+                )
+            ).scalars().all()
+            if corrections and existing.extraction_data:
+                existing.extraction_data = apply_manual_corrections(
+                    existing.extraction_data, corrections
+                )
             atts = list(existing.attachment_links or [])
             for a in rec.attachment_links or []:
                 if a not in atts:
@@ -318,6 +550,18 @@ async def execute_search_task(
             ann_id = existing.id
             chash = existing.content_hash or rec.content_hash or ""
         else:
+            lifecycle_relations = list(rec.related_sources or [])
+            for sibling in lifecycle_siblings:
+                lifecycle_relations.append(
+                    {
+                        "source_name": sibling.source_name,
+                        "source_url": sibling.source_url,
+                        "announcement_id": sibling.id,
+                        "announcement_type": sibling.announcement_type,
+                        "relation": "lifecycle",
+                        "reason": "同项目编号不同公告类型，关联但不合并",
+                    }
+                )
             ann = TenderAnnouncement(
                 title=rec.title[:512],
                 source_name=rec.source_name,
@@ -333,13 +577,20 @@ async def execute_search_task(
                 summary=rec.summary,
                 clean_content=rec.clean_content,
                 raw_content=rec.raw_content,
+                detail_status=rec.detail_status,
+                source_metadata=rec.source_metadata,
+                extraction_data=rec.extraction_data,
+                extraction_version="v2",
+                announcement_type=rec.announcement_type,
+                detail_url=(rec.source_metadata or {}).get("detail_url") or rec.source_url,
+                content_format=(rec.source_metadata or {}).get("content_format"),
                 attachment_links=rec.attachment_links or [],
                 crawl_time=crawl_time,
                 content_hash=rec.content_hash,
                 deduplication_key=rec.deduplication_key,
                 is_primary=True,
                 related_urls=rec.related_urls or [rec.source_url],
-                related_sources=rec.related_sources or [],
+                related_sources=lifecycle_relations,
                 dedupe_reasons=rec.dedupe_reasons or [],
                 project_code=rec.project_code,
                 first_seen_at=crawl_time,
@@ -347,6 +598,23 @@ async def execute_search_task(
             )
             db.add(ann)
             await db.flush()
+            for sibling in lifecycle_siblings:
+                reverse = list(sibling.related_sources or [])
+                if not any(
+                    isinstance(row, dict) and row.get("announcement_id") == ann.id
+                    for row in reverse
+                ):
+                    reverse.append(
+                        {
+                            "source_name": ann.source_name,
+                            "source_url": ann.source_url,
+                            "announcement_id": ann.id,
+                            "announcement_type": ann.announcement_type,
+                            "relation": "lifecycle",
+                            "reason": "同项目编号不同公告类型，关联但不合并",
+                        }
+                    )
+                    sibling.related_sources = reverse
             stats.saved_count += 1
             ann_id = ann.id
             chash = rec.content_hash or ""
@@ -355,19 +623,35 @@ async def execute_search_task(
         id_hash_pairs.append((ann_id, chash))
 
     # ---- 增量：相对本任务 DeliveryHistory ----
-    plan = await plan_incremental_delivery(db, task_id=task.id, announcements=id_hash_pairs)
+    # 完整快照是独立审计输出，不读取、不写入增量交付历史。
+    if report_mode == "full_snapshot":
+        plan = IncrementalPlan(items=[], new_count=0, update_count=0, skipped_count=0)
+    else:
+        plan = await plan_incremental_delivery(
+            db, task_id=task.id, announcements=id_hash_pairs
+        )
     stats.incremental_count = plan.new_count
     stats.update_count = plan.update_count
     stats.skipped_already_delivered = plan.skipped_count
     stats.announcement_ids = saved_ids
 
-    output_items: list[dict] = []
-    for item in plan.items:
-        ann = await db.get(TenderAnnouncement, item.announcement_id)
+    output_items: list[dict] = (
+        snapshot_output_items if report_mode == "full_snapshot" else []
+    )
+    planned_by_id = {item.announcement_id: item for item in plan.items}
+    # 增量报告只展示未交付的变更；未去重快照已保留本轮每条来源记录，
+    # 不再经数据库主记录回读，避免跨源或库内合并吞掉报告条目。
+    report_ids = (
+        [] if report_mode == "full_snapshot" else list(planned_by_id)
+    )
+    for announcement_id in report_ids:
+        ann = await db.get(TenderAnnouncement, announcement_id)
         if not ann:
             continue
+        item = planned_by_id.get(ann.id)
         meta = detail_meta.get(ann.source_url) or {
-            "detail_fetched": True,
+            "detail_fetched": ann.detail_status == "full",
+            "detail_status": ann.detail_status or "unknown",
             "attachment_extract_failed": False,
             "requires_login": ann.requires_login,
         }
@@ -380,23 +664,72 @@ async def execute_search_task(
                 "related_urls": ann.related_urls or [ann.source_url],
                 "related_sources": ann.related_sources or [],
                 "dedupe_reasons": ann.dedupe_reasons or [],
-                "is_new": item.is_new,
-                "is_update": item.is_update,
-                "change_label": "内容发生变化" if item.is_update else ("新增" if item.is_new else ""),
-                "content_hash": item.content_hash,
+                "is_new": bool(item and item.is_new),
+                "is_update": bool(item and item.is_update),
+                "change_label": (
+                    "内容发生变化"
+                    if item and item.is_update
+                    else ("新增" if item and item.is_new else "")
+                ),
+                "content_hash": item.content_hash if item else ann.content_hash,
                 "summary": ann.summary,
                 "clean_content": (ann.clean_content or "")[:8000],
                 "publish_time": ann.publish_time.isoformat() if ann.publish_time else None,
                 "region": ann.region,
                 "project_code": ann.project_code,
+                "announcement_type": ann.announcement_type,
+                "detail_status": ann.detail_status or meta.get("detail_status", "unknown"),
+                "source_metadata": ann.source_metadata or meta.get("source_metadata") or {},
+                "extraction_data": ann.extraction_data,
                 "attachment_links": ann.attachment_links or [],
                 "data_mode": ann.data_mode,
                 "requires_login": ann.requires_login,
-                "detail_fetched": meta.get("detail_fetched", True),
+                "detail_fetched": meta.get("detail_fetched", ann.detail_status == "full"),
                 "attachment_extract_failed": meta.get("attachment_extract_failed", False),
+                "detail_url": ann.detail_url or ann.source_url,
+                "content_format": ann.content_format,
             }
         )
     stats.output_items = output_items
+
+    # 规则分析不影响采集成功与否；可选 LLM 仅在证据校验后补充简短研判。
+    try:
+        profile_row = await db.scalar(
+            select(CompanyProfile).order_by(CompanyProfile.updated_at.desc())
+        )
+        analysis = await build_execution_analysis(
+            output_items,
+            keywords=keywords,
+            regions=regions,
+            start_date=start.isoformat() if start else None,
+            end_date=end.isoformat() if end else None,
+            company_profile=profile_row.profile_data if profile_row else None,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("execution analysis unavailable: %s", exc)
+        analysis = {
+            "version": 1,
+            "status": "rule_unavailable",
+            "provider": "rules",
+            "portfolio_summary": "本轮未能生成机会研判；公告原始字段与报告仍可用。",
+            "projects": [],
+        }
+    stats.analysis_data = analysis
+    execution.analysis_data = analysis
+    analysis_by_id = {
+        str(project.get("announcement_id")): project
+        for project in analysis.get("projects", [])
+        if isinstance(project, dict) and project.get("announcement_id")
+    }
+    for output_item in output_items:
+        project = analysis_by_id.get(str(output_item.get("announcement_id")))
+        if project:
+            output_item["analysis_data"] = project
+            announcement_id = str(output_item.get("announcement_id") or "")
+            if not announcement_id.startswith("snapshot:"):
+                announcement = await db.get(TenderAnnouncement, announcement_id)
+                if announcement:
+                    announcement.analysis_data = project
 
     # 各源报告贡献
     contrib_map: dict[str, int] = {}
@@ -413,9 +746,22 @@ async def execute_search_task(
     execution.filtered_result_count = len(deduped.primaries)
     execution.duplicate_count = stats.duplicate_count
     execution.incremental_count = plan.new_count + plan.update_count
+    execution.truncated = stats.truncated
+    execution.detail_full_count = stats.detail_success_count
+    execution.detail_metadata_count = stats.detail_metadata_only_count
+    execution.detail_failed_count = stats.detail_failed + stats.detail_status_failed_count
+    execution.detail_human_verification_count = stats.detail_human_verification_count
 
     if stats.sources_succeeded:
-        execution.status = "partial" if stats.sources_failed else "success"
+        has_quality_failures = bool(
+            stats.sources_failed
+            or stats.detail_failed
+            or stats.detail_status_failed_count
+            or stats.detail_metadata_only_count
+            or stats.detail_human_verification_count
+            or stats.truncated
+        )
+        execution.status = "partial" if has_quality_failures else "success"
     else:
         execution.status = "failed"
     if errors:
@@ -447,11 +793,25 @@ async def execute_search_task(
     if stats.sources_failed:
         for sn, reason in stats.sources_failed.items():
             warnings.append(f"{source_display_name(sn)}：{reason}")
+    if stats.detail_human_verification_count:
+        warnings.append(
+            f"{stats.detail_human_verification_count} 条详情要求人工完成安全验证；"
+            "系统未绕过验证，该类记录不按完整正文分析。"
+        )
+    if stats.truncated:
+        warnings.append(
+            "本次快照已达每源 500 条安全上限，truncated=true；"
+            "报告不声称为完整覆盖。"
+        )
 
     report_ctx = ReportContext(
         original_query=task.original_query,
         generated_at=execution.finished_at or datetime.now(TZ),
-        execute_type="定时执行" if task.schedule_enabled and not task.execute_immediately else "立即执行",
+        execute_type={
+            "scheduled": "定时执行",
+            "initial": "创建后首轮执行",
+            "manual": "手工执行",
+        }.get(trigger_type, "手工执行"),
         data_mode=data_mode_label,
         execution_status=execution.status or "success",
         keywords=keywords,
@@ -469,6 +829,9 @@ async def execute_search_task(
         detail_cap_skipped=stats.detail_cap_skipped,
         detail_failed=stats.detail_failed,
         detail_success_count=stats.detail_success_count,
+        detail_metadata_only_count=stats.detail_metadata_only_count,
+        detail_status_failed_count=stats.detail_status_failed_count,
+        detail_human_verification_count=stats.detail_human_verification_count,
         detail_filtered_out=stats.detail_filtered_out,
         candidates_count=stats.candidates_count,
         filtered_out_count=stats.filtered_out_count,
@@ -480,6 +843,10 @@ async def execute_search_task(
         incremental_count=plan.new_count,
         update_count=plan.update_count,
         skipped_already_delivered=plan.skipped_count,
+        report_scope=report_scope,
+        truncated=stats.truncated,
+        deduplicate=stats.deduplicate,
+        analysis=analysis,
         items=output_items,
         crawl_time=crawl_time.isoformat(),
         warnings=warnings,
@@ -505,6 +872,7 @@ async def execute_search_task(
     # 仅成功写出报告后标记交付；失败执行或报告失败不写 DeliveryHistory
     if (
         execution.status in ("success", "partial")
+        and report_mode == "incremental"
         and plan.items
         and report_path is not None
     ):
@@ -516,7 +884,11 @@ async def execute_search_task(
             now=execution.finished_at,
         )
 
-    task.status = "done" if execution.status in ("success", "partial") else "failed"
+    # 首轮或手工执行不应破坏后续调度；最近一次执行状态由 TaskExecution 表达。
+    if task.schedule_enabled and not task.is_paused:
+        task.status = "scheduled"
+    else:
+        task.status = "done" if execution.status in ("success", "partial") else "failed"
     await db.commit()
     await db.refresh(execution)
     return execution, stats
