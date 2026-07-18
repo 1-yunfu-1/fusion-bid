@@ -49,6 +49,7 @@ def _normalise_identity(value: str) -> str:
 
 _DOCUMENT_TITLE_SUFFIXES = (
     "国际招标澄清或变更公告",
+    "国际招标公告",
     "招标澄清或变更公告",
     "澄清或变更公告",
     "中标候选人公示",
@@ -492,22 +493,16 @@ async def _fetch_managed_public_pdf_detail(
     for browser_attempt in range(2):
         try:
             async with broker.acquire(interactive=not headless) as lease:
-                for tab_attempt in range(2):
-                    page = await lease.context.new_page()
-                    try:
-                        result = await _collect_public_pdf_detail(
-                            page,
-                            detail_url=detail_url,
-                            expected_id=expected_id,
-                            expected_title=expected_title,
-                            timeout_ms=timeout_ms,
-                            headless=headless,
-                        )
-                    finally:
-                        try:
-                            await page.close()
-                        except Exception:  # noqa: BLE001
-                            pass
+                page = await broker.get_work_page(lease.context)
+                for page_attempt in range(2):
+                    result = await _collect_public_pdf_detail(
+                        page,
+                        detail_url=detail_url,
+                        expected_id=expected_id,
+                        expected_title=expected_title,
+                        timeout_ms=timeout_ms,
+                        headless=headless,
+                    )
                     result.acquisition_mode = "managed_chrome"
                     result.browser_reused = lease.reused
                     # 返回发生在租约退出之前，此刻内部状态仍是 busy；对调用方
@@ -516,6 +511,8 @@ async def _fetch_managed_public_pdf_detail(
                         "ready" if broker.is_connected else "unavailable"
                     )
                     last_result = result
+                    if result.failure_reason == "browser_closed":
+                        raise RuntimeError("managed public browser page closed")
                     if result.status == "full":
                         return result
                     if result.status == "needs_human_verification":
@@ -528,7 +525,7 @@ async def _fetch_managed_public_pdf_detail(
                         "incomplete_pdf_pages",
                     }:
                         return result
-                    if tab_attempt == 0:
+                    if page_attempt == 0:
                         await asyncio.sleep(1)
                 if broker.is_connected:
                     return last_result

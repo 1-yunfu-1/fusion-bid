@@ -120,18 +120,33 @@ class ManagedPublicBrowser:
         self._pid: int | None = None
         self._port: int | None = None
         self._process: subprocess.Popen | None = None
-        self._playwright_manager: Any = None
         self._playwright: Any = None
         self._browser: Any = None
+        self._work_page: Any = None
         self._operation_lock = asyncio.Lock()
         self._lifecycle_lock = asyncio.Lock()
 
     @property
     def is_connected(self) -> bool:
-        return bool(self._browser and self._browser.is_connected())
+        if not self._browser or not self._browser.is_connected():
+            return False
+        if self._process is not None and self._process.poll() is not None:
+            return False
+        if (
+            os.name == "nt"
+            and self._pid
+            and self._process is None
+            and _process_executable(self._pid) is None
+        ):
+            return False
+        return True
 
     def status(self) -> dict[str, Any]:
         state = self._state if self._state in PUBLIC_BROWSER_STATES else "unavailable"
+        last_error = self._last_error
+        if state in {"ready", "busy", "needs_verification"} and not self.is_connected:
+            state = "unavailable"
+            last_error = last_error or "专用浏览器进程已退出，将在下次采集时自动重启"
         try:
             profile_ready = self.profile_dir.is_dir() and any(
                 self.profile_dir.iterdir()
@@ -142,7 +157,7 @@ class ManagedPublicBrowser:
             "state": state,
             "engine": self._engine,
             "profile_ready": profile_ready,
-            "last_error": self._last_error,
+            "last_error": last_error,
         }
 
     async def _cdp_ready(self, port: int, timeout_seconds: float = 20) -> bool:
@@ -168,8 +183,7 @@ class ManagedPublicBrowser:
             raise ManagedPublicBrowserError(
                 "Playwright 未安装，请使用一键启动脚本安装完整依赖"
             ) from exc
-        manager = async_playwright()
-        playwright = await manager.start()
+        playwright = await async_playwright().start()
         try:
             browser = await playwright.chromium.connect_over_cdp(
                 f"http://127.0.0.1:{port}",
@@ -180,11 +194,11 @@ class ManagedPublicBrowser:
             if not browser.contexts:
                 raise ManagedPublicBrowserError("专用浏览器没有可用默认上下文")
         except Exception:
-            await manager.stop()
+            await playwright.stop()
             raise
-        self._playwright_manager = manager
         self._playwright = playwright
         self._browser = browser
+        self._work_page = None
 
     def _read_runtime(self) -> dict[str, Any] | None:
         try:
@@ -302,11 +316,18 @@ class ManagedPublicBrowser:
         async with self._lifecycle_lock:
             if self.is_connected:
                 return True
+            if self._browser is not None or self._playwright is not None:
+                await self._disconnect_playwright()
+            if self._process is not None and self._process.poll() is not None:
+                self._process = None
             self._state = "starting"
             self._last_error = None
             try:
                 reused = await self._try_attach_previous()
                 if not reused:
+                    if self._process is not None:
+                        await self._stop_exact_process(self._process)
+                        self._process = None
                     await self._start_new()
                 self._state = "ready"
                 return reused
@@ -315,6 +336,27 @@ class ManagedPublicBrowser:
                 self._last_error = _public_error_message(exc)
                 await self._disconnect_playwright()
                 raise ManagedPublicBrowserError(self._last_error) from exc
+
+    async def get_work_page(self, context):
+        """复用固定工作页，避免每次采集都闪现并关闭一个浏览器窗口。"""
+        page = self._work_page
+        if page is not None:
+            try:
+                if not page.is_closed():
+                    return page
+            except Exception:  # noqa: BLE001
+                pass
+        available = []
+        try:
+            available = [
+                candidate
+                for candidate in context.pages
+                if not candidate.is_closed()
+            ]
+        except Exception:  # noqa: BLE001
+            available = []
+        self._work_page = available[0] if available else await context.new_page()
+        return self._work_page
 
     async def _bring_to_front(self) -> None:
         if os.name != "nt" or not self._pid:
@@ -362,26 +404,26 @@ class ManagedPublicBrowser:
     def mark_needs_verification(self) -> None:
         self._state = "needs_verification"
 
-    async def _disconnect_playwright(self) -> None:
+    async def _disconnect_playwright(self, *, close_browser: bool = False) -> None:
         browser = self._browser
-        manager = self._playwright_manager
+        playwright = self._playwright
+        self._work_page = None
         self._browser = None
         self._playwright = None
-        self._playwright_manager = None
-        if browser:
+        if close_browser and browser:
             try:
                 await browser.close()
             except Exception:  # noqa: BLE001
                 pass
-        if manager:
+        if playwright:
             try:
-                await manager.stop()
+                await playwright.stop()
             except Exception:  # noqa: BLE001
                 pass
 
     async def shutdown(self) -> None:
         async with self._lifecycle_lock:
-            await self._disconnect_playwright()
+            await self._disconnect_playwright(close_browser=True)
             process = self._process
             self._process = None
             if process:

@@ -60,6 +60,10 @@ def test_pdf_title_identity_accepts_official_document_without_announcement_suffi
         "华能霞浦核电项目设备国际招标澄清或变更公告(9)",
         "华能霞浦核电项目设备 招标编号：XYZ",
     )
+    assert pdf_detail_module._pdf_content_matches_title(
+        "某核电项目调节阀设备采购（第二次）国际招标公告(2)",
+        "招标项目名称:某核电项目调节阀设备采购（第二次）",
+    )
 
 
 def test_pdf_title_identity_rejects_unrelated_document():
@@ -224,6 +228,34 @@ async def test_operation_queue_serializes_public_page_work(tmp_path, monkeypatch
 
 
 @pytest.mark.asyncio
+async def test_managed_browser_reuses_existing_work_page(tmp_path):
+    class Page:
+        def is_closed(self):
+            return False
+
+    class Context:
+        def __init__(self):
+            self.pages = [Page()]
+            self.created = 0
+
+        async def new_page(self):
+            self.created += 1
+            return Page()
+
+    browser = ManagedPublicBrowser()
+    browser.profile_dir = tmp_path / "profile"
+    browser.runtime_file = tmp_path / "runtime.json"
+    context = Context()
+
+    first = await browser.get_work_page(context)
+    second = await browser.get_work_page(context)
+
+    assert first is context.pages[0]
+    assert second is first
+    assert context.created == 0
+
+
+@pytest.mark.asyncio
 async def test_previous_runtime_requires_exact_process_identity(tmp_path, monkeypatch):
     browser = ManagedPublicBrowser()
     browser.profile_dir = tmp_path / "profile"
@@ -306,6 +338,7 @@ def test_public_status_never_exposes_port_or_local_profile(tmp_path):
     browser.profile_dir.mkdir()
     (browser.profile_dir / "Local State").write_text("{}", encoding="utf-8")
     browser._port = 44001
+    browser._browser = _FakeBrowser()
     browser._state = "ready"
 
     status = browser.status()
@@ -320,6 +353,43 @@ def test_public_status_never_exposes_port_or_local_profile(tmp_path):
     assert str(browser.profile_dir) not in str(status)
 
 
+def test_public_status_reports_exited_browser_instead_of_stale_ready(tmp_path):
+    browser = ManagedPublicBrowser()
+    browser.profile_dir = tmp_path / "profile"
+    browser.runtime_file = tmp_path / "runtime.json"
+    browser._browser = _FakeBrowser()
+    browser._process = _FakeProcess(44501)
+    browser._process.returncode = 0
+    browser._state = "ready"
+
+    status = browser.status()
+
+    assert status["state"] == "unavailable"
+    assert "自动重启" in status["last_error"]
+
+
+@pytest.mark.asyncio
+async def test_reconnect_disconnects_driver_without_closing_managed_browser(tmp_path):
+    class FakePlaywright:
+        stopped = False
+
+        async def stop(self):
+            self.stopped = True
+
+    browser = ManagedPublicBrowser()
+    browser.profile_dir = tmp_path / "profile"
+    browser.runtime_file = tmp_path / "runtime.json"
+    fake_browser = _FakeBrowser()
+    fake_playwright = FakePlaywright()
+    browser._browser = fake_browser
+    browser._playwright = fake_playwright
+
+    await browser._disconnect_playwright()
+
+    assert fake_playwright.stopped is True
+    assert fake_browser.closed is False
+
+
 def test_public_error_redacts_local_path_and_loopback_port():
     message = managed_module._public_error_message(
         r"failed C:\Users\example\profile at 127.0.0.1:44001"
@@ -332,8 +402,7 @@ def test_public_error_redacts_local_path_and_loopback_port():
 @pytest.mark.asyncio
 async def test_pdf_collection_restarts_managed_browser_once_after_crash(monkeypatch):
     class FakePage:
-        async def close(self):
-            return None
+        pass
 
     class FakeBroker:
         def __init__(self):
@@ -344,16 +413,14 @@ async def test_pdf_collection_restarts_managed_browser_once_after_crash(monkeypa
         async def acquire(self, *, interactive=False):
             self.acquire_count += 1
             attempt = self.acquire_count
-
-            class Context:
-                async def new_page(self):
-                    if attempt == 1:
-                        raise RuntimeError("browser process exited")
-                    return FakePage()
-
             yield SimpleNamespace(
-                context=Context(), reused=attempt > 1, engine="chrome"
+                context=object(), reused=attempt > 1, engine="chrome"
             )
+
+        async def get_work_page(self, _context):
+            if self.acquire_count == 1:
+                raise RuntimeError("browser process exited")
+            return FakePage()
 
         @property
         def is_connected(self):
