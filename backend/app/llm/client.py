@@ -30,6 +30,17 @@ class LlmCallResult:
     raw_text: str | None = None
 
 
+@dataclass
+class JsonLlmCallResult:
+    """Generic JSON call result for evidence-bounded post-processing."""
+
+    success: bool
+    provider: ProviderName | None = None
+    model: str | None = None
+    data: dict[str, Any] | None = None
+    error: str | None = None
+
+
 def _extract_json_object(text: str) -> dict[str, Any]:
     text = text.strip()
     if text.startswith("```"):
@@ -190,6 +201,64 @@ async def parse_intent_llm_chain(
         result = await parse_intent_with_provider(
             query, reference_time=reference_time, provider=name  # type: ignore[arg-type]
         )
+        if result.success:
+            return result
+        last = result
+    return last
+
+
+async def call_json_with_provider(
+    messages: list[dict[str, str]], *, provider: ProviderName
+) -> JsonLlmCallResult:
+    """Call an enabled provider without exposing configuration secrets to callers."""
+    eff = effective_llm_settings()
+    if provider == "api":
+        if not eff["api_enabled"] or not eff["api_key_configured"]:
+            return JsonLlmCallResult(success=False, provider=provider, error="API unavailable")
+        from app.core.llm_secrets import get_llm_api_key
+
+        base_url = eff["api_base_url"]
+        model = eff["api_model"]
+        api_key = get_llm_api_key()
+        timeout = float(eff["api_timeout"])
+    else:
+        if not eff["ollama_enabled"]:
+            return JsonLlmCallResult(success=False, provider=provider, error="Ollama unavailable")
+        base_url = eff["ollama_base_url"]
+        model = eff["ollama_model"]
+        api_key = "ollama"
+        timeout = float(eff["ollama_timeout"])
+    try:
+        text = await _chat_completions(
+            base_url=base_url,
+            api_key=api_key,
+            model=model,
+            messages=messages,
+            timeout=timeout,
+            provider=provider,
+        )
+        data = _extract_json_object(text)
+        return JsonLlmCallResult(
+            success=True, provider=provider, model=model, data=data
+        )
+    except Exception as exc:  # noqa: BLE001
+        message = re.sub(r"Bearer\s+\S+", "Bearer ***", str(exc))
+        logger.info("Evidence-bounded LLM analysis unavailable for %s: %s", provider, message)
+        return JsonLlmCallResult(
+            success=False, provider=provider, model=model, error=message
+        )
+
+
+async def call_json_llm_chain(
+    messages: list[dict[str, str]], *, prefer_order: list[str] | None = None
+) -> JsonLlmCallResult:
+    eff = effective_llm_settings()
+    order = prefer_order or [x for x in eff["prefer_order"] if x in ("api", "ollama")]
+    last = JsonLlmCallResult(success=False, error="No enabled LLM provider")
+    for name in order:
+        if name not in ("api", "ollama"):
+            continue
+        result = await call_json_with_provider(messages, provider=name)  # type: ignore[arg-type]
         if result.success:
             return result
         last = result

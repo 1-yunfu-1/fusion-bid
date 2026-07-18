@@ -9,3 +9,8 @@ export const apiClient = axios.create({
     Accept: "application/json",
   },
 });
+
+export function apiResourceUrl(path: string): string {
+  const base = import.meta.env.VITE_API_BASE_URL || "";
+  return `${base}${path}`;
+}

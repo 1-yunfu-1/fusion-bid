@@ -41,6 +41,48 @@ if errorlevel 1 (
   exit /b 1
 )
 
+REM Check port before creating environments or installing dependencies.
+REM Never terminate an arbitrary process on port 8000.
+set "PORT_PID="
+for /f "tokens=5" %%P in ('netstat -ano ^| findstr ":8000" ^| findstr "LISTENING"') do (
+  if not defined PORT_PID set "PORT_PID=%%P"
+)
+if defined PORT_PID (
+  "%SYS_PY%" -c "import json,urllib.request; d=json.load(urllib.request.urlopen('http://127.0.0.1:8000/api/health',timeout=2)); raise SystemExit(0 if 'FusionBid' in str(d.get('app','')) and d.get('extraction_version')=='v2' and d.get('database_revision')=='20260718_0006' else 2 if 'FusionBid' in str(d.get('app','')) else 1)" >nul 2>&1
+  set "HEALTH_RC=!ERRORLEVEL!"
+  if "!HEALTH_RC!"=="0" (
+      echo [OK] Current FusionBid is already running on port 8000 ^(PID !PORT_PID!^).
+      start "" http://127.0.0.1:8000/
+      exit /b 0
+  )
+  if "!HEALTH_RC!"=="2" (
+    powershell -NoProfile -Command "$p=Get-CimInstance Win32_Process -Filter 'ProcessId=!PORT_PID!'; $root=[IO.Path]::GetFullPath('%ROOT%'); if(([string]$p.ExecutablePath).StartsWith($root,[StringComparison]::OrdinalIgnoreCase) -or ([string]$p.CommandLine).Contains($root)){exit 0}else{exit 1}" >nul 2>&1
+    if errorlevel 1 (
+      echo [ERROR] An older FusionBid is running, but it cannot be verified as this workspace ^(PID !PORT_PID!^).
+      echo         It will not be terminated. Close it manually, then retry.
+      pause
+      exit /b 1
+    )
+    echo [WARN] Older FusionBid from this workspace detected ^(PID !PORT_PID!^).
+    choice /C YN /N /M "Safely stop it and start the upgraded version? [Y/N] "
+    if errorlevel 2 exit /b 0
+    taskkill /PID !PORT_PID! >nul 2>&1
+    timeout /t 2 /nobreak >nul
+    for /f "tokens=5" %%P in ('netstat -ano ^| findstr ":8000" ^| findstr "LISTENING"') do (
+      echo [ERROR] The old FusionBid did not stop safely. Close its window manually.
+      pause
+      exit /b 1
+    )
+    echo [OK] Old FusionBid stopped. Database migration will run before startup.
+    set "PORT_PID="
+  ) else (
+  echo [ERROR] Port 8000 is occupied by another process ^(PID !PORT_PID!^).
+  echo         Stop that process yourself or configure a different port, then retry.
+  pause
+  exit /b 1
+  )
+)
+
 if not exist "%ROOT%\.env" (
   if exist "%ROOT%\.env.example" (
     copy /Y "%ROOT%\.env.example" "%ROOT%\.env" >nul
@@ -110,6 +152,16 @@ if errorlevel 1 (
   exit /b 1
 )
 
+pushd "%ROOT%\backend"
+"%PY%" -m alembic upgrade head
+if errorlevel 1 (
+  echo [ERROR] Database migration failed. The server was not started.
+  popd
+  pause
+  exit /b 1
+)
+popd
+
 echo [3/4] Playwright chromium ^(optional^)...
 "%PY%" -m playwright install chromium >nul 2>&1
 
@@ -118,12 +170,6 @@ if not exist "%ROOT%\frontend\dist\index.html" (
   echo        Run: cd frontend ^&^& npm install ^&^& npm run build
 ) else (
   echo [OK] frontend\dist found
-)
-
-REM free port 8000 if occupied by old process
-for /f "tokens=5" %%P in ('netstat -ano ^| findstr ":8000" ^| findstr "LISTENING"') do (
-  echo [WARN] Port 8000 in use by PID %%P, trying to stop it...
-  taskkill /F /PID %%P >nul 2>&1
 )
 
 echo [4/4] Starting server...

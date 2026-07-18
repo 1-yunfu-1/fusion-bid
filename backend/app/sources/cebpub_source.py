@@ -5,12 +5,15 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import re
+from typing import Any
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
 from app.cleaners.html_cleaner import clean_html_to_text, extract_attachment_links
+from app.browser.pdf_detail import fetch_public_pdf_detail
 from app.sources.base import (
     DetailResult,
     HealthResult,
@@ -25,7 +28,19 @@ logger = logging.getLogger(__name__)
 CEBPUB_BASE = "http://www.cebpubservice.com/ctpsp_iiss"
 SEARCH_API = f"{CEBPUB_BASE}/searchbusinesstypebeforedooraction/getStringMethod.do"
 PORTAL = f"{CEBPUB_BASE}/searchbusinesstypebeforedooraction/getSearch.do"
+DETAIL_PAGE = f"{CEBPUB_BASE}/searchbusinesstypebeforedooraction/showDetails.do"
+DETAIL_API = f"{CEBPUB_BASE}/SecondaryAction/findDetails.do"
+CURRENT_DETAIL_BASE = "https://ctbpsp.com/#/bulletinDetail"
 TZ = ZoneInfo("Asia/Shanghai")
+
+
+def current_detail_url(business_id: str) -> str:
+    """Map the legacy public-list ID to the current official detail route."""
+
+    value = str(business_id or "").strip()
+    if not value:
+        return "https://ctbpsp.com/"
+    return f"{CURRENT_DETAIL_BASE}?uuid={value}&inpvalue=&dataSource=0&tenderAgency="
 
 
 def _parse_date(value: str | None) -> datetime | None:
@@ -38,6 +53,141 @@ def _parse_date(value: str | None) -> datetime | None:
         return datetime(int(m.group(1)), int(m.group(2)), int(m.group(3)), tzinfo=TZ)
     except ValueError:
         return None
+
+
+def _metadata_content(item: ListItem) -> str:
+    """Build a truthful fallback solely from the official search response."""
+    raw = item.raw or {}
+    parts = [
+        f"项目名称：{item.title}",
+        f"区域：{item.region or '原文未明确说明'}",
+        f"交易平台：{raw.get('transactionPlatfName') or '原文未明确说明'}",
+        f"项目编号：{raw.get('tenderProjectCode') or '原文未明确说明'}",
+        f"行业：{raw.get('industriesType') or '原文未明确说明'}",
+        f"公告发布时间：{raw.get('receiveTime') or '原文未明确说明'}",
+        f"公告结束时间：{raw.get('bulletinEndTime') or '原文未明确说明'}",
+        "说明：本条仅使用公开检索接口元数据；完整正文以官方公告详情为准。",
+    ]
+    return "\n".join(parts)
+
+
+def _norm(value: Any) -> str:
+    return re.sub(r"\W+", "", str(value or ""))
+
+
+def _find_current_detail(
+    payload: Any, *, business_id: str, title: str
+) -> dict[str, Any] | None:
+    """Select only a detail object that can be tied to the requested list item.
+
+    Some versions of the official response place ID/title on an outer wrapper
+    and bulletin fields in a nested object.  Identity may therefore be
+    inherited only from an already verified parent in the same JSON response.
+    """
+    title_probe = _norm(title)[:16]
+
+    def walk(value: Any, verified_parent: bool = False) -> dict[str, Any] | None:
+        if isinstance(value, list):
+            for child in value:
+                found = walk(child, verified_parent)
+                if found:
+                    return found
+            return None
+        if not isinstance(value, dict):
+            return None
+        node_id = str(
+            value.get("businessId")
+            or value.get("businessID")
+            or value.get("id")
+            or ""
+        )
+        node_title = _norm(
+            value.get("businessObjectName")
+            or value.get("title")
+            or value.get("projectName")
+            or value.get("tenderProjectName")
+            or ""
+        )
+        identity_verified = verified_parent or (
+            bool(business_id and node_id == business_id)
+            and bool(title_probe and len(title_probe) >= 6 and title_probe in node_title)
+        )
+        if identity_verified and any(
+            key in value
+            for key in (
+                "bulletinContent",
+                "content",
+                "noticeContent",
+                "htmlContent",
+                "tendererName",
+                "tenderAgencyName",
+                "qualificationRequirements",
+            )
+        ):
+            return value
+        for child in value.values():
+            found = walk(child, identity_verified)
+            if found:
+                return found
+        return None
+
+    return walk(payload)
+
+
+def _value(node: dict[str, Any], *keys: str) -> str:
+    for key in keys:
+        value = node.get(key)
+        if value is None or isinstance(value, (dict, list)):
+            continue
+        text = str(value).strip()
+        if text:
+            return text
+    return ""
+
+
+def _build_detail_content(item: ListItem, detail: dict[str, Any]) -> str:
+    """Convert verified official fields into auditable extraction text."""
+    raw = item.raw or {}
+    labels = [
+        ("项目名称", _value(detail, "businessObjectName", "projectName", "tenderProjectName") or item.title),
+        ("招标人名称", _value(detail, "tendererName", "tenderName", "purchaserName", "purchaser")),
+        ("招标代理机构", _value(detail, "tenderAgencyName", "agencyName", "tenderAgentName")),
+        ("项目编号", _value(detail, "tenderProjectCode", "projectCode", "tenderCode") or _value(raw, "tenderProjectCode")),
+        ("公告发布时间", _value(detail, "receiveTime", "publishTime", "bulletinIssueTime") or _value(raw, "receiveTime")),
+        ("公告结束时间", _value(detail, "bulletinEndTime", "endTime") or _value(raw, "bulletinEndTime")),
+        ("投标人资格要求", _value(detail, "qualificationRequirements", "qualificationRequirement", "qualification")),
+    ]
+    parts = [f"{label}：{value}" for label, value in labels if value]
+    body_html = _value(detail, "bulletinContent", "content", "noticeContent", "htmlContent")
+    body = clean_html_to_text(body_html) if body_html else ""
+    if body:
+        parts.extend(["公告正文：", body[:30000]])
+    if not body and not any(value for _, value in labels[1:]):
+        return ""
+    return "\n".join(parts)
+
+
+def _verified_attachment_urls(payload: Any) -> list[str]:
+    """Read URLs only from explicitly named attachment/file fields in a verified payload."""
+    links: list[str] = []
+
+    def visit(value: Any, attachment_context: bool = False) -> None:
+        if isinstance(value, dict):
+            for key, child in value.items():
+                is_attachment_key = bool(
+                    re.search(r"attachment|annex|accessory|file|附件|附档", str(key), re.I)
+                )
+                visit(child, attachment_context or is_attachment_key)
+        elif isinstance(value, list):
+            for child in value:
+                visit(child, attachment_context)
+        elif attachment_context and isinstance(value, str):
+            candidate = value.strip()
+            if re.match(r"^https?://", candidate) and candidate not in links:
+                links.append(candidate)
+
+    visit(payload)
+    return links
 
 
 class CebpubSource(TenderSourceAdapter):
@@ -156,8 +306,8 @@ class CebpubSource(TenderSourceAdapter):
             if not title:
                 continue
             bid = str(raw.get("businessId") or "")
-            # 列表未必给详情 URL；用检索页 + businessId 作为可追溯标识 URL
-            url = f"{PORTAL}?businessId={bid}" if bid else PORTAL
+            # 旧公开列表 businessId 可直接映射到现行官方详情 uuid。
+            url = current_detail_url(bid)
             region = (raw.get("regionName") or "").strip() or None
             pub = _parse_date(raw.get("receiveTime"))
             results.append(
@@ -174,39 +324,182 @@ class CebpubSource(TenderSourceAdapter):
         return results
 
     async def fetch_detail(self, item: ListItem) -> DetailResult:
-        """列表已含关键字段；尝试拉取检索页 HTML 作补充，失败则用列表信息."""
+        """通过官方详情链路读取当前公告；失败时严格降级为列表元数据。"""
         raw = item.raw or {}
-        parts = [
-            f"项目名称：{item.title}",
-            f"区域：{item.region or '原文未明确说明'}",
-            f"交易平台：{raw.get('transactionPlatfName') or '原文未明确说明'}",
-            f"项目编号：{raw.get('tenderProjectCode') or '原文未明确说明'}",
-            f"行业：{raw.get('industriesType') or '原文未明确说明'}",
-            f"公告发布时间：{raw.get('receiveTime') or '原文未明确说明'}",
-            f"公告结束时间：{raw.get('bulletinEndTime') or '原文未明确说明'}",
-            "说明：详情来自公开检索接口字段；完整正文以官方门户为准。",
-        ]
-        clean = "\n".join(parts)
-        html = ""
+        clean = _metadata_content(item)
+        business_id = str(raw.get("businessId") or item.source_item_id or "").strip()
+        detail_url = current_detail_url(business_id) if business_id else item.source_url
+        # 真实平台 ID 为 32 位十六进制字符。此路径等待 PDF.js 文本层，
+        # 避免把入口页、广告或同类项目内容当作公告正文。
+        if re.fullmatch(r"[0-9a-fA-F]{32}", business_id):
+            pdf_detail = await fetch_public_pdf_detail(
+                detail_url=detail_url,
+                expected_id=business_id,
+                expected_title=item.title,
+            )
+            pdf_metadata = {
+                "detail_status": pdf_detail.status,
+                "detail_url": detail_url,
+                "pdf_url": pdf_detail.pdf_url,
+                "business_id": business_id,
+                "tender_project_code": raw.get("tenderProjectCode") or None,
+                "verified_by": "uuid+page_title+pdf_title",
+                "content_format": pdf_detail.content_format,
+                "content_pages": pdf_detail.pages,
+                "message": pdf_detail.message,
+            }
+            if pdf_detail.status == "full":
+                raw_json = json.dumps(
+                    {"pages": pdf_detail.pages, "pdf_url": pdf_detail.pdf_url},
+                    ensure_ascii=False,
+                )
+                return DetailResult(
+                    title=item.title,
+                    source_url=detail_url,
+                    publish_time=item.publish_time,
+                    region=item.region,
+                    raw_content=raw_json[:1_500_000],
+                    clean_content=pdf_detail.clean_content[:1_000_000],
+                    attachment_links=[],
+                    detail_fetched=True,
+                    detail_status="full",
+                    detail_url=detail_url,
+                    content_format=pdf_detail.content_format,
+                    source_metadata=pdf_metadata,
+                    raw={
+                        **raw,
+                        "detail_fetched": True,
+                        "detail_status": "full",
+                        "content_pages": pdf_detail.pages,
+                    },
+                )
+            if pdf_detail.status in {"needs_human_verification", "failed"}:
+                return DetailResult(
+                    title=item.title,
+                    source_url=detail_url,
+                    publish_time=item.publish_time,
+                    region=item.region,
+                    raw_content=clean,
+                    clean_content=clean,
+                    attachment_links=[],
+                    detail_fetched=False,
+                    detail_status=pdf_detail.status,
+                    detail_url=detail_url,
+                    content_format=pdf_detail.content_format,
+                    source_metadata=pdf_metadata,
+                    raw={
+                        **raw,
+                        "detail_fetched": False,
+                        "detail_status": pdf_detail.status,
+                    },
+                )
+        detail_form = {
+            "schemaVersion": raw.get("schemaVersion") or "V60.02",
+            "businessKeyWord": "tenderBulletin",
+            "tenderProjectCode": raw.get("tenderProjectCode") or "",
+            "businessId": business_id,
+            "businessObjectName": item.title,
+            "transactionPlatfName": raw.get("transactionPlatfName") or "",
+            "platformCode": raw.get("transactionPlatfCode") or raw.get("platformCode") or "",
+            "oldBusinessId": raw.get("oldBusinessId") or business_id,
+        }
+        api_form = {
+            "schemaVersion": detail_form["schemaVersion"],
+            "businessKeyWord": "tenderBulletin",
+            "tenderProjectCode": detail_form["tenderProjectCode"],
+            "businessObjectName": item.title,
+            "businessId": business_id,
+        }
+        metadata = {
+            "detail_status": "metadata_only",
+            "detail_endpoint": DETAIL_API,
+            "business_id": business_id or None,
+            "tender_project_code": detail_form["tenderProjectCode"] or None,
+            "verified_by": "official_detail_chain",
+            "detail_url": detail_url,
+        }
         try:
-            html = await self.fetcher.get_text(PORTAL)
-            extra = clean_html_to_text(html)
-            if extra and len(extra) > 50:
-                clean = clean + "\n\n" + extra[:3000]
-        except Exception:  # noqa: BLE001
-            pass
+            responses = await self.fetcher.post_form_sequence(
+                [(DETAIL_PAGE, detail_form), (DETAIL_API, api_form)]
+            )
+            page_text = getattr(responses[0], "text", "") or ""
+            page_probe = _norm(page_text)
+            title_probe = _norm(item.title)[:16]
+            page_matches = bool(
+                business_id
+                and business_id in page_text
+                and title_probe
+                and title_probe in page_probe
+            )
+            detail_payload = responses[1].json()
+            current = _find_current_detail(
+                detail_payload, business_id=business_id, title=item.title
+            )
+            # JSON 节点已经以 ID + 标题双锚点校验；页面文本仅作额外审计信息。
+            if current:
+                full_clean = _build_detail_content(item, current)
+                if full_clean:
+                    raw_json = json.dumps(current, ensure_ascii=False, default=str)
+                    metadata.update(
+                        {
+                            "detail_status": "full",
+                            "detail_fetched": True,
+                            "verified_title": current.get("businessObjectName")
+                            or current.get("title")
+                            or item.title,
+                            "page_matches": page_matches,
+                        }
+                    )
+                    return DetailResult(
+                        title=item.title,
+                        source_url=detail_url,
+                        publish_time=item.publish_time,
+                        region=item.region,
+                        raw_content=raw_json[:500000],
+                        clean_content=full_clean,
+                        attachment_links=[],
+                        detail_fetched=True,
+                        detail_status="full",
+                        detail_url=detail_url,
+                        content_format="json",
+                        source_metadata=metadata,
+                        raw={
+                            **raw,
+                            "detail_fetched": True,
+                            "detail_status": "full",
+                            "detail_payload": current,
+                        },
+                    )
+        except Exception as exc:  # noqa: BLE001
+            logger.info("cebpub detail unavailable for %s: %s", business_id or item.title, exc)
         return DetailResult(
             title=item.title,
-            source_url=item.source_url,
+            source_url=detail_url,
             publish_time=item.publish_time,
             region=item.region,
-            raw_content=html[:50000] if html else clean,
+            raw_content=clean,
             clean_content=clean,
             attachment_links=[],
-            raw=raw,
+            detail_fetched=False,
+            detail_status="metadata_only",
+            detail_url=detail_url,
+            content_format=None,
+            source_metadata=metadata,
+            raw={**raw, "detail_fetched": False, "detail_status": "metadata_only"},
         )
 
     async def extract_attachments(self, detail: DetailResult) -> list[str]:
         if detail.attachment_links:
             return list(detail.attachment_links)
-        return extract_attachment_links(detail.raw_content or "", base_url=detail.source_url)
+        if not detail.detail_fetched:
+            return []
+        payload = (detail.raw or {}).get("detail_payload")
+        links = _verified_attachment_urls(payload)
+        if isinstance(payload, dict):
+            body_html = _value(
+                payload, "bulletinContent", "content", "noticeContent", "htmlContent"
+            )
+            for link in extract_attachment_links(body_html, base_url=detail.source_url):
+                if link not in links:
+                    links.append(link)
+        return links

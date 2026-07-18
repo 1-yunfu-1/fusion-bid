@@ -9,10 +9,10 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 from docx import Document
-from docx.enum.text import WD_ALIGN_PARAGRAPH, WD_LINE_SPACING
+from docx.enum.text import WD_ALIGN_PARAGRAPH
 from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
-from docx.shared import Cm, Pt, RGBColor
+from docx.shared import Cm, Inches, Pt, RGBColor
 
 from app.reports.fields import (
     _MISSING,
@@ -38,6 +38,7 @@ class SourceRunStat:
     raw_count: int = 0
     list_kept: int = 0
     detail_success: int = 0
+    detail_metadata_only: int = 0
     final_contributed: int = 0  # 进入报告的条目数（按主来源）
 
 
@@ -66,6 +67,9 @@ class ReportContext:
     detail_cap_skipped: int = 0
     detail_failed: int = 0
     detail_success_count: int = 0
+    detail_metadata_only_count: int = 0
+    detail_status_failed_count: int = 0
+    detail_human_verification_count: int = 0
     detail_filtered_out: int = 0
     candidates_count: int = 0
     cross_source_merge_count: int = 0
@@ -77,6 +81,10 @@ class ReportContext:
     incremental_count: int = 0
     update_count: int = 0
     skipped_already_delivered: int = 0
+    report_scope: str = "incremental"
+    truncated: bool = False
+    deduplicate: bool = True
+    analysis: dict[str, Any] = field(default_factory=dict)
     # 结果
     items: list[dict[str, Any]] = field(default_factory=list)
     crawl_time: str | None = None
@@ -155,6 +163,17 @@ def _add_label_value(doc: Document, label: str, value: str, *, size: int = 11) -
     _set_run_font(r2, size=size)
 
 
+def _add_bullet(doc: Document, text: str, *, size: int = 10) -> None:
+    """Use a real Word bullet paragraph for source-derived requirement lists."""
+    p = doc.add_paragraph(style="List Bullet")
+    p.paragraph_format.left_indent = Cm(1.27)  # 0.5 in
+    p.paragraph_format.first_line_indent = Cm(-0.635)  # hanging 0.25 in
+    p.paragraph_format.space_after = Pt(8)
+    p.paragraph_format.line_spacing = 1.167
+    run = p.add_run(text)
+    _set_run_font(run, size=size)
+
+
 def _add_hyperlink(paragraph, url: str, text: str = "查看原始公告") -> None:
     part = paragraph.part
     r_id = part.relate_to(
@@ -202,6 +221,55 @@ def _set_cell_text(cell, text: str, *, bold: bool = False, size: int = 9) -> Non
     _set_run_font(run, size=size, bold=bold)
 
 
+def _set_table_geometry(table, widths: list[int]) -> None:
+    """Apply the standard_business_brief fixed 9360-DXA table token map."""
+    table.autofit = False
+    tbl_pr = table._tbl.tblPr
+
+    def child(tag: str):
+        value = tbl_pr.find(qn(tag))
+        if value is None:
+            value = OxmlElement(tag)
+            tbl_pr.append(value)
+        return value
+
+    table_width = child("w:tblW")
+    table_width.set(qn("w:w"), "9360")
+    table_width.set(qn("w:type"), "dxa")
+    table_indent = child("w:tblInd")
+    table_indent.set(qn("w:w"), "120")
+    table_indent.set(qn("w:type"), "dxa")
+    layout = child("w:tblLayout")
+    layout.set(qn("w:type"), "fixed")
+
+    grid_cols = table._tbl.tblGrid.findall(qn("w:gridCol"))
+    for index, width in enumerate(widths):
+        if index < len(grid_cols):
+            grid_cols[index].set(qn("w:w"), str(width))
+    for row in table.rows:
+        for index, cell in enumerate(row.cells):
+            width = widths[min(index, len(widths) - 1)]
+            cell.width = Inches(width / 1440)
+            tc_pr = cell._tc.get_or_add_tcPr()
+            tc_w = tc_pr.find(qn("w:tcW"))
+            if tc_w is None:
+                tc_w = OxmlElement("w:tcW")
+                tc_pr.append(tc_w)
+            tc_w.set(qn("w:w"), str(width))
+            tc_w.set(qn("w:type"), "dxa")
+            tc_mar = tc_pr.find(qn("w:tcMar"))
+            if tc_mar is None:
+                tc_mar = OxmlElement("w:tcMar")
+                tc_pr.append(tc_mar)
+            for side, value in (("top", 80), ("bottom", 80), ("start", 120), ("end", 120)):
+                margin = tc_mar.find(qn(f"w:{side}"))
+                if margin is None:
+                    margin = OxmlElement(f"w:{side}")
+                    tc_mar.append(margin)
+                margin.set(qn("w:w"), str(value))
+                margin.set(qn("w:type"), "dxa")
+
+
 def _add_table(doc: Document, headers: list[str], rows: list[list[str]], *, col_widths_cm: list[float] | None = None):
     table = doc.add_table(rows=1 + len(rows), cols=len(headers))
     table.style = "Table Grid"
@@ -215,11 +283,12 @@ def _add_table(doc: Document, headers: list[str], rows: list[list[str]], *, col_
     for ri, row in enumerate(rows):
         for ci, val in enumerate(row):
             _set_cell_text(table.rows[ri + 1].cells[ci], val, size=9)
-    if col_widths_cm:
-        for row in table.rows:
-            for i, w in enumerate(col_widths_cm):
-                if i < len(row.cells):
-                    row.cells[i].width = Cm(w)
+    raw_widths = col_widths_cm or [1.0] * len(headers)
+    total = sum(raw_widths) or float(len(headers))
+    widths = [max(1, round(9360 * width / total)) for width in raw_widths]
+    # Keep the table grid exactly at 9360 DXA despite rounding individual columns.
+    widths[-1] += 9360 - sum(widths)
+    _set_table_geometry(table, widths)
     return table
 
 
@@ -241,7 +310,12 @@ def _period_text(ctx: ReportContext) -> str:
 
 
 def _prepare_items(ctx: ReportContext) -> list[dict[str, Any]]:
-    return [
+    analysis_by_id = {
+        str(project.get("announcement_id")): project
+        for project in (ctx.analysis or {}).get("projects", [])
+        if isinstance(project, dict) and project.get("announcement_id")
+    }
+    prepared = [
         enrich_report_item(
             it,
             keywords=ctx.keywords,
@@ -251,14 +325,24 @@ def _prepare_items(ctx: ReportContext) -> list[dict[str, Any]]:
         )
         for it in ctx.items
     ]
+    for item in prepared:
+        item["opportunity_analysis"] = analysis_by_id.get(
+            str(item.get("announcement_id")), {}
+        )
+    return prepared
 
 
 def _add_header_footer(doc: Document, ctx: ReportContext) -> None:
     section = doc.sections[0]
-    section.top_margin = Cm(2.2)
-    section.bottom_margin = Cm(2.0)
-    section.left_margin = Cm(2.2)
-    section.right_margin = Cm(2.2)
+    # standard_business_brief：Letter + 1 in margins + 0.492 in header/footer.
+    section.page_width = Inches(8.5)
+    section.page_height = Inches(11)
+    section.top_margin = Cm(2.54)
+    section.bottom_margin = Cm(2.54)
+    section.left_margin = Cm(2.54)
+    section.right_margin = Cm(2.54)
+    section.header_distance = Cm(1.25)
+    section.footer_distance = Cm(1.25)
 
     header = section.header
     header.is_linked_to_previous = False
@@ -333,6 +417,17 @@ def _page1_cover(doc: Document, ctx: ReportContext, items: list[dict]) -> None:
     )
     _add_label_value(doc, "本次新增数量：", str(ctx.incremental_count))
     _add_label_value(doc, "本次内容更新数量：", str(ctx.update_count))
+    _add_label_value(
+        doc,
+        "报告范围：",
+        (
+            "本轮未去重快照（已达安全上限，结果截断）"
+            if ctx.truncated
+            else "本轮原始完整快照（不去重）"
+        )
+        if ctx.report_scope == "snapshot"
+        else "增量交付（新增与变化）",
+    )
     _add_label_value(doc, "数据模式：", ctx.data_mode)
     _add_label_value(
         doc,
@@ -355,8 +450,8 @@ def _page1_cover(doc: Document, ctx: ReportContext, items: list[dict]) -> None:
     if st == "partial":
         box = doc.add_paragraph()
         run = box.add_run(
-            "【注意】本次为部分成功：至少有一个数据源失败或被跳过。"
-            "报告中的有效结果仅来自已成功数据源，请结合第二页「数据源执行情况」阅读，"
+            "【注意】本次为部分成功：可能存在数据源失败、详情未验证、"
+            "待人工验证或快照截断。请结合「数据源执行情况」和每条「详情状态」阅读，"
             "勿将结果理解为全网完整覆盖。"
         )
         _set_run_font(run, size=11, bold=True, color=RGBColor(0xB7, 0x6E, 0x00))
@@ -382,6 +477,14 @@ def _page2_summary(doc: Document, ctx: ReportContext, items: list[dict]) -> None
     src_fail = "、".join(
         source_display_name(s) for s in (ctx.sources_failed or {})
     ) or "无"
+    report_item_summary = (
+        f"本报告保留来源记录 {len(items)} 条（未去重，可能重复项已标注）"
+        if ctx.report_scope == "snapshot"
+        else (
+            f"本报告收录有效结果 {len(items)} 条"
+            f"（新增 {ctx.incremental_count}、更新 {ctx.update_count}）"
+        )
+    )
     _add_para(
         doc,
         (
@@ -393,8 +496,7 @@ def _page2_summary(doc: Document, ctx: ReportContext, items: list[dict]) -> None
             f"失败/跳过 {len(ctx.sources_failed or {})} 个（{src_fail}）。"
             f"原始列表 {ctx.raw_result_count} 条，"
             f"经过滤与去重后主记录 {ctx.primary_count or ctx.final_count} 条，"
-            f"本报告收录有效结果 {len(items)} 条"
-            f"（新增 {ctx.incremental_count}、更新 {ctx.update_count}）。"
+            f"{report_item_summary}。"
         ),
     )
 
@@ -410,6 +512,7 @@ def _page2_summary(doc: Document, ctx: ReportContext, items: list[dict]) -> None
                     ),
                     str(ss.raw_count),
                     str(ss.detail_success),
+                    str(ss.detail_metadata_only),
                     str(ss.final_contributed),
                     (ss.message or "—")[:40],
                 ]
@@ -434,31 +537,43 @@ def _page2_summary(doc: Document, ctx: ReportContext, items: list[dict]) -> None
                 st = "未执行"
                 msg = "—"
             contrib = sum(1 for it in items if it.get("source_name") == name)
-            rows.append([source_display_name(name), st, "—", "—", str(contrib), msg])
+            rows.append([source_display_name(name), st, "—", "—", "—", str(contrib), msg])
     if not rows:
-        rows.append(["—", "—", "0", "0", "0", "无数据源记录"])
+        rows.append(["—", "—", "0", "0", "0", "0", "无数据源记录"])
     _add_table(
         doc,
-        ["数据源", "状态", "列表条数", "详情成功", "报告贡献", "说明"],
+        ["数据源", "状态", "列表条数", "完整详情", "仅元数据", "报告贡献", "说明"],
         rows,
-        col_widths_cm=[4.0, 1.5, 1.8, 1.8, 1.8, 4.5],
+        col_widths_cm=[3.2, 1.3, 1.5, 1.5, 1.5, 1.5, 3.7],
     )
     _add_para(
         doc,
-        "说明：「报告贡献」指本报告条目中主来源为该数据源的数量；"
-        "失败数据源贡献为 0，不代表其网站无相关公告。",
+        "说明：「完整详情」仅计入已通过当前公告校验的详情；「仅元数据」不会被当作公告正文。"
+        "「报告贡献」指本报告条目中主来源为该数据源的数量。",
         size=9,
         color=RGBColor(0x66, 0x66, 0x66),
     )
 
     _add_heading(doc, "三、数据处理漏斗", 1)
     fd = ctx.funnel_dict()
-    ok, notes = verify_funnel_closed(fd)
+    if ctx.report_scope == "snapshot":
+        ok, notes = True, [
+            (
+                "未去重快照已达每源 500 条安全上限，已标记截断，不声称为完整报告。"
+                if ctx.truncated
+                else "未去重完整快照保留本轮全部合格来源记录；本次不读取也不写入 DeliveryHistory。"
+            )
+        ]
+    else:
+        ok, notes = verify_funnel_closed(fd)
     funnel_rows = [
         ["原始列表结果", str(ctx.raw_result_count), "各成功数据源列表页合计"],
         ["列表阶段过滤排除", str(ctx.list_filtered_out), "关键词/区域/时间/相关性"],
         ["详情上限未抓取", str(ctx.detail_cap_skipped), "超过每源详情抓取上限"],
         ["详情抓取失败", str(ctx.detail_failed), "打开详情页异常"],
+        ["仅列表元数据", str(ctx.detail_metadata_only_count), "未验证详情，不作为公告正文"],
+        ["详情内容失败", str(ctx.detail_status_failed_count), "已保留来源记录与失败状态"],
+        ["待人工安全验证", str(ctx.detail_human_verification_count), "系统未绕过验证机制"],
         ["详情阶段过滤排除", str(ctx.detail_filtered_out), "详情二次条件不匹配"],
         ["进入去重候选", str(ctx.candidates_count), "待跨源去重"],
         ["跨源合并减少", str(ctx.cross_source_merge_count), "同项目多来源合并"],
@@ -467,7 +582,13 @@ def _page2_summary(doc: Document, ctx: ReportContext, items: list[dict]) -> None
         ["历史已交付跳过", str(ctx.skipped_already_delivered), "增量：已推送且无变化"],
         ["本次新增", str(ctx.incremental_count), "首次交付"],
         ["本次内容更新", str(ctx.update_count), "已推送但内容变化"],
-        ["本报告条目", str(len(items)), "新增 + 更新"],
+        [
+            "本报告条目",
+            str(len(items)),
+            "本轮全部来源记录（未去重）"
+            if ctx.report_scope == "snapshot"
+            else "新增 + 更新",
+        ],
     ]
     _add_table(
         doc,
@@ -483,16 +604,56 @@ def _page2_summary(doc: Document, ctx: ReportContext, items: list[dict]) -> None
             color=RGBColor(0x1E, 0x84, 0x4E) if ok else RGBColor(0xC0, 0x39, 0x2B),
         )
 
-    _add_heading(doc, "四、重点项目 Top 3", 1)
+    _add_heading(doc, "四、投标决策分析", 1)
+    analysis = ctx.analysis or {}
+    _add_para(
+        doc,
+        str(analysis.get("portfolio_summary") or "本轮未生成组合研判。"),
+        bold=True,
+    )
+    _add_para(
+        doc,
+        "分析方式：规则依据公告原文字段生成；如启用 LLM，仅展示通过字段证据校验的补充建议，不构成中标预测。",
+        size=9,
+        color=RGBColor(0x66, 0x66, 0x66),
+    )
+    projects = [
+        p for p in analysis.get("projects", []) if isinstance(p, dict)
+    ]
+    if projects:
+        analysis_rows = []
+        for project in projects[:8]:
+            analysis_rows.append(
+                [
+                    str(project.get("title") or _MISSING)[:36],
+                    str(project.get("decision") or "信息不足"),
+                    str(project.get("deadline_urgency") or "未知"),
+                    "；".join(project.get("gaps") or ["无明显缺口"])[:60],
+                    "；".join(project.get("recommended_actions") or [])[:80],
+                ]
+            )
+        _add_table(
+            doc,
+            ["项目", "参与建议", "时效", "主要信息缺口", "建议下一步"],
+            analysis_rows,
+            col_widths_cm=[4.0, 1.5, 1.6, 4.0, 5.1],
+        )
+    else:
+        _add_para(doc, "暂无可分析项目；可先补齐官方详情后重新生成未去重完整报告。")
+
+    _add_heading(doc, "五、重点项目 Top 3", 1)
     if not items:
         _add_para(doc, "本次无有效结果条目。")
     else:
-        # 按完整度 + 有预算优先
+        # 优先级由证据受限的规则研判给出，再按完整度排序。
+        priority_rank = {"高": 4, "中": 3, "待核验": 2, "低": 1}
         ranked = sorted(
             items,
             key=lambda x: (
-                x.get("completeness", {}).get("percent", 0),
-                1 if (x.get("fields") or {}).get("budget") not in (_MISSING, None, "") else 0,
+                priority_rank.get(
+                    (x.get("opportunity_analysis") or {}).get("priority"), 0
+                ),
+                x.get("completeness", {}).get("percent") or 0,
             ),
             reverse=True,
         )[:3]
@@ -507,16 +668,16 @@ def _page2_summary(doc: Document, ctx: ReportContext, items: list[dict]) -> None
                 doc,
                 (
                     f"地区：{f.get('region', _MISSING)}；"
-                    f"采购人：{f.get('purchaser', _MISSING)}；"
-                    f"预算：{f.get('budget', _MISSING)}；"
+                    f"{f.get('purchaser_source_label') or '采购人/招标人'}：{f.get('purchaser', _MISSING)}；"
                     f"截止：{f.get('deadline', _MISSING)}；"
+                    f"优先级：{(it.get('opportunity_analysis') or {}).get('priority', '待核验')}；"
                     f"完整度：{it.get('completeness', {}).get('label', '—')}；"
                     f"来源：{it.get('source_display', '—')}"
                 ),
                 size=10,
             )
 
-    _add_heading(doc, "五、数据质量提示", 1)
+    _add_heading(doc, "六、数据质量提示", 1)
     tips = [
         "所有字段均来自公开页面抽取；无法确认时标注「原文未明确说明」或「本次未成功提取」，系统不编造。",
         "区域匹配依据见各项目「匹配依据」；标题含外地地名时请人工核对是否误召回。",
@@ -530,7 +691,7 @@ def _page2_summary(doc: Document, ctx: ReportContext, items: list[dict]) -> None
 
 def _page3_overview(doc: Document, ctx: ReportContext, items: list[dict]) -> None:
     doc.add_page_break()
-    _add_heading(doc, "六、项目总览", 1)
+    _add_heading(doc, "七、项目总览", 1)
     if not items:
         _add_para(doc, "无项目可展示。")
         return
@@ -543,6 +704,15 @@ def _page3_overview(doc: Document, ctx: ReportContext, items: list[dict]) -> Non
                 it.get("short_title") or _MISSING,
                 f.get("region") or _MISSING,
                 f.get("purchaser") or _MISSING,
+                (it.get("opportunity_analysis") or {}).get("priority") or "待核验",
+                {
+                    "full": "已核验详情",
+                    "metadata_only": "仅元数据",
+                    "failed": "详情失败",
+                    "needs_human_verification": "待人工验证",
+                }.get(
+                    it.get("detail_status"), "状态未知"
+                ),
                 f.get("announcement_type") or _MISSING,
                 it.get("publish_time_cn") or _MISSING,
                 f.get("deadline") or _MISSING,
@@ -556,7 +726,9 @@ def _page3_overview(doc: Document, ctx: ReportContext, items: list[dict]) -> Non
             "序号",
             "项目简称",
             "项目地区",
-            "采购人",
+            "采购人/招标人",
+            "优先级",
+            "详情状态",
             "公告类型",
             "发布时间",
             "截止时间",
@@ -564,13 +736,13 @@ def _page3_overview(doc: Document, ctx: ReportContext, items: list[dict]) -> Non
             "来源",
         ],
         rows,
-        col_widths_cm=[1.0, 2.8, 1.6, 2.2, 1.6, 1.8, 1.8, 1.6, 2.0],
+        col_widths_cm=[0.8, 2.4, 1.4, 1.8, 1.1, 1.5, 1.2, 1.4, 1.4, 1.3, 1.4],
     )
 
 
 def _detail_pages(doc: Document, ctx: ReportContext, items: list[dict]) -> None:
     doc.add_page_break()
-    _add_heading(doc, "七、项目结构化详情", 1)
+    _add_heading(doc, "八、项目结构化详情", 1)
     if not items:
         _add_para(doc, "无详情可展示。")
         return
@@ -593,33 +765,143 @@ def _detail_pages(doc: Document, ctx: ReportContext, items: list[dict]) -> None:
         if pn and pn not in (title, short):
             _add_label_value(doc, "项目名称：", pn)
 
-        status_bits = []
+        status_bits: list[str] = []
         if label:
             status_bits.append(label)
         if it.get("is_update"):
             status_bits.append("内容更新")
         elif it.get("is_new"):
             status_bits.append("新增")
+        status_bits = list(dict.fromkeys(status_bits))
         _add_label_value(
             doc,
             "公告状态：",
             "、".join(status_bits) if status_bits else "有效收录",
         )
+        if it.get("dedupe_status"):
+            dedupe_text = str(it["dedupe_status"])
+            if it.get("dedupe_hint"):
+                dedupe_text = f"{dedupe_text}：{it['dedupe_hint']}"
+            _add_label_value(doc, "收录方式：", dedupe_text)
         _add_label_value(doc, "项目编号：", f.get("project_code") or _MISSING)
-        _add_label_value(doc, "采购人：", f.get("purchaser") or _MISSING)
-        _add_label_value(doc, "代理机构：", f.get("agency") or _MISSING)
+        purchaser_label = f.get("purchaser_source_label")
+        if not purchaser_label or purchaser_label == _MISSING:
+            purchaser_label = "采购人/招标人"
+        _add_label_value(doc, f"{purchaser_label}：", f.get("purchaser") or _MISSING)
+        if (
+            f.get("tenderer")
+            and f.get("tenderer") not in {_MISSING, f.get("purchaser")}
+        ):
+            tenderer_label = f.get("tenderer_source_label") or "招标人"
+            _add_label_value(doc, f"{tenderer_label}：", f.get("tenderer"))
+        _add_label_value(doc, "招标/采购代理机构：", f.get("agency") or _MISSING)
+        _add_label_value(doc, "交易平台：", f.get("transaction_platform") or _MISSING)
         _add_label_value(doc, "项目地区：", f.get("region") or _MISSING)
         _add_label_value(doc, "公告类型：", f.get("announcement_type") or _MISSING)
         _add_label_value(doc, "采购内容：", f.get("content") or _MISSING)
         _add_label_value(doc, "预算金额：", f.get("budget") or _MISSING)
+        _add_label_value(doc, "招标文件售价：", f.get("document_price") or _MISSING)
+        _add_label_value(doc, "资金来源：", f.get("funding_source") or _MISSING)
         _add_label_value(doc, "发布时间：", it.get("publish_time_cn") or _MISSING)
-        _add_label_value(doc, "截止时间：", f.get("deadline") or _MISSING)
-        _add_label_value(doc, "资格要求：", f.get("qualification") or _MISSING)
+        _add_label_value(doc, "公告结束时间：", f.get("notice_end_time") or _MISSING)
+        _add_label_value(
+            doc,
+            "招标文件获取时间：",
+            (
+                f"{f.get('document_acquisition_start')} 至 {f.get('document_acquisition_end')}"
+                if f.get("document_acquisition_start") not in {None, "", _MISSING}
+                and f.get("document_acquisition_end") not in {None, "", _MISSING}
+                else f.get("document_acquisition_end") or f.get("document_acquisition_start") or _MISSING
+            ),
+        )
+        _add_label_value(doc, "投标截止时间：", f.get("bid_deadline") or f.get("deadline") or _MISSING)
+        _add_label_value(doc, "开标时间：", f.get("opening_time") or _MISSING)
+        qualification_items = f.get("qualification_items") or []
+        if qualification_items:
+            _add_label_value(doc, "资格要求（原文提取）：", "见以下条款")
+            for requirement in qualification_items:
+                _add_bullet(doc, str(requirement), size=10)
+        else:
+            _add_label_value(doc, "资格要求：", f.get("qualification") or _MISSING)
+        _add_label_value(
+            doc,
+            "详情状态：",
+            {
+                "full": "已核验公告详情",
+                "metadata_only": "仅列表元数据（不作为公告正文）",
+                "failed": "详情抓取失败",
+                "needs_human_verification": "详情页需人工完成安全验证（系统未绕过）",
+            }.get(it.get("detail_status"), "状态未知"),
+        )
+        _add_label_value(doc, "数据模式：", it.get("data_mode") or "live")
         _add_label_value(
             doc,
             "数据完整度：",
             (it.get("completeness") or {}).get("label") or _MISSING,
         )
+
+        opportunity = it.get("opportunity_analysis") or {}
+        _add_para(doc, "投标决策分析：", bold=True)
+        _add_label_value(doc, "AI/规则参与建议：", opportunity.get("decision") or "信息不足")
+        _add_label_value(doc, "机会优先级：", opportunity.get("priority") or "待核验")
+        _add_label_value(doc, "时间紧迫度：", opportunity.get("deadline_urgency") or "未知")
+        if opportunity.get("deadline_note"):
+            _add_para(doc, f"· {opportunity['deadline_note']}", size=10)
+        if opportunity.get("gaps"):
+            _add_para(doc, "需补齐/核验：", bold=True, size=10)
+            for gap in opportunity.get("gaps") or []:
+                _add_bullet(doc, str(gap), size=10)
+        if opportunity.get("recommended_actions"):
+            _add_para(doc, "建议下一步：", bold=True, size=10)
+            for action in opportunity.get("recommended_actions") or []:
+                _add_bullet(doc, str(action), size=10)
+        if opportunity.get("timeline"):
+            _add_para(doc, "时间倒排：", bold=True, size=10)
+            for milestone in opportunity.get("timeline") or []:
+                suffix = (
+                    f"（证据 {milestone.get('evidence_id')}）"
+                    if milestone.get("evidence_id")
+                    else ""
+                )
+                _add_bullet(
+                    doc,
+                    f"{milestone.get('milestone')}：{milestone.get('time')}{suffix}",
+                    size=10,
+                )
+        if opportunity.get("technical_business_risks"):
+            _add_para(doc, "技术/商务风险：", bold=True, size=10)
+            for risk in opportunity.get("technical_business_risks") or []:
+                _add_bullet(doc, str(risk), size=10)
+        if opportunity.get("missing_materials"):
+            _add_para(doc, "建议准备材料：", bold=True, size=10)
+            for material in opportunity.get("missing_materials") or []:
+                _add_bullet(doc, str(material), size=10)
+        matrix = opportunity.get("qualification_matrix") or []
+        if matrix:
+            _add_para(doc, "资格符合性矩阵：", bold=True, size=10)
+            _add_table(
+                doc,
+                ["条款", "原文要求", "匹配状态", "画像依据"],
+                [
+                    [
+                        str(row.get("clause_id") or ""),
+                        str(row.get("requirement") or ""),
+                        str(row.get("status") or "待核验"),
+                        str(row.get("profile_basis") or ""),
+                    ]
+                    for row in matrix
+                    if isinstance(row, dict)
+                ],
+                col_widths_cm=[1.2, 8.0, 2.4, 4.6],
+            )
+        if opportunity.get("decision_evidence_ids"):
+            _add_label_value(
+                doc,
+                "建议证据 ID：",
+                "、".join(map(str, opportunity.get("decision_evidence_ids") or [])),
+            )
+        if opportunity.get("llm_note"):
+            _add_para(doc, f"辅助研判（已校验证据）：{opportunity['llm_note']}", size=10)
 
         att = it.get("attachment") or {}
         _add_label_value(doc, "附件状态：", att.get("label") or "未发现公开附件")
@@ -640,6 +922,34 @@ def _detail_pages(doc: Document, ctx: ReportContext, items: list[dict]) -> None:
         _add_para(doc, f"· 关键词：{mb.get('keyword', _MISSING)}", size=10)
         _add_para(doc, f"· 区域：{mb.get('region', _MISSING)}", size=10)
         _add_para(doc, f"· 时间：{mb.get('time', _MISSING)}", size=10)
+        evidence = it.get("field_evidence") or {}
+        evidence_labels = [
+            str(value.get("source_label"))
+            for value in evidence.values()
+            if isinstance(value, dict) and value.get("source_label")
+        ]
+        if evidence_labels:
+            _add_para(doc, f"字段依据：{'、'.join(dict.fromkeys(evidence_labels))}", size=9, color=RGBColor(0x66, 0x66, 0x66))
+        evidence_rows = []
+        for field_name, value in evidence.items():
+            if not isinstance(value, dict) or not value.get("quote"):
+                continue
+            evidence_rows.append(
+                [
+                    str(value.get("evidence_id") or field_name),
+                    str(value.get("source_label") or field_name),
+                    str(value.get("page") or "—"),
+                    str(value.get("quote") or "")[:220],
+                ]
+            )
+        if evidence_rows:
+            _add_para(doc, "关键字段原文证据：", bold=True, size=10)
+            _add_table(
+                doc,
+                ["证据 ID", "原文标签", "PDF 页码", "原文片段"],
+                evidence_rows[:18],
+                col_widths_cm=[2.5, 2.4, 1.4, 9.9],
+            )
 
         # 来源链接 — 超链接文字
         p = doc.add_paragraph()
@@ -677,15 +987,20 @@ def _detail_pages(doc: Document, ctx: ReportContext, items: list[dict]) -> None:
 
 def _last_page(doc: Document, ctx: ReportContext, items: list[dict]) -> None:
     doc.add_page_break()
-    _add_heading(doc, "八、数据处理说明与声明", 1)
+    _add_heading(doc, "九、数据处理说明与声明", 1)
 
     _add_heading(doc, "数据处理说明", 2)
     for line in [
         "流程：多源列表检索 → 列表条件过滤 → 详情抓取 → 详情二次过滤 → 跨源去重 → 增量判定 → 生成报告。",
         "过滤维度：关键词、区域、发布时间、招标/采购相关性。",
-        "去重：同批跨源合并 + 库内项目编号/内容指纹合并；主记录优先信息更完整的官方来源。",
-        "增量：相对本任务历史交付记录，仅将新增或内容变化条目写入本报告。",
-        "字段抽取：基于正文规则匹配；缺失字段不推断、不补全。",
+        "去重（入库与增量）：同批跨源合并 + 库内项目编号/内容指纹合并；主记录优先信息更完整的官方来源。",
+        (
+            "未去重快照：本轮每个来源采到的合格记录均写入本报告，可能重复项会保留并标注；"
+            "本次不读取也不写入 DeliveryHistory。"
+            if ctx.report_scope == "snapshot"
+            else "增量：相对本任务历史交付记录，仅将新增或内容变化条目写入本报告。"
+        ),
+        "字段抽取：AI 优先提取 → 原文证据校验 → 规则兜底；无法定位的 AI 值会被拒绝。",
     ]:
         _add_para(doc, f"· {line}")
 
@@ -761,12 +1076,28 @@ def build_word_document(ctx: ReportContext) -> Document:
 
     items = _prepare_items(ctx)
     doc = Document()
+    # standard_business_brief tokens; Chinese font is a consistent named override.
     style = doc.styles["Normal"]
-    style.font.name = "宋体"
+    style.font.name = "Calibri"
     style.font.size = Pt(11)
     style._element.rPr.rFonts.set(qn("w:eastAsia"), "宋体")
     pf = style.paragraph_format
-    pf.line_spacing_rule = WD_LINE_SPACING.SINGLE
+    pf.space_before = Pt(0)
+    pf.space_after = Pt(6)
+    pf.line_spacing = 1.10
+    for name, size, color, before, after in (
+        ("Heading 1", 16, "2E74B5", 16, 8),
+        ("Heading 2", 13, "2E74B5", 12, 6),
+        ("Heading 3", 12, "1F4D78", 8, 4),
+    ):
+        heading = doc.styles[name]
+        heading.font.name = "Calibri"
+        heading.font.size = Pt(size)
+        heading.font.color.rgb = RGBColor.from_string(color)
+        heading._element.rPr.rFonts.set(qn("w:eastAsia"), "黑体")
+        heading.paragraph_format.space_before = Pt(before)
+        heading.paragraph_format.space_after = Pt(after)
+        heading.paragraph_format.line_spacing = 1.10
 
     _add_header_footer(doc, ctx)
     _page1_cover(doc, ctx, items)

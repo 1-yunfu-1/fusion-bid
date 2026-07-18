@@ -36,7 +36,11 @@ async def test_login_start_mocked(client: AsyncClient, monkeypatch):
 
     r = await client.post(
         "/api/login/start",
-        json={"login_url": "https://www.baidu.com/", "wait_seconds": 120, "force": True},
+        json={
+            "login_url": "https://www.chinabidding.cn/",
+            "wait_seconds": 120,
+            "force": True,
+        },
     )
     assert r.status_code == 200
     body = r.json()

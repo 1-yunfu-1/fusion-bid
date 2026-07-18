@@ -78,6 +78,18 @@ class HttpFetcher:
         await self.limiter.wait()
         return await self._post_form_retry(url, data=data)
 
+    async def post_form_sequence(
+        self, steps: list[tuple[str, dict[str, Any]]]
+    ) -> list[httpx.Response]:
+        """在一个短生命周期会话内顺序提交表单。
+
+        少数公开门户会在“详情定位页 → 详情数据接口”之间依赖临时 Cookie。
+        这里仅复用本次请求的内存 Cookie，不落盘、不复用登录态，也不绕过站点安全措施。
+        """
+        if not steps:
+            return []
+        return await self._post_form_sequence_retry(steps)
+
     async def get_json(self, url: str, *, params: dict[str, Any] | None = None) -> Any:
         await self.limiter.wait()
         text_resp = await self._get_response_retry(url, params=params)
@@ -123,3 +135,21 @@ class HttpFetcher:
             resp = await client.post(url, data=data)
             resp.raise_for_status()
             return resp
+
+    @retry(
+        reraise=True,
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=1, min=1, max=8),
+        retry=retry_if_exception_type((httpx.TimeoutException, httpx.NetworkError, httpx.HTTPStatusError)),
+    )
+    async def _post_form_sequence_retry(
+        self, steps: list[tuple[str, dict[str, Any]]]
+    ) -> list[httpx.Response]:
+        async with self._client() as client:
+            responses: list[httpx.Response] = []
+            for url, data in steps:
+                await self.limiter.wait()
+                resp = await client.post(url, data=data)
+                resp.raise_for_status()
+                responses.append(resp)
+            return responses

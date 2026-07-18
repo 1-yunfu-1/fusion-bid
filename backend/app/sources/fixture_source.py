@@ -12,11 +12,12 @@ from app.sources.base import (
 
 
 class FixtureSourcePlaceholder(TenderSourceAdapter):
-    """演示/测试源骨架：阶段一不加载任何假业务数据."""
+    """隐藏的离线测试占位源，不加载任何假业务数据."""
 
     source_name = "fixture_source_placeholder"
     requires_login = False
     enabled = False
+    visible = False
 
     async def health_check(self) -> HealthResult:
         return HealthResult(

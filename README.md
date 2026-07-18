@@ -1,10 +1,10 @@
 # FusionBid 智标聚合助手
 
 > 2026 AI 先锋未来人才大赛——超聚变企业命题  
-> AI 招投标信息聚合工具：自然语言 → 多源采集 → 清洗去重 → Word 报告 → 定时增量
+> AI 招投标信息聚合工具：自然语言 → 多源采集 → 可验证详情 → 清洗去重 → Word 决策报告 → 定时增量
 
 **默认语言**：简体中文 · **默认时区**：Asia/Shanghai  
-**当前版本**：完整联调交付
+**当前版本**：v1.0.0 · 比赛冲刺联调版
 
 仓库：https://github.com/1-yunfu-1/fusion-bid
 
@@ -22,8 +22,16 @@
 | Word 报告 | ✅ |
 | 定时任务 | ✅ |
 | 一键启动（单端口托管前端+API） | ✅ |
+| 确认后自动执行首轮并保留结果 | ✅ |
+| 详情证据链 / AI 决策分析 / 企业画像 | ✅ |
 
 不返回伪造招标数据。
+
+主演示路径固定为：**输入 → 解析 → 确认 → 自动首查 → 查看结果 → 下载 Word → 定时增量**。普通任务确认后必定首查；定时任务默认也先执行首轮，可在确认页关闭。
+
+报告中的“采购人/招标人”和资格要求均保留原文标签、PDF 页码与原文证据。CEBPUB 使用旧公开接口发现公告，再以 `businessId` 映射当前 `ctbpsp.com` 详情；只有公告 ID 与标题校验通过的正文才进入抽取链路。遇到验证码或无法核验时标记为“待人工验证/仅元数据”，不会把门户通用页当成公告正文。
+
+抽取采用 **AI 优先 → 原文证据校验 → 规则兜底**。AI 建议只允许“建议参与 / 有条件参与 / 不建议参与 / 信息不足”，并引用证据 ID，不输出无依据的中标概率。任务列表的“重新采集未去重完整报告”是独立完整快照：重新抓取、保留每个来源记录、不读写 DeliveryHistory；达到每源 500 条上限会明确标记 `truncated=true`。
 
 ---
 
@@ -49,6 +57,8 @@
 > - API Key **不会**预置在仓库中，请在页面「设置」中填写。
 
 首次运行会自动创建虚拟环境并安装依赖（需联网）。
+
+脚本不会强制结束占用 8000 端口的进程：当前版本 FusionBid 会直接打开；当前工作区旧版本会询问是否安全重启并先迁移数据库；其他进程或无法确认归属的实例只提示 PID 后退出。
 
 制作干净发布 zip：
 
@@ -76,6 +86,7 @@ cd ..\backend
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 pip install -e ".[full]"
+alembic upgrade head
 uvicorn app.main:app --reload --host 127.0.0.1 --port 8000
 ```
 
@@ -134,7 +145,12 @@ pytest
 cd ../frontend
 npm run lint
 npm run build
+
+cd ..
+docker compose config
 ```
+
+当前仓库最近一次结果：后端 **97 passed**，前端 lint/build 通过，Docker Compose 配置通过。
 
 ---
 
@@ -144,6 +160,7 @@ npm run build
 - [LLM 双模式配置](docs/LLM双模式配置.md)
 - [数据源说明](docs/数据源说明.md)
 - [Demo 演示脚本](docs/Demo演示脚本.md)
+- [报名材料项目说明](docs/报名材料项目说明.md)
 - [详设文档](docs/详设文档.md)
 - [发布包使用说明模板](scripts/release_README.md)
 - [AGENTS.md](AGENTS.md)

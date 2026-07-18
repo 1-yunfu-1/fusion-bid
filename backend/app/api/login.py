@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from urllib.parse import urlparse
+
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 
@@ -56,7 +58,7 @@ async def login_status() -> dict:
         }
 
     return {
-        "enabled": settings.login_source_enabled,
+        "enabled": bool(source and source.enabled),
         "home_url": settings.login_source_home_url,
         "login_url": settings.login_source_login_url,
         "search_url_template": settings.login_source_search_url,
@@ -79,6 +81,21 @@ async def login_status() -> dict:
 async def login_start(body: LoginStartRequest | None = None) -> dict:
     """从界面启动 Playwright 可见浏览器登录初始化."""
     body = body or LoginStartRequest()
+    settings = get_settings()
+    source = get_source("login_portal")
+    configuration_error = getattr(source, "configuration_error", None)
+    if configuration_error:
+        raise HTTPException(status_code=400, detail=configuration_error)
+    if body.login_url:
+        requested_host = (urlparse(body.login_url).hostname or "").lower().removeprefix("www.")
+        configured_host = (
+            urlparse(settings.login_source_home_url).hostname or ""
+        ).lower().removeprefix("www.")
+        if not requested_host or requested_host != configured_host:
+            raise HTTPException(
+                status_code=400,
+                detail="登录地址必须与已配置的首页和检索地址属于同一门户",
+            )
     result = start_login_process(
         login_url=body.login_url,
         wait_seconds=body.wait_seconds,

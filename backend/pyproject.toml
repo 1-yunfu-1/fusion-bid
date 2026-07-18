@@ -33,6 +33,8 @@ dev = [
 ]
 full = [
     "playwright>=1.49.0",
+    "Pillow>=11.0.0",
+    "pytesseract>=0.3.13",
 ]
 
 [build-system]

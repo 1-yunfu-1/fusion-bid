@@ -8,7 +8,7 @@ from zoneinfo import ZoneInfo
 from fastapi import APIRouter
 
 from app.core.config import get_settings
-from app.core.database import check_db
+from app.core.database import check_db, database_revision
 from app.schemas.health import HealthResponse, MetaResponse
 
 router = APIRouter()
@@ -20,6 +20,7 @@ async def health_check() -> HealthResponse:
     tz = ZoneInfo(settings.app_timezone)
     now = datetime.now(tz)
     db_ok = await check_db()
+    revision = await database_revision() if db_ok else "unavailable"
     status = "ok" if db_ok else "degraded"
     return HealthResponse(
         status=status,
@@ -30,6 +31,8 @@ async def health_check() -> HealthResponse:
         time=now,
         database="ok" if db_ok else "error",
         database_ok=db_ok,
+        database_revision=revision,
+        extraction_version="v2",
         message="服务正常" if db_ok else "数据库连接异常",
     )
 

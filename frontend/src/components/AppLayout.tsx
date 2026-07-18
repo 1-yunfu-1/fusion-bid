@@ -1,11 +1,13 @@
-import { Layout, Menu, Typography, theme } from "antd";
+import { useState } from "react";
+import { Button, Drawer, Grid, Layout, Menu, Typography, theme } from "antd";
 import {
-  DashboardOutlined,
   CloudServerOutlined,
+  DashboardOutlined,
   FileSearchOutlined,
-  HistoryOutlined,
-  SettingOutlined,
   FileWordOutlined,
+  HistoryOutlined,
+  MenuOutlined,
+  SettingOutlined,
   UnorderedListOutlined,
 } from "@ant-design/icons";
 import { Link, Outlet, useLocation } from "react-router-dom";
@@ -39,7 +41,10 @@ const menuItems = [
 ];
 
 export default function AppLayout() {
+  const [navOpen, setNavOpen] = useState(false);
   const location = useLocation();
+  const screens = Grid.useBreakpoint();
+  const isDesktop = Boolean(screens.lg);
   const {
     token: { colorBgContainer },
   } = theme.useToken();
@@ -51,46 +56,60 @@ export default function AppLayout() {
         : location.pathname.startsWith(item.key),
     )?.key || "/";
 
+  const navigation = (
+    <>
+      <div className="app-logo">FusionBid</div>
+      <Menu
+        theme="dark"
+        mode="inline"
+        selectedKeys={[selected]}
+        items={menuItems}
+        onClick={() => setNavOpen(false)}
+      />
+    </>
+  );
+
   return (
     <Layout style={{ minHeight: "100vh" }}>
-      <Sider breakpoint="lg" collapsedWidth={64} theme="dark">
-        <div
-          style={{
-            height: 64,
-            margin: 16,
-            color: "#fff",
-            fontWeight: 700,
-            fontSize: 16,
-            display: "flex",
-            alignItems: "center",
-          }}
-        >
-          FusionBid
-        </div>
-        <Menu theme="dark" mode="inline" selectedKeys={[selected]} items={menuItems} />
-      </Sider>
-      <Layout>
-        <Header
-          style={{
-            background: colorBgContainer,
-            padding: "0 24px",
-            display: "flex",
-            alignItems: "center",
-            borderBottom: "1px solid #f0f0f0",
-          }}
-        >
-          <Typography.Title level={4} style={{ margin: 0 }}>
+      {isDesktop && (
+        <Sider width={220} theme="dark">
+          {navigation}
+        </Sider>
+      )}
+      <Drawer
+        title={null}
+        placement="left"
+        open={!isDesktop && navOpen}
+        onClose={() => setNavOpen(false)}
+        width={240}
+        closable={false}
+        styles={{ body: { padding: 0, background: "#001529" } }}
+      >
+        {navigation}
+      </Drawer>
+      <Layout className="app-main-layout">
+        <Header className="app-header" style={{ background: colorBgContainer }}>
+          {!isDesktop && (
+            <Button
+              type="text"
+              icon={<MenuOutlined />}
+              aria-label="打开导航菜单"
+              className="mobile-menu-button"
+              onClick={() => setNavOpen(true)}
+            />
+          )}
+          <Typography.Text strong className="app-title">
             智标聚合助手
-          </Typography.Title>
-          <Typography.Text type="secondary" style={{ marginLeft: 16 }}>
+          </Typography.Text>
+          <Typography.Text type="secondary" className="app-subtitle">
             2026 AI 先锋未来人才大赛 · 超聚变企业命题
           </Typography.Text>
         </Header>
-        <Content style={{ margin: 24 }}>
+        <Content className="app-content">
           <Outlet />
         </Content>
-        <Footer style={{ textAlign: "center" }} className="muted">
-          FusionBid · 默认时区 Asia/Shanghai · 阶段一骨架
+        <Footer className="muted app-footer">
+          FusionBid · Asia/Shanghai · 数据来源与模式可追溯
         </Footer>
       </Layout>
     </Layout>

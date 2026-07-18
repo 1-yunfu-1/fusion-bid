@@ -39,10 +39,14 @@ class CandidateRecord:
     summary: str | None = None
     clean_content: str | None = None
     raw_content: str | None = None
+    detail_status: str = "unknown"
+    source_metadata: dict[str, Any] | None = None
+    extraction_data: dict[str, Any] | None = None
     attachment_links: list[str] = field(default_factory=list)
     content_hash: str | None = None
     deduplication_key: str | None = None
     project_code: str | None = None
+    announcement_type: str | None = None
     publisher: str | None = None
     # 入库后填充
     db_id: str | None = None
@@ -64,6 +68,10 @@ class CandidateRecord:
             (self.clean_content or "") + " " + (self.title or "")
         ):
             score += 25
+        if self.detail_status == "full":
+            score += 80
+        elif self.detail_status == "metadata_only":
+            score += 5
         # 官方加权
         score += max(0, 30 - SOURCE_PRIORITY.get(self.source_name, 10) * 5)
         return score
@@ -90,6 +98,25 @@ def _region_compatible(a: str | None, b: str | None) -> bool:
     return sa in b or sb in a or sa in sb or sb in sa
 
 
+def announcement_lifecycle_type(record: CandidateRecord) -> str:
+    """识别公告生命周期节点，用于防止原公告被终止/更正公告覆盖。"""
+    explicit = (record.announcement_type or "").strip()
+    probe = f"{explicit} {record.title}"
+    rules = (
+        ("终止公告", ("终止公告", "终止招标", "招标终止")),
+        ("废标公告", ("废标公告", "流标公告", "采购失败")),
+        ("更正公告", ("更正公告", "变更公告", "澄清公告")),
+        ("中标公告", ("中标公告", "中标候选人公示", "中标结果")),
+        ("成交公告", ("成交公告", "成交结果")),
+        ("资格预审", ("资格预审",)),
+        ("招标公告", ("招标公告", "采购公告", "磋商公告", "询价公告")),
+    )
+    for lifecycle, markers in rules:
+        if any(marker in probe for marker in markers):
+            return lifecycle
+    return explicit or "未知"
+
+
 def is_duplicate(left: CandidateRecord, right: CandidateRecord) -> tuple[bool, str]:
     """判断两条是否重复，返回 (是否重复, 依据)."""
     # 1) 同源 source_item_id
@@ -111,23 +138,39 @@ def is_duplicate(left: CandidateRecord, right: CandidateRecord) -> tuple[bool, s
     code_r = right.project_code or normalize_bid_code(
         f"{right.title} {right.clean_content or ''}"
     )
+    type_l = announcement_lifecycle_type(left)
+    type_r = announcement_lifecycle_type(right)
+    if code_l and code_r and code_l != code_r:
+        return False, ""
     if code_l and code_r and code_l == code_r:
+        if type_l != type_r and "未知" not in {type_l, type_r}:
+            return False, ""
         return True, f"项目编号一致:{code_l}"
 
     # 4) 标题标准化完全一致 + 区域兼容 + 时间兼容
     nt_l, nt_r = normalize_title(left.title), normalize_title(right.title)
-    if nt_l and nt_l == nt_r and _region_compatible(left.region, right.region):
+    if (
+        nt_l
+        and nt_l == nt_r
+        and type_l == type_r
+        and _region_compatible(left.region, right.region)
+    ):
         if _same_day(left.publish_time, right.publish_time):
             return True, "标准化标题+区域+日期"
 
     # 5) 标题高相似 + 区域 + 正文相似或附件名重叠
     ts = title_similarity(left.title, right.title)
-    if ts >= 0.88 and _region_compatible(left.region, right.region):
+    if (
+        ts >= 0.88
+        and type_l == type_r
+        and _region_compatible(left.region, right.region)
+    ):
         cs = content_similarity(left.clean_content or "", right.clean_content or "")
         att_l = attachment_name_set(left.attachment_links)
         att_r = attachment_name_set(right.attachment_links)
         att_overlap = bool(att_l & att_r) if att_l and att_r else False
-        if cs >= 0.55 or att_overlap or ts >= 0.95:
+        # 标题相似本身不再足以合并；必须有高度正文或附件证据。
+        if cs >= 0.75 or att_overlap:
             reason = f"标题相似({ts:.2f})"
             if cs >= 0.55:
                 reason += f"+正文相似({cs:.2f})"
@@ -136,7 +179,14 @@ def is_duplicate(left: CandidateRecord, right: CandidateRecord) -> tuple[bool, s
             return True, reason
 
     # 6) 正文哈希
-    if left.content_hash and right.content_hash and left.content_hash == right.content_hash:
+    if (
+        left.detail_status == "full"
+        and right.detail_status == "full"
+        and type_l == type_r
+        and left.content_hash
+        and right.content_hash
+        and left.content_hash == right.content_hash
+    ):
         return True, "正文哈希一致"
 
     return False, ""
@@ -178,13 +228,21 @@ def merge_into_primary(primary: CandidateRecord, other: CandidateRecord, reason:
     primary.dedupe_reasons.append(reason)
 
     # 补全主记录信息
-    if (not primary.clean_content or len(primary.clean_content) < len(other.clean_content or "")) and (
-        other.clean_content
+    other_is_better = other.completeness_score() > primary.completeness_score()
+    detail_is_better = other.detail_status == "full" and primary.detail_status != "full"
+    same_detail_quality = other.detail_status == primary.detail_status
+    if other.clean_content and (
+        not primary.clean_content
+        or detail_is_better
+        or (same_detail_quality and len(other.clean_content) > len(primary.clean_content))
+        or (same_detail_quality and other_is_better)
     ):
-        if not primary.clean_content:
-            primary.clean_content = other.clean_content
-            primary.raw_content = other.raw_content
-            primary.summary = other.summary
+        primary.clean_content = other.clean_content
+        primary.raw_content = other.raw_content
+        primary.summary = other.summary
+        primary.detail_status = other.detail_status
+        primary.source_metadata = other.source_metadata
+        primary.extraction_data = other.extraction_data
     # 附件并集
     seen = set(primary.attachment_links or [])
     for link in other.attachment_links or []:

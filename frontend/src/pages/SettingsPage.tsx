@@ -37,6 +37,7 @@ import {
   type ApiModelsResponse,
   type ApiProfile,
 } from "../api/llm";
+import CompanyProfileCard from "../components/CompanyProfileCard";
 
 type ProfileForm = {
   name: string;
@@ -236,6 +237,7 @@ export default function SettingsPage() {
 
   return (
     <Space direction="vertical" size="large" style={{ width: "100%" }}>
+      <Typography.Title level={1} style={{ margin: 0 }}>设置</Typography.Title>
       <Alert
         type="info"
         showIcon
@@ -252,6 +254,8 @@ export default function SettingsPage() {
           </div>
         }
       />
+
+      <CompanyProfileCard />
 
       <Row gutter={[16, 16]}>
         <Col xs={24} lg={12}>

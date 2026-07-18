@@ -24,3 +24,85 @@ export interface TaskListResponse {
   items: TaskOut[];
   total: number;
 }
+
+export interface TaskExecutionResponse {
+  execution_id: string;
+  task_id: string;
+  status: "success" | "partial" | "failed" | string;
+  task_status: string;
+  trigger_type: "initial" | "manual" | "scheduled" | string;
+  report_scope: "incremental" | "snapshot" | string;
+  report_mode: "incremental" | "full_snapshot" | string;
+  deduplicate: boolean;
+  truncated: boolean;
+  next_run_at?: string | null;
+  sources_requested: string[];
+  sources_succeeded: string[];
+  sources_failed: Record<string, string>;
+  raw_result_count: number;
+  detail_success_count: number;
+  detail_metadata_only_count: number;
+  detail_failed_count: number;
+  detail_human_verification_count: number;
+  filtered_out_count: number;
+  duplicate_count: number;
+  cross_source_merge_count: number;
+  saved_count: number;
+  incremental_count: number;
+  update_count: number;
+  skipped_already_delivered: number;
+  announcement_ids: string[];
+  output_items: Array<Record<string, unknown>>;
+  dedupe_reasons: string[];
+  report_filename?: string | null;
+  report_download_url?: string | null;
+  analysis_status: string;
+  analysis_provider: string;
+  analysis_preview: {
+    status?: string;
+    provider?: string;
+    portfolio_summary?: string;
+    priority_counts?: Record<string, number>;
+    top_projects?: Array<{
+      announcement_id?: string;
+      title?: string;
+      priority?: string;
+      deadline_urgency?: string;
+    }>;
+  };
+  error_message?: string | null;
+  message: string;
+}
+
+export interface TaskExecutionItem {
+  id: string;
+  status: string;
+  trigger_type: string;
+  report_scope: string;
+  report_mode: string;
+  deduplicate: boolean;
+  truncated: boolean;
+  started_at?: string | null;
+  finished_at?: string | null;
+  sources_requested: string[];
+  sources_succeeded: string[];
+  raw_result_count: number;
+  filtered_result_count: number;
+  duplicate_count: number;
+  incremental_count: number;
+  detail_full_count: number;
+  detail_metadata_count: number;
+  detail_failed_count: number;
+  detail_human_verification_count: number;
+  report_filename?: string | null;
+  report_download_url?: string | null;
+  analysis_status: string;
+  analysis_provider: string;
+  analysis_preview: TaskExecutionResponse["analysis_preview"];
+  error_message?: string | null;
+}
+
+export interface TaskExecutionListResponse {
+  items: TaskExecutionItem[];
+  total: number;
+}

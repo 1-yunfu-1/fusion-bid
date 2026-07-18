@@ -32,6 +32,21 @@ class TenderAnnouncement(Base):
     summary: Mapped[str | None] = mapped_column(Text, nullable=True)
     clean_content: Mapped[str | None] = mapped_column(Text, nullable=True)
     raw_content: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # 详情质量必须与正文一起持久化，避免历史报告将列表元数据误标为已获取详情。
+    detail_status: Mapped[str] = mapped_column(
+        String(24), default="unknown", nullable=False, index=True
+    )  # full | metadata_only | failed | needs_human_verification | unknown
+    detail_url: Mapped[str | None] = mapped_column(String(2048), nullable=True)
+    content_format: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    extraction_version: Mapped[str] = mapped_column(
+        String(16), default="v2", nullable=False, index=True
+    )
+    announcement_type: Mapped[str | None] = mapped_column(
+        String(64), nullable=True, index=True
+    )
+    source_metadata: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    extraction_data: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    analysis_data: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     attachment_links: Mapped[list | None] = mapped_column(JSON, nullable=True)
     crawl_time: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     content_hash: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)

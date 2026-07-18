@@ -48,6 +48,29 @@ async def test_login_source_search_without_state(tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_login_source_disables_cross_site_configuration(monkeypatch):
+    from app.core.config import get_settings
+
+    monkeypatch.setenv("LOGIN_SOURCE_ENABLED", "true")
+    monkeypatch.setenv("LOGIN_SOURCE_HOME_URL", "https://www.baidu.com/")
+    monkeypatch.setenv("LOGIN_SOURCE_LOGIN_URL", "https://www.baidu.com/login")
+    monkeypatch.setenv(
+        "LOGIN_SOURCE_SEARCH_URL",
+        "https://www.chinabidding.cn/search/?q={keyword}",
+    )
+    get_settings.cache_clear()
+    try:
+        src = LoginPortalSource()
+        assert src.enabled is False
+        health = await src.health_check()
+        assert health.ok is False
+        assert "不属于同一门户" in health.message
+        assert "公开源仍会继续执行" in health.message
+    finally:
+        get_settings.cache_clear()
+
+
+@pytest.mark.asyncio
 async def test_login_source_parse_list_from_html():
     src = LoginPortalSource()
     html = """

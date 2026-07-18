@@ -8,6 +8,12 @@ function downloadUrl(filename: string): string {
   return `${base}/api/reports/download/${encodeURIComponent(filename)}`;
 }
 
+const reportStatuses: Record<string, { label: string; color: string }> = {
+  success: { label: "成功", color: "success" },
+  partial: { label: "部分成功", color: "warning" },
+  failed: { label: "失败", color: "error" },
+};
+
 export default function ReportsPage() {
   const { data, isLoading, refetch, isFetching } = useQuery({
     queryKey: ["reports"],
@@ -33,7 +39,7 @@ export default function ReportsPage() {
 
   return (
     <Card
-      title="报告中心"
+      title={<Typography.Title level={1} style={{ margin: 0, fontSize: 26 }}>报告中心</Typography.Title>}
       className="page-card"
       extra={
         <Button onClick={() => refetch()} loading={isFetching}>
@@ -53,6 +59,7 @@ export default function ReportsPage() {
         rowKey="filename"
         dataSource={data?.items || []}
         pagination={{ pageSize: 20, total: data?.total || 0 }}
+        scroll={{ x: 980 }}
         columns={[
           {
             title: "文件名",
@@ -76,7 +83,11 @@ export default function ReportsPage() {
             title: "状态",
             dataIndex: "status",
             width: 100,
-            render: (s?: string) => (s ? <Tag>{s}</Tag> : "—"),
+            render: (s?: string) => {
+              if (!s) return "—";
+              const meta = reportStatuses[s] || { label: s, color: "default" };
+              return <Tag color={meta.color}>{meta.label}</Tag>;
+            },
           },
           {
             title: "大小",

@@ -13,6 +13,7 @@ from lxml import etree
 
 from app.reports.fields import (
     attachment_status,
+    build_extraction_data,
     enrich_report_item,
     extract_fields,
     format_cn_date,
@@ -82,6 +83,31 @@ def test_extract_fields_no_fabrication():
     empty = extract_fields(title="仅有标题", clean_content="")
     assert empty["purchaser"] == "原文未明确说明"
     assert empty["budget"] == "原文未明确说明"
+
+
+def test_extract_fields_preserves_tenderer_label_and_multiline_qualifications():
+    text = """
+    招标人名称：福建某核电有限公司
+    项目编号：FJ-2026-001
+    投标人资格要求：
+    1. 具有独立法人资格；
+    2. 具备有效的安全生产许可证；
+    3. 近三年具有同类项目业绩。
+    投标截止时间：2026-08-20 09:00
+    """
+    fields = extract_fields(title="核电项目招标公告", clean_content=text)
+    assert fields["purchaser"] == "福建某核电有限公司"
+    assert fields["purchaser_source_label"] == "招标人名称"
+    assert len(fields["qualification_items"]) >= 3
+    assert "安全生产许可证" in fields["qualification"]
+    assert format_cn_date("1970-01-01") == "原文未明确说明"
+    extraction = build_extraction_data(
+        title="核电项目招标公告",
+        clean_content=text,
+        detail_status="full",
+    )
+    assert extraction["fields"]["purchaser"] == "福建某核电有限公司"
+    assert extraction["evidence"]["purchaser"]["source_label"] == "招标人名称"
 
 
 def test_attachment_status_variants():
@@ -203,6 +229,7 @@ def _sample_ctx(**kwargs) -> ReportContext:
                 "is_new": True,
                 "is_update": False,
                 "detail_fetched": True,
+                "detail_status": "full",
                 "requires_login": False,
                 "related_urls": [
                     "https://www.cebpubservice.com/example/1",
@@ -220,6 +247,7 @@ def _sample_ctx(**kwargs) -> ReportContext:
                 "change_label": "新增",
                 "is_new": True,
                 "detail_fetched": True,
+                "detail_status": "full",
                 "requires_login": False,
             },
         ],
@@ -249,6 +277,7 @@ def test_generate_word_report_structure_and_fields(tmp_path: Path):
     assert "海淀区某中心" in text  # 采购人抽取
     assert "匹配依据" in text
     assert "数据完整度" in text
+    assert "投标决策分析" in text
     assert "查看原始公告" in text
     assert "https://www.cebpubservice.com/example/1" not in text  # 不直接铺满长 URL
     assert "未发现公开附件" in text or "发现" in text or "附件状态" in text
@@ -257,6 +286,21 @@ def test_generate_word_report_structure_and_fields(tmp_path: Path):
     # 页眉
     assert doc.sections[0].header.paragraphs
     assert any("智标" in (p.text or "") or "FusionBid" in (p.text or "") for p in doc.sections[0].header.paragraphs)
+
+
+def test_snapshot_word_report_discloses_non_deduplicated_source_records(tmp_path: Path):
+    ctx = _sample_ctx(report_scope="snapshot")
+    for item in ctx.items:
+        item["change_label"] = "本轮原始记录（未去重）"
+        item["dedupe_status"] = "保留（同批疑似重复）"
+        item["dedupe_hint"] = "标准化标题+区域+日期"
+
+    path = generate_report_file(ctx, reports_dir=tmp_path)
+    text = "\n".join(p.text for p in Document(str(path)).paragraphs)
+    assert "本轮原始完整快照（不去重）" in text
+    assert "本报告保留来源记录 2 条（未去重，可能重复项已标注）" in text
+    assert "未去重完整快照保留本轮全部合格来源记录" in text
+    assert "收录方式：保留（同批疑似重复）" in text
 
 
 def test_report_hyperlinks_clickable(tmp_path: Path):

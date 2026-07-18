@@ -124,7 +124,7 @@ async def _execute_job(task_id: str) -> None:
                 return
 
             logger.info("scheduled run start task=%s", task_id)
-            execution, _stats = await execute_search_task(db, task)
+            execution, _stats = await execute_search_task(db, task, trigger_type="scheduled")
             # 刷新 next_run / once 处理
             task = await db.get(SearchTask, task_id)
             if not task:

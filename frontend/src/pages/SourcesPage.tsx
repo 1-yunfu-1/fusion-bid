@@ -103,7 +103,7 @@ export default function SourcesPage() {
   const startLoginMutation = useMutation({
     mutationFn: async (vars: { force?: boolean }) => {
       const { data } = await apiClient.post("/api/login/start", {
-        login_url: loginUrl || null,
+        login_url: null,
         wait_seconds: waitSeconds,
         force: !!vars.force,
       });
@@ -176,6 +176,7 @@ export default function SourcesPage() {
 
   return (
     <Space direction="vertical" size="large" style={{ width: "100%" }}>
+      <Typography.Title level={1} style={{ margin: 0 }}>数据源</Typography.Title>
       <Alert
         type="info"
         showIcon
@@ -193,13 +194,14 @@ export default function SourcesPage() {
               type="primary"
               loading={startLoginMutation.isPending}
               onClick={() => startLoginMutation.mutate({ force: false })}
-              disabled={running}
+              disabled={running || !loginQuery.data?.enabled}
             >
               启动登录浏览器
             </Button>
             <Button
               loading={startLoginMutation.isPending}
               onClick={() => startLoginMutation.mutate({ force: true })}
+              disabled={!loginQuery.data?.enabled}
             >
               强制重新启动
             </Button>
@@ -278,13 +280,13 @@ export default function SourcesPage() {
             )}
 
             <Typography.Paragraph type="secondary" style={{ marginBottom: 8 }}>
-              登录页 URL（可改；启动时使用）
+              登录门户（由环境配置统一管理）
             </Typography.Paragraph>
             <Space.Compact style={{ width: "100%", marginBottom: 12 }}>
               <Input
                 value={loginUrl}
-                onChange={(e) => setLoginUrl(e.target.value)}
-                placeholder="https://your-portal.example/login"
+                readOnly
+                placeholder="请在环境配置中设置登录门户"
               />
               <InputNumber
                 min={60}
@@ -371,6 +373,7 @@ export default function SourcesPage() {
           rowKey="source_name"
           dataSource={listQuery.data?.items || []}
           pagination={false}
+          scroll={{ x: 880 }}
           columns={[
             { title: "标识", dataIndex: "source_name" },
             { title: "名称", dataIndex: "display_name" },

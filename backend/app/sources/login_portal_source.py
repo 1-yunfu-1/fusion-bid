@@ -16,7 +16,7 @@ import hashlib
 import logging
 import re
 from datetime import datetime
-from urllib.parse import quote, urljoin
+from urllib.parse import quote, urljoin, urlparse
 from zoneinfo import ZoneInfo
 
 from bs4 import BeautifulSoup
@@ -66,12 +66,24 @@ class LoginPortalSource(TenderSourceAdapter):
 
     def __init__(self) -> None:
         settings = get_settings()
-        self.enabled = settings.login_source_enabled
         self.home_url = settings.login_source_home_url
         self.login_url = settings.login_source_login_url
         self.search_url_template = settings.login_source_search_url
         self.max_items = settings.login_source_max_items
         self.state_path = state_file_path(settings.login_source_state_file)
+        hosts = {
+            (urlparse(url).hostname or "").lower().removeprefix("www.")
+            for url in (self.home_url, self.login_url, self.search_url_template)
+        }
+        hosts.discard("")
+        self.configuration_error = None
+        if len(hosts) != 1:
+            self.configuration_error = (
+                "登录页、首页与检索地址不属于同一门户，登录源已停用；"
+                "请统一 LOGIN_SOURCE_HOME_URL、LOGIN_SOURCE_LOGIN_URL 和 "
+                "LOGIN_SOURCE_SEARCH_URL。公开源仍会继续执行。"
+            )
+        self.enabled = bool(settings.login_source_enabled and not self.configuration_error)
 
     def _build_search_url(self, keyword: str, region: str = "") -> str:
         tpl = self.search_url_template
@@ -83,6 +95,14 @@ class LoginPortalSource(TenderSourceAdapter):
 
     async def health_check(self) -> HealthResult:
         meta = safe_state_meta(self.state_path)
+        if self.configuration_error:
+            return HealthResult(
+                ok=False,
+                message=self.configuration_error,
+                requires_login=True,
+                login_ok=False,
+                checked_at=datetime.now(TZ),
+            )
         if not self.enabled:
             return HealthResult(
                 ok=False,
@@ -152,7 +172,7 @@ class LoginPortalSource(TenderSourceAdapter):
 
     async def search(self, query: SearchQuery) -> list[ListItem]:
         if not self.enabled:
-            raise LoginRequiredError("登录态数据源未启用")
+            raise LoginRequiredError(self.configuration_error or "登录态数据源未启用")
         if not self.state_path.exists():
             raise LoginRequiredError(
                 "登录状态不存在。请到「数据源」页点击「启动登录浏览器」完成手动登录"
