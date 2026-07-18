@@ -204,7 +204,47 @@ async def test_cebpub_interactive_fetch_uses_visible_browser(monkeypatch):
     detail = await source.fetch_detail(item, interactive=True)
 
     assert calls[0]["headless"] is False
+    assert calls[0]["managed"] is True
     assert calls[0]["timeout_ms"] == 300_000
     assert detail.detail_status == "needs_human_verification"
-    assert detail.source_metadata["acquisition_mode"] == "interactive"
+    assert detail.source_metadata["acquisition_mode"] == "managed_chrome"
+    assert detail.source_metadata["interaction_requested"] is True
     assert detail.source_metadata["failure_reason"] == "verification_timeout"
+
+
+@pytest.mark.asyncio
+async def test_cebpub_keeps_managed_browser_metadata_only_failure(monkeypatch):
+    source = CebpubSource()
+    business_id = "1d1600b68217477890a8076bc98a6880"
+    item = ListItem(
+        title="服务器、数据库、数据库集群软件招标公告",
+        source_url="https://ctbpsp.com/",
+        source_item_id=business_id,
+        raw={"businessId": business_id},
+    )
+
+    async def fake_pdf_detail(**kwargs):
+        return PublicPdfDetail(
+            status="metadata_only",
+            detail_url=kwargs["detail_url"],
+            message="PDF 第 2 页未能读取",
+            failure_reason="incomplete_pdf_pages",
+            acquisition_mode="managed_chrome",
+            browser_reused=True,
+            browser_state="ready",
+        )
+
+    async def legacy_must_not_run(_steps):
+        raise AssertionError("32 位 UUID 不应回退到旧详情接口")
+
+    monkeypatch.setattr(
+        "app.sources.cebpub_source.fetch_public_pdf_detail", fake_pdf_detail
+    )
+    monkeypatch.setattr(source.fetcher, "post_form_sequence", legacy_must_not_run)
+
+    detail = await source.fetch_detail(item)
+
+    assert detail.detail_status == "metadata_only"
+    assert detail.source_metadata["failure_reason"] == "incomplete_pdf_pages"
+    assert detail.source_metadata["acquisition_mode"] == "managed_chrome"
+    assert detail.source_metadata["browser_reused"] is True

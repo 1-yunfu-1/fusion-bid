@@ -17,6 +17,17 @@ async def test_health_ok(client: AsyncClient):
     assert "official-document-import-v1" in data["capabilities"]
     assert "pdfjs-text-layer-capture-v1" in data["capabilities"]
     assert "browser-rendered-detail-capture-v1" in data["capabilities"]
+    assert "managed-public-browser-v1" in data["capabilities"]
+    assert data["public_browser"]["state"] in {
+        "not_started",
+        "starting",
+        "ready",
+        "busy",
+        "needs_verification",
+        "unavailable",
+    }
+    assert "port" not in data["public_browser"]
+    assert "profile_dir" not in data["public_browser"]
     assert "Asia/Shanghai" in data["timezone"]
     assert data["phase"] == "phase8-integration"
 

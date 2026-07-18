@@ -148,14 +148,12 @@ export default function AnnouncementsPage() {
   const [correctionForm] = Form.useForm();
   const healthQuery = useQuery({ queryKey: ["health"], queryFn: fetchHealth });
   const recrawlCompatible = Boolean(
-    healthQuery.data?.capabilities?.includes("interactive-detail-recrawl-v1"),
+    healthQuery.data?.capabilities?.includes("managed-public-browser-v1"),
   );
   const importCompatible = Boolean(
     healthQuery.data?.capabilities?.includes("official-document-import-v1"),
   );
-  const browserCaptureCompatible = Boolean(
-    healthQuery.data?.capabilities?.includes("browser-rendered-detail-capture-v1"),
-  );
+  const publicBrowserState = healthQuery.data?.public_browser?.state;
 
   const sourceQuery = useQuery({
     queryKey: ["sources"],
@@ -201,13 +199,13 @@ export default function AnnouncementsPage() {
         isRecrawl
           ? { interactive_on_verification: action === "recrawlInteractive" }
           : {},
-        { timeout: action === "recrawlInteractive" ? 360000 : isRecrawl ? 90000 : 300000 },
+        { timeout: isRecrawl ? 360000 : 300000 },
       );
       return data;
     },
     onSuccess: (data, action) => {
       if ((action === "recrawl" || action === "recrawlInteractive") && data.ok === false) {
-        const detail = [data.failure_reason, data.acquisition_mode]
+        const detail = [data.failure_reason, data.acquisition_mode, data.browser_state]
           .filter(Boolean)
           .join(" / ");
         message.warning(
@@ -305,24 +303,26 @@ export default function AnnouncementsPage() {
         导入官方文件
       </Button>
       <Button
+        type="primary"
         icon={<ReloadOutlined />}
         disabled={!recrawlCompatible}
         loading={actionMutation.isPending && actionMutation.variables === "recrawl"}
         onClick={() => actionMutation.mutate("recrawl")}
       >
-        无头自动采集
+        全自动重新采集
       </Button>
-      <Button
-        type={detail?.detail_status === "needs_human_verification" ? "primary" : "default"}
-        icon={<ReloadOutlined />}
-        disabled={!recrawlCompatible}
-        loading={
-          actionMutation.isPending && actionMutation.variables === "recrawlInteractive"
-        }
-        onClick={() => actionMutation.mutate("recrawlInteractive")}
-      >
-        可见浏览器采集
-      </Button>
+      {detail?.detail_status === "needs_human_verification" ? (
+        <Button
+          icon={<ReloadOutlined />}
+          disabled={!recrawlCompatible}
+          loading={
+            actionMutation.isPending && actionMutation.variables === "recrawlInteractive"
+          }
+          onClick={() => actionMutation.mutate("recrawlInteractive")}
+        >
+          打开专用浏览器完成验证
+        </Button>
+      ) : null}
       <Button
         disabled={detail?.detail_status !== "full"}
         loading={actionMutation.isPending && actionMutation.variables === "reextract"}
@@ -479,8 +479,8 @@ export default function AnnouncementsPage() {
                   type="info"
                   showIcon
                   style={{ marginBottom: 16 }}
-                  message="正在采集官方详情"
-                  description="正在尝试公开详情链路，不会弹出临时浏览器；失败后可在常用浏览器打开官方页并导入下载的 PDF 或 HTML。"
+                  message="正在全自动采集官方详情"
+                  description="系统正在启动或复用专用 Chrome、加载公告、逐页读取 PDF，并继续完成证据抽取与 AI 分析。无需安装扩展或逐条点击。"
                 />
               ) : null}
               {actionMutation.isPending && actionMutation.variables === "recrawlInteractive" ? (
@@ -488,17 +488,26 @@ export default function AnnouncementsPage() {
                   type="info"
                   showIcon
                   style={{ marginBottom: 16 }}
-                  message="正在等待可见浏览器中的官方详情"
-                  description="浏览器最多保持 300 秒；只完成官方页面要求的验证。若站点仍显示空白，请改用常用 Chrome 的 FusionBid 采集扩展。"
+                  message="正在等待专用浏览器完成官方验证"
+                  description="只需完成官方页面明确要求的验证码；验证通过后系统会自动继续逐页采集和解析，无需再次点击。"
                 />
               ) : null}
-              {detail.detail_status !== "full" && browserCaptureCompatible ? (
+              {detail.detail_status === "needs_human_verification" ? (
                 <Alert
                   type="warning"
                   showIcon
                   style={{ marginBottom: 16 }}
-                  message="自动化浏览器可能被官方站点限制"
-                  description="常用 Chrome 能正常显示公告时，可加载 browser_extension/ctbpsp_capture 扩展，在官方详情页点击扩展完成逐页采集；扩展不会读取或上传 Cookie。"
+                  message="官方页面要求人工安全验证"
+                  description="正常公开页会完全自动处理；仅在官方明确要求验证码时，使用上方按钮打开 FusionBid 专用浏览器完成一次验证。"
+                />
+              ) : null}
+              {publicBrowserState === "unavailable" ? (
+                <Alert
+                  type="error"
+                  showIcon
+                  style={{ marginBottom: 16 }}
+                  message="专用浏览器不可用"
+                  description={healthQuery.data?.public_browser?.last_error || "未找到可用的 Chrome/Edge 或浏览器启动失败。"}
                 />
               ) : null}
               {!healthQuery.isLoading && (!recrawlCompatible || !importCompatible) ? (
@@ -507,7 +516,7 @@ export default function AnnouncementsPage() {
                   showIcon
                   style={{ marginBottom: 16 }}
                   message="详情采集工具已禁用"
-                  description="当前后端缺少自动重采或官方文件导入能力，请先使用 FusionBid 启动脚本安全重启。"
+                  description="当前后端缺少专用浏览器自动采集或官方文件导入能力，请先使用 FusionBid 启动脚本安全重启。"
                 />
               ) : null}
               {needsReviewFields.length > 0 ? (

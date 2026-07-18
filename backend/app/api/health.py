@@ -9,6 +9,7 @@ from fastapi import APIRouter
 
 from app.core.config import get_settings
 from app.core.database import check_db, database_revision
+from app.browser.managed_public import managed_public_browser_status
 from app.schemas.health import HealthResponse, MetaResponse
 
 router = APIRouter()
@@ -39,7 +40,9 @@ async def health_check() -> HealthResponse:
             "official-document-import-v1",
             "pdfjs-text-layer-capture-v1",
             "browser-rendered-detail-capture-v1",
+            "managed-public-browser-v1",
         ],
+        public_browser=managed_public_browser_status(),
         message="服务正常" if db_ok else "数据库连接异常",
     )
 

@@ -74,6 +74,14 @@ class Settings(BaseSettings):
     crawl_max_concurrency: int = Field(default=3, alias="CRAWL_MAX_CONCURRENCY")
     crawl_rate_limit_per_second: float = Field(default=1.0, alias="CRAWL_RATE_LIMIT_PER_SECOND")
 
+    # --- CEBPUB 公开详情：专用普通 Chrome/Edge + 本机 CDP ---
+    cebpub_browser_mode: Literal["managed", "legacy"] = Field(
+        default="managed", alias="CEBPUB_BROWSER_MODE"
+    )
+    cebpub_browser_timeout_seconds: int = Field(
+        default=60, ge=15, le=300, alias="CEBPUB_BROWSER_TIMEOUT_SECONDS"
+    )
+
     # --- 登录态数据源（Playwright 手动登录 + storage state）---
     login_source_enabled: bool = Field(default=True, alias="LOGIN_SOURCE_ENABLED")
     login_source_home_url: str = Field(

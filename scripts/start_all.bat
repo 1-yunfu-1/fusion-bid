@@ -48,7 +48,7 @@ for /f "tokens=5" %%P in ('netstat -ano ^| findstr ":8000" ^| findstr "LISTENING
   if not defined PORT_PID set "PORT_PID=%%P"
 )
 if defined PORT_PID (
-  "%SYS_PY%" -c "import json,urllib.request; d=json.load(urllib.request.urlopen('http://127.0.0.1:8000/api/health',timeout=2)); raise SystemExit(0 if 'FusionBid' in str(d.get('app','')) and d.get('extraction_version')=='v2' and d.get('database_revision')=='20260718_0006' else 2 if 'FusionBid' in str(d.get('app','')) else 1)" >nul 2>&1
+  "%SYS_PY%" -c "import json,urllib.request; d=json.load(urllib.request.urlopen('http://127.0.0.1:8000/api/health',timeout=2)); current='managed-public-browser-v1' in d.get('capabilities',[]); raise SystemExit(0 if 'FusionBid' in str(d.get('app','')) and d.get('extraction_version')=='v2' and d.get('database_revision')=='20260718_0006' and current else 2 if 'FusionBid' in str(d.get('app','')) else 1)" >nul 2>&1
   set "HEALTH_RC=!ERRORLEVEL!"
   if "!HEALTH_RC!"=="0" (
       echo [OK] Current FusionBid is already running on port 8000 ^(PID !PORT_PID!^).

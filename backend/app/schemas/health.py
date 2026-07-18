@@ -7,6 +7,13 @@ from datetime import datetime
 from pydantic import BaseModel, Field
 
 
+class PublicBrowserStatus(BaseModel):
+    state: str = "not_started"
+    engine: str | None = None
+    profile_ready: bool = False
+    last_error: str | None = None
+
+
 class HealthResponse(BaseModel):
     status: str = Field(description="overall | ok / degraded / error")
     app: str
@@ -19,6 +26,7 @@ class HealthResponse(BaseModel):
     database_revision: str = "unversioned"
     extraction_version: str = "v2"
     capabilities: list[str] = Field(default_factory=list)
+    public_browser: PublicBrowserStatus = Field(default_factory=PublicBrowserStatus)
     message: str = ""
 
 

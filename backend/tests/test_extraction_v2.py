@@ -2,13 +2,22 @@
 
 from __future__ import annotations
 
+import sys
+from types import ModuleType, SimpleNamespace
+
 import pytest
 
-from app.browser.pdf_detail import _extract_rendered_text_pages, restore_reading_order
+from app.browser.pdf_detail import (
+    _extract_rendered_text_pages,
+    _ocr_rendered_pages,
+    _wait_for_pdf_frame,
+    restore_reading_order,
+)
 from app.deduplication.engine import CandidateRecord, is_duplicate
 from app.reports.fields import (
     _ai_source_chunks,
     _split_qualification_items,
+    _subject_label_rank,
     _validate_ai_extraction_rows,
     build_extraction_data,
     enrich_report_item,
@@ -25,6 +34,20 @@ def test_joined_qualification_field_can_be_split_back_into_clauses():
         "3.2",
         "3.10",
         "3.11",
+    ]
+
+
+def test_pdf_qualification_numbers_need_no_space_before_chinese_text():
+    items = _split_qualification_items(
+        "3.1投标人须依法注册\n3.2本项目不允许联合体投标\n"
+        "3.3本次允许代理商投标\n3.4投标人须办理CA证书"
+    )
+
+    assert [item.split(maxsplit=1)[0] for item in items] == [
+        "3.1",
+        "3.2",
+        "3.3",
+        "3.4",
     ]
 
 
@@ -151,6 +174,55 @@ def test_ai_purchaser_requires_real_source_label():
     assert any("source_label" in error for error in errors)
 
 
+def test_subject_label_priority_prefers_tenderer_over_project_owner():
+    assert _subject_label_rank("采购人") > _subject_label_rank("招标人")
+    assert _subject_label_rank("招标人") > _subject_label_rank("项目业主")
+
+
+def test_ai_verified_datetime_is_stored_in_normalized_form():
+    content = "5.1投标截止时间为2026-08-06 14:00:00（北京时间）"
+    valid, errors = _validate_ai_extraction_rows(
+        {
+            "fields": [
+                {
+                    "name": "bid_deadline",
+                    "value": "2026-08-06 14:00:00",
+                    "source_label": "投标截止时间",
+                    "quote": content,
+                    "page": 1,
+                }
+            ]
+        },
+        clean_content=content,
+        source_metadata={"content_pages": [{"page": 1, "text": content}]},
+    )
+
+    assert errors == []
+    assert valid[0]["value"] == "2026年8月6日 14:00"
+
+
+def test_ai_verified_mixed_currency_price_drops_redundant_yuan_symbol():
+    content = "招标文件售价￥：￥200/$30"
+    valid, errors = _validate_ai_extraction_rows(
+        {
+            "fields": [
+                {
+                    "name": "document_price",
+                    "value": "￥200/$30",
+                    "source_label": "招标文件售价￥",
+                    "quote": content,
+                    "page": 1,
+                }
+            ]
+        },
+        clean_content=content,
+        source_metadata={"content_pages": [{"page": 1, "text": content}]},
+    )
+
+    assert errors == []
+    assert valid[0]["value"] == "200/$30"
+
+
 def test_international_pdf_reversed_cells_extract_complete_fields():
     content = """
 【第1页】
@@ -244,6 +316,59 @@ def test_pdf_reading_order_removes_subpixel_render_duplicates():
     assert text == "招标文件售价800.0"
 
 
+@pytest.mark.asyncio
+async def test_pdf_frame_waits_for_frame_attachment(monkeypatch):
+    frame = type("Frame", (), {"url": "https://ctbpsp.com/web_pdf/viewer.html"})()
+
+    class DelayedPage:
+        reads = 0
+
+        @property
+        def frames(self):
+            self.reads += 1
+            return [] if self.reads < 3 else [frame]
+
+    async def fast_sleep(_seconds):
+        return None
+
+    monkeypatch.setattr("app.browser.pdf_detail.asyncio.sleep", fast_sleep)
+    page = DelayedPage()
+
+    assert await _wait_for_pdf_frame(page, timeout_ms=1000) is frame
+    assert page.reads == 3
+
+
+def test_raw_pdf_section_prefixes_and_table_layout_preserve_dates_and_price():
+    content = """
+2.招标内容、交货期、交货地点及招标文件售价：
+计量单位 交货期 招标文件售价人民币 备注
+标段（包）编号 货物名称 数量 交货地点
+位 期 （元） 注
+C1100000189017141002001 服务器、数据库、数据库集群软件 1.000 套 1周 800.0
+3.投标人资格要求
+3.1投标人须依法注册。
+4.招标文件的获取
+4.1参与：凡有意参加投标者，请于2026年07月16日22时00分00秒至2026年07月23日22时00分00秒下载招标文件。
+5.投标文件递交及开标信息
+5.1投标截止时间为2026-08-06 14:00:00（北京时间）。
+5.3开标时间为2026年08月06日14时00分（北京时间）。
+""".strip()
+
+    extraction = build_extraction_data(
+        title="服务器、数据库、数据库集群软件招标公告",
+        clean_content=content,
+        detail_status="full",
+        source_metadata={"content_pages": [{"page": 1, "text": content}]},
+    )
+    fields = extraction["fields"]
+
+    assert fields["document_price"] == "800元"
+    assert fields["document_acquisition_start"] == "2026年7月16日 22:00"
+    assert fields["document_acquisition_end"] == "2026年7月23日 22:00"
+    assert fields["bid_deadline"] == "2026年8月6日 14:00"
+    assert fields["opening_time"] == "2026年8月6日 14:00"
+
+
 class _FakeLayer:
     def __init__(self, items):
         self.items = items
@@ -324,6 +449,51 @@ async def test_pdfjs_text_layer_fallback_scrolls_and_extracts_every_page():
     assert pages[0]["text"] == "招标人：某研究所"
     assert pages[1]["text"] == "资格要求：具备营业执照"
     assert all(page.scrolled for page in rendered_pages)
+
+
+@pytest.mark.asyncio
+async def test_scanned_pdf_ocr_only_processes_missing_pages(monkeypatch):
+    fake_pil = ModuleType("PIL")
+    fake_pil.Image = SimpleNamespace(open=lambda _stream: object())
+    fake_tesseract = ModuleType("pytesseract")
+    calls: list[str] = []
+
+    def image_to_string(_image, *, lang):
+        calls.append(lang)
+        return "第2页扫描正文：招标人 某研究所"
+
+    fake_tesseract.image_to_string = image_to_string
+    monkeypatch.setitem(sys.modules, "PIL", fake_pil)
+    monkeypatch.setitem(sys.modules, "pytesseract", fake_tesseract)
+
+    class ScannedPage:
+        def __init__(self, number: int) -> None:
+            self.number = number
+            self.scrolled = False
+
+        async def scroll_into_view_if_needed(self, **_kwargs):
+            self.scrolled = True
+
+        async def screenshot(self, **_kwargs):
+            return f"page-{self.number}".encode()
+
+    scanned_pages = [ScannedPage(1), ScannedPage(2), ScannedPage(3)]
+
+    pages = await _ocr_rendered_pages(
+        _FakeFrame(scanned_pages), page_numbers={2}
+    )
+
+    assert pages == [
+        {
+            "page": 2,
+            "text": "第2页扫描正文：招标人 某研究所",
+            "method": "ocr",
+        }
+    ]
+    assert scanned_pages[0].scrolled is False
+    assert scanned_pages[1].scrolled is True
+    assert scanned_pages[2].scrolled is False
+    assert calls == ["chi_sim+eng"]
 
 
 def test_different_project_codes_and_lifecycle_not_merged():

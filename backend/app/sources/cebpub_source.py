@@ -14,6 +14,7 @@ from zoneinfo import ZoneInfo
 
 from app.cleaners.html_cleaner import clean_html_to_text, extract_attachment_links
 from app.browser.pdf_detail import fetch_public_pdf_detail
+from app.core.config import get_settings
 from app.sources.base import (
     DetailResult,
     HealthResult,
@@ -334,12 +335,19 @@ class CebpubSource(TenderSourceAdapter):
         # 真实平台 ID 为 32 位十六进制字符。此路径等待 PDF.js 文本层，
         # 避免把入口页、广告或同类项目内容当作公告正文。
         if re.fullmatch(r"[0-9a-fA-F]{32}", business_id):
+            settings = get_settings()
+            managed = settings.cebpub_browser_mode == "managed"
             pdf_detail = await fetch_public_pdf_detail(
                 detail_url=detail_url,
                 expected_id=business_id,
                 expected_title=item.title,
-                timeout_ms=300_000 if interactive else 25_000,
+                timeout_ms=(
+                    300_000
+                    if interactive
+                    else settings.cebpub_browser_timeout_seconds * 1_000
+                ),
                 headless=not interactive,
+                managed=managed,
             )
             pdf_metadata = {
                 "detail_status": pdf_detail.status,
@@ -347,12 +355,20 @@ class CebpubSource(TenderSourceAdapter):
                 "pdf_url": pdf_detail.pdf_url,
                 "business_id": business_id,
                 "tender_project_code": raw.get("tenderProjectCode") or None,
-                "verified_by": "uuid+page_title+pdf_title",
+                "verified_by": "official_origin+uuid+page_title+pdf_project_title_core+complete_pages",
                 "content_format": pdf_detail.content_format,
                 "content_pages": pdf_detail.pages,
                 "message": pdf_detail.message,
                 "failure_reason": pdf_detail.failure_reason,
-                "acquisition_mode": "interactive" if interactive else "headless",
+                "acquisition_mode": pdf_detail.acquisition_mode
+                or (
+                    "managed_chrome"
+                    if managed
+                    else ("interactive" if interactive else "headless")
+                ),
+                "browser_reused": pdf_detail.browser_reused,
+                "browser_state": pdf_detail.browser_state,
+                "interaction_requested": interactive,
             }
             if pdf_detail.status == "full":
                 raw_json = json.dumps(
@@ -379,26 +395,28 @@ class CebpubSource(TenderSourceAdapter):
                         "content_pages": pdf_detail.pages,
                     },
                 )
-            if pdf_detail.status in {"needs_human_verification", "failed"}:
-                return DetailResult(
-                    title=item.title,
-                    source_url=detail_url,
-                    publish_time=item.publish_time,
-                    region=item.region,
-                    raw_content=clean,
-                    clean_content=clean,
-                    attachment_links=[],
-                    detail_fetched=False,
-                    detail_status=pdf_detail.status,
-                    detail_url=detail_url,
-                    content_format=pdf_detail.content_format,
-                    source_metadata=pdf_metadata,
-                    raw={
-                        **raw,
-                        "detail_fetched": False,
-                        "detail_status": pdf_detail.status,
-                    },
-                )
+            # 32 位 UUID 的现行详情只信任专用浏览器中已校验的 PDF。
+            # 即使本次仅得到 metadata_only，也必须保留浏览器的真实失败原因，
+            # 不能再被旧详情接口的空响应覆盖。
+            return DetailResult(
+                title=item.title,
+                source_url=detail_url,
+                publish_time=item.publish_time,
+                region=item.region,
+                raw_content=clean,
+                clean_content=clean,
+                attachment_links=[],
+                detail_fetched=False,
+                detail_status=pdf_detail.status,
+                detail_url=detail_url,
+                content_format=pdf_detail.content_format,
+                source_metadata=pdf_metadata,
+                raw={
+                    **raw,
+                    "detail_fetched": False,
+                    "detail_status": pdf_detail.status,
+                },
+            )
         detail_form = {
             "schemaVersion": raw.get("schemaVersion") or "V60.02",
             "businessKeyWord": "tenderBulletin",

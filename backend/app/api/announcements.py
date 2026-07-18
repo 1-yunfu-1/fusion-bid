@@ -73,7 +73,7 @@ class FieldCorrectionRequest(BaseModel):
 
 class RecrawlRequest(BaseModel):
     interactive_on_verification: bool = Field(
-        default=True,
+        default=False,
         description="手工重采遇到官方验证时是否启动可见浏览器",
     )
 
@@ -634,6 +634,10 @@ async def _recrawl_announcement(
         raise HTTPException(status_code=502, detail=f"重新采集失败: {exc}") from exc
 
     previous_full = announcement.detail_status == "full"
+    detail_metadata = detail.source_metadata or {}
+    acquisition_mode = str(detail_metadata.get("acquisition_mode") or acquisition_mode)
+    browser_reused = bool(detail_metadata.get("browser_reused", False))
+    browser_state = detail_metadata.get("browser_state")
     if detail.detail_status == "full":
         announcement.source_url = detail.source_url
         announcement.detail_url = detail.detail_url or detail.source_url
@@ -671,6 +675,8 @@ async def _recrawl_announcement(
             "message": (detail.source_metadata or {}).get("message"),
             "failure_reason": (detail.source_metadata or {}).get("failure_reason"),
             "acquisition_mode": acquisition_mode,
+            "browser_reused": browser_reused,
+            "browser_state": browser_state,
         }
         announcement.source_metadata = metadata
         if not previous_full:
@@ -695,6 +701,8 @@ async def _recrawl_announcement(
         "detail_status": detail.detail_status,
         "extraction_version": announcement.extraction_version,
         "acquisition_mode": acquisition_mode,
+        "browser_reused": browser_reused,
+        "browser_state": browser_state,
         "verification_attempted": verification_attempted,
         "failure_reason": (detail.source_metadata or {}).get("failure_reason"),
         "announcement": await _expanded_detail(announcement, db),

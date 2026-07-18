@@ -191,7 +191,9 @@ async def test_recrawl_falls_back_to_interactive_and_extracts_purchaser(
                 raw_content=content,
                 source_metadata={
                     "content_pages": [{"page": 1, "text": content}],
-                    "acquisition_mode": "interactive",
+                    "acquisition_mode": "managed_chrome",
+                    "browser_reused": True,
+                    "browser_state": "ready",
                 },
             )
 
@@ -209,7 +211,9 @@ async def test_recrawl_falls_back_to_interactive_and_extracts_purchaser(
     payload = response.json()
     assert source.calls == [False, True]
     assert payload["ok"] is True
-    assert payload["acquisition_mode"] == "interactive"
+    assert payload["acquisition_mode"] == "managed_chrome"
+    assert payload["browser_reused"] is True
+    assert payload["browser_state"] == "ready"
     assert payload["verification_attempted"] is True
     assert payload["announcement"]["fields"]["purchaser"] == "西安航天动力试验技术研究所"
     assert payload["announcement"]["fields"]["purchaser_source_label"] == "招标人"
@@ -223,6 +227,49 @@ async def test_duplicate_recrawl_returns_409(client, db_engine):
     finally:
         announcements_api._active_recrawls.discard(announcement_id)
     assert response.status_code == 409
+
+
+async def test_default_recrawl_never_opens_interactive_browser(
+    client, db_engine, monkeypatch
+):
+    announcement_id = await _create_pending_announcement(db_engine)
+
+    class FakeSource:
+        enabled = True
+
+        def __init__(self):
+            self.calls = []
+
+        async def fetch_detail(self, item, *, interactive=False):
+            self.calls.append(interactive)
+            return DetailResult(
+                title=item.title,
+                source_url=item.source_url,
+                detail_url=item.source_url,
+                detail_status="needs_human_verification",
+                detail_fetched=False,
+                source_metadata={
+                    "message": "官方页面要求验证",
+                    "failure_reason": "verification_required",
+                    "acquisition_mode": "managed_chrome",
+                    "browser_state": "needs_verification",
+                },
+            )
+
+        async def extract_attachments(self, detail):
+            return []
+
+    source = FakeSource()
+    monkeypatch.setattr(announcements_api, "get_source", lambda _name: source)
+
+    response = await client.post(f"/api/announcements/{announcement_id}/recrawl")
+
+    assert response.status_code == 200, response.text
+    payload = response.json()
+    assert source.calls == [False]
+    assert payload["ok"] is False
+    assert payload["verification_attempted"] is False
+    assert payload["browser_state"] == "needs_verification"
 
 
 async def test_browser_text_layer_capture_extracts_verified_pages(client, db_engine):

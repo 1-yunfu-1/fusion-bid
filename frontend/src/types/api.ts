@@ -10,6 +10,12 @@ export interface HealthResponse {
   database_revision?: string;
   extraction_version?: string;
   capabilities?: string[];
+  public_browser?: {
+    state: "not_started" | "starting" | "ready" | "busy" | "needs_verification" | "unavailable";
+    engine?: string | null;
+    profile_ready: boolean;
+    last_error?: string | null;
+  };
   message: string;
 }
 
