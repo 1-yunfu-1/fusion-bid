@@ -13,6 +13,7 @@ from lxml import etree
 
 from app.reports.fields import (
     attachment_status,
+    build_match_basis,
     build_extraction_data,
     enrich_report_item,
     extract_fields,
@@ -36,6 +37,20 @@ def test_sanitize_filename_strips_illegal_and_traversal():
     assert "/" not in s
     assert "\\" not in s
     assert "服务器" in s or "招标" in s
+
+
+def test_nationwide_match_basis_explains_unrestricted_scope():
+    match = build_match_basis(
+        title="北京市核电设备公开招标公告",
+        clean_content="招标人：测试单位",
+        region_field="北京市",
+        keywords=["核电", "核能"],
+        regions=["全国"],
+        start_date="2025-07-19",
+        end_date="2026-07-19",
+        publish_time="2026-07-18",
+    )
+    assert match["region"] == "查询范围为全国，未限制地区"
 
 
 def test_build_report_filename_unique(tmp_path: Path):

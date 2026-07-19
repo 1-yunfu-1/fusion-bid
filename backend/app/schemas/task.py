@@ -96,6 +96,9 @@ class TaskExecutionResponse(BaseModel):
     source_detail_breakdown: dict[str, dict[str, int]] = Field(default_factory=dict)
     stage_durations_ms: dict[str, int] = Field(default_factory=dict)
     effective_concurrency: dict[str, Any] = Field(default_factory=dict)
+    requested_regions: list[str] = Field(default_factory=list)
+    effective_regions: list[str] = Field(default_factory=list)
+    region_scope: Literal["nationwide", "restricted"] = "restricted"
     filtered_out_count: int = 0
     duplicate_count: int = 0
     cross_source_merge_count: int = 0
@@ -142,6 +145,9 @@ class TaskExecutionItem(BaseModel):
     source_detail_breakdown: dict[str, dict[str, int]] = Field(default_factory=dict)
     stage_durations_ms: dict[str, int] = Field(default_factory=dict)
     effective_concurrency: dict[str, Any] = Field(default_factory=dict)
+    requested_regions: list[str] = Field(default_factory=list)
+    effective_regions: list[str] = Field(default_factory=list)
+    region_scope: Literal["nationwide", "restricted"] = "restricted"
     report_filename: str | None = None
     report_download_url: str | None = None
     analysis_status: str = "rule_only"

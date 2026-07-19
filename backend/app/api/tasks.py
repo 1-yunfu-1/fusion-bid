@@ -15,6 +15,7 @@ from app.core.config import get_settings
 from app.core.database import get_db
 from app.models.execution import TaskExecution
 from app.models.task import SearchTask
+from app.parsers.regions import resolve_region_selection
 from app.parsers.validator import validate_intent
 from app.schemas.task import (
     TaskExecuteRequest,
@@ -74,6 +75,7 @@ async def update_task(
     now = datetime.now(ZoneInfo(settings.app_timezone))
     intent = body.intent
     issues = validate_intent(intent, reference_time=now, timezone=settings.app_timezone)
+    intent.regions = resolve_region_selection(intent.regions).requested
     errors = [i for i in issues if i.severity == "error"]
     hard = [e for e in errors if e.code in ("expired_schedule", "conflicting_dates")]
     if hard:
@@ -230,6 +232,9 @@ async def execute_task(
             ),
             stage_durations_ms=getattr(stats, "stage_durations_ms", {}),
             effective_concurrency=getattr(stats, "effective_concurrency", {}),
+            requested_regions=getattr(stats, "requested_regions", []),
+            effective_regions=getattr(stats, "effective_regions", []),
+            region_scope=getattr(stats, "region_scope", "restricted"),
             filtered_out_count=stats.filtered_out_count,
             duplicate_count=stats.duplicate_count,
             cross_source_merge_count=stats.cross_source_merge_count,
@@ -397,6 +402,9 @@ async def list_executions(
                 effective_concurrency=dict(
                     diagnostics.get("effective_concurrency") or {}
                 ),
+                requested_regions=list(diagnostics.get("requested_regions") or []),
+                effective_regions=list(diagnostics.get("effective_regions") or []),
+                region_scope=str(diagnostics.get("region_scope") or "restricted"),
                 report_filename=report_filename,
                 report_download_url=report_download_url,
                 analysis_status=(e.analysis_data or {}).get("status", "rule_only"),

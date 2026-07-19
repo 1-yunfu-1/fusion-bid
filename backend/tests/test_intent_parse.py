@@ -9,6 +9,7 @@ import pytest
 from httpx import AsyncClient
 
 from app.parsers.rule_parser import parse_intent_by_rules
+from app.parsers.regions import resolve_region_selection
 from app.parsers.service import parse_user_query
 from app.parsers.validator import validate_intent
 
@@ -16,6 +17,31 @@ TZ = ZoneInfo("Asia/Shanghai")
 # 固定参考时间：2026-07-17 10:30，用于可重复测试
 REF = datetime(2026, 7, 17, 10, 30, tzinfo=TZ)
 REF_MORNING = datetime(2026, 7, 17, 8, 0, tzinfo=TZ)
+
+
+@pytest.mark.asyncio
+async def test_nationwide_nuclear_query_is_normalized_and_keeps_or_keywords():
+    query = "我想知道最近一年的核电或核能相关全国的\n的招标公告"
+    intent = parse_intent_by_rules(query, reference_time=REF)
+
+    assert set(intent.keywords) == {"核电", "核能"}
+    assert intent.regions == ["全国"]
+    assert intent.date_range.start_date == date(2025, 7, 17)
+    assert intent.date_range.end_date == date(2026, 7, 17)
+    assert not any(i.severity == "error" for i in validate_intent(intent, reference_time=REF))
+
+
+def test_nationwide_aliases_and_conflicting_regions():
+    for alias in ("全国", "全国范围", "不限地区", "不限区域", "国内"):
+        selection = resolve_region_selection([alias])
+        assert selection.requested == ["全国"]
+        assert selection.effective == []
+        assert selection.scope == "nationwide"
+
+    mixed = resolve_region_selection(["安徽省", "全国"])
+    assert mixed.requested == ["全国"]
+    assert mixed.effective == []
+    assert mixed.had_conflict is True
 
 
 @pytest.mark.asyncio
@@ -134,6 +160,51 @@ async def test_api_parse_endpoint(client: AsyncClient):
     assert data["parser_used"] == "rule"
     assert "安徽省" in data["intent"]["regions"]
     assert data["intent"]["execute_immediately"] is True
+
+
+@pytest.mark.asyncio
+async def test_api_parse_nationwide_adds_scope_note(client: AsyncClient):
+    resp = await client.post(
+        "/api/parse",
+        json={
+            "query": "我想知道最近一年的核电或核能相关全国的招标公告",
+            "prefer_llm": False,
+            "reference_time": REF.isoformat(),
+        },
+    )
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    assert data["intent"]["regions"] == ["全国"]
+    assert set(data["intent"]["keywords"]) == {"核电", "核能"}
+    assert "已识别为全国范围，不进行地区过滤" in data["warnings"]
+
+
+@pytest.mark.asyncio
+async def test_api_confirm_nationwide_overrides_specific_regions(client: AsyncClient):
+    intent = {
+        "original_query": "最近1个月全国和安徽省服务器招标",
+        "keywords": ["服务器"],
+        "exclude_keywords": [],
+        "regions": ["全国", "安徽省"],
+        "date_range": {
+            "start_date": "2026-06-17",
+            "end_date": "2026-07-17",
+            "original_expression": "最近1个月",
+        },
+        "schedule": {
+            "enabled": False,
+            "schedule_type": None,
+            "execute_date": None,
+            "execute_time": None,
+            "timezone": "Asia/Shanghai",
+        },
+        "execute_immediately": True,
+    }
+    response = await client.post("/api/parse/confirm", json={"intent": intent})
+    assert response.status_code == 200, response.text
+    data = response.json()
+    assert data["intent"]["regions"] == ["全国"]
+    assert any(i["code"] == "nationwide_overrides_regions" for i in data["issues"])
 
 
 @pytest.mark.asyncio

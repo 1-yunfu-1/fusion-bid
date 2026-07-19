@@ -2,6 +2,18 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+from typing import Literal, Sequence
+
+NATIONWIDE_REGION = "全国"
+_NATIONWIDE_ALIASES = (
+    "全国范围",
+    "不限地区",
+    "不限区域",
+    "国内",
+    NATIONWIDE_REGION,
+)
+
 # 标准名称 -> 别名列表（含简称、口语）
 _REGION_ALIASES: dict[str, list[str]] = {
     "北京市": ["北京", "北京市", "京"],
@@ -73,8 +85,57 @@ def _build_lookup() -> list[tuple[str, str]]:
 _LOOKUP = _build_lookup()
 
 
+@dataclass(frozen=True)
+class RegionSelection:
+    """用户展示范围与数据源实际过滤范围。"""
+
+    requested: list[str]
+    effective: list[str]
+    scope: Literal["nationwide", "restricted"]
+    had_conflict: bool = False
+
+
+def _canonical_region(value: str) -> str:
+    normalized = value.strip()
+    if not normalized:
+        return ""
+    if normalized in _NATIONWIDE_ALIASES:
+        return NATIONWIDE_REGION
+    for alias, canonical in _LOOKUP:
+        if normalized == alias:
+            return canonical
+    return normalized
+
+
+def resolve_region_selection(regions: Sequence[str] | None) -> RegionSelection:
+    """规范化地区，并将“全国”转换为无地区过滤的执行语义。"""
+
+    canonical: list[str] = []
+    for value in regions or []:
+        region = _canonical_region(str(value))
+        if region and region not in canonical:
+            canonical.append(region)
+
+    nationwide = NATIONWIDE_REGION in canonical
+    restricted = [region for region in canonical if region != NATIONWIDE_REGION]
+    if nationwide:
+        return RegionSelection(
+            requested=[NATIONWIDE_REGION],
+            effective=[],
+            scope="nationwide",
+            had_conflict=bool(restricted),
+        )
+    return RegionSelection(
+        requested=restricted,
+        effective=restricted,
+        scope="restricted",
+    )
+
+
 def extract_regions(text: str) -> list[str]:
     """从文本中提取标准化区域列表."""
+    if any(alias in text for alias in _NATIONWIDE_ALIASES):
+        return [NATIONWIDE_REGION]
     found: list[str] = []
     remaining = text
     for alias, canonical in _LOOKUP:
@@ -89,6 +150,9 @@ def extract_regions(text: str) -> list[str]:
 def strip_regions(text: str) -> str:
     """从文本中移除已识别区域词，便于关键词抽取."""
     result = text
+    for alias in _NATIONWIDE_ALIASES:
+        if alias in result:
+            result = result.replace(alias, " ")
     for alias, _ in _LOOKUP:
         if alias in result:
             result = result.replace(alias, " ")

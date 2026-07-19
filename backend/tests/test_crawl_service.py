@@ -82,6 +82,47 @@ class MockMirrorSource(MockPublicSource):
         ]
 
 
+class NationwideSource(MockPublicSource):
+    source_name = "mock_nationwide"
+
+    def __init__(self, state: dict) -> None:
+        self.state = state
+
+    async def search(self, query: SearchQuery) -> list[ListItem]:
+        self.state["query_regions"] = list(query.regions)
+        return [
+            ListItem(
+                title=f"{region}{keyword}设备{index}公开招标公告",
+                source_url=f"https://example.com/nationwide/{index}",
+                source_item_id=f"nationwide-{index}",
+                publish_time=datetime(2026, 7, 1 + index, tzinfo=TZ),
+                region=region,
+                snippet=f"{region} {keyword} 设备招标",
+            )
+            for index, (region, keyword) in enumerate(
+                (("北京市", "核电"), ("安徽省", "核能"), ("广东省", "核电")),
+                start=1,
+            )
+        ]
+
+    async def fetch_detail(
+        self, item: ListItem, *, interactive: bool = False
+    ) -> DetailResult:
+        return DetailResult(
+            title=item.title,
+            source_url=item.source_url,
+            publish_time=item.publish_time,
+            region=item.region,
+            clean_content=(
+                f"招标人：{item.region}测试单位\n"
+                f"项目编号：NUCLEAR-{item.source_item_id}\n"
+                f"{item.region} {item.title}"
+            ),
+            detail_fetched=True,
+            detail_status="full",
+        )
+
+
 class ParallelCebpubSource(TenderSourceAdapter):
     source_name = "cebpub"
     requires_login = False
@@ -185,6 +226,63 @@ async def test_execute_search_task_saves_announcements(monkeypatch):
         assert execution.status in ("success", "partial")
         assert stats.saved_count >= 1
         assert "mock_public" in stats.sources_succeeded
+
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_legacy_nationwide_task_uses_unrestricted_source_and_detail_filters(
+    monkeypatch, tmp_path
+):
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    factory = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+    state: dict = {}
+    monkeypatch.setattr(
+        crawl_service,
+        "build_sources",
+        lambda only_enabled=True: [NationwideSource(state)],
+    )
+
+    def fake_report(*args, **kwargs):
+        path = tmp_path / "nationwide.docx"
+        path.write_bytes(b"docx")
+        return path
+
+    monkeypatch.setattr(crawl_service, "generate_report_file", fake_report)
+
+    async with factory() as db:
+        task = SearchTask(
+            original_query="最近一年全国核电或核能招标",
+            keywords=["核电", "核能"],
+            regions=["全国"],
+            start_date=date(2025, 7, 19),
+            end_date=date(2026, 7, 19),
+            execute_immediately=True,
+            schedule_enabled=False,
+            status="confirmed",
+        )
+        db.add(task)
+        await db.commit()
+        await db.refresh(task)
+
+        execution, stats = await crawl_service.execute_search_task(
+            db,
+            task,
+            max_details_per_source=8,
+            report_mode="full_snapshot",
+        )
+
+        assert execution.status == "success"
+        assert state["query_regions"] == []
+        assert stats.detail_success_count == 3
+        assert stats.detail_filtered_out == 0
+        assert stats.candidates_count == 3
+        assert stats.region_scope == "nationwide"
+        assert stats.requested_regions == ["全国"]
+        assert stats.effective_regions == []
+        assert execution.crawl_diagnostics["region_scope"] == "nationwide"
 
     await engine.dispose()
 

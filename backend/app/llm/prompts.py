@@ -11,7 +11,7 @@ INTENT_SYSTEM_PROMPT = """你是招投标信息检索助手的意图解析模块
 - original_query: 用户原句
 - keywords: 主题关键词数组，如服务器、充电桩、充电设施建设
 - exclude_keywords: 排除词数组，没有则 []
-- regions: 标准化行政区，如 安徽省、上海市、北京市（尽量补全省/市后缀）
+- regions: 标准化行政区，如 安徽省、上海市、北京市（尽量补全省/市后缀）；全国、不限地区或国内范围统一输出 ["全国"]
 - date_range.start_date / end_date: YYYY-MM-DD；无法确定则 null
 - date_range.original_expression: 用户原文中的时间表达
 - schedule.enabled: 是否定时
@@ -23,6 +23,7 @@ INTENT_SYSTEM_PROMPT = """你是招投标信息检索助手的意图解析模块
 
 规则：
 1. 未提及区域则 regions=[]，不得猜测。
+1.1 同时出现全国范围和具体省市时，regions=["全国"]，全国表示不限制地区。
 2. 未提及主题则 keywords=[]，不得猜测。
 3. 相对时间如「最近1个月」须结合 reference_time 换算为明确起止日期。
 4. 「2026年3月份」→ 2026-03-01 至 2026-03-31。

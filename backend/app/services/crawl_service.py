@@ -28,6 +28,7 @@ from app.models.company import CompanyProfile
 from app.models.company import AnnouncementFieldCorrection
 from app.models.execution import TaskExecution
 from app.models.task import SearchTask
+from app.parsers.regions import resolve_region_selection
 from app.reports.analysis import build_execution_analysis
 from app.reports.fields import (
     apply_manual_corrections,
@@ -89,6 +90,9 @@ class CrawlStats:
     source_detail_breakdown: dict[str, dict[str, int]] = field(default_factory=dict)
     stage_durations_ms: dict[str, int] = field(default_factory=dict)
     effective_concurrency: dict[str, object] = field(default_factory=dict)
+    requested_regions: list[str] = field(default_factory=list)
+    effective_regions: list[str] = field(default_factory=list)
+    region_scope: str = "restricted"
 
 
 @dataclass
@@ -700,13 +704,23 @@ async def execute_search_task(
     await db.refresh(execution)
 
     keywords = list(task.keywords or [])
-    regions = list(task.regions or [])
+    region_selection = resolve_region_selection(task.regions)
+    regions = region_selection.requested
+    effective_regions = region_selection.effective
+    stats.requested_regions = list(regions)
+    stats.effective_regions = list(effective_regions)
+    stats.region_scope = region_selection.scope
     start: date | None = task.start_date
     end: date | None = task.end_date
-    ctx = FilterContext(keywords=keywords, regions=regions, start_date=start, end_date=end)
+    ctx = FilterContext(
+        keywords=keywords,
+        regions=effective_regions,
+        start_date=start,
+        end_date=end,
+    )
     query = SearchQuery(
         keywords=keywords,
-        regions=regions,
+        regions=effective_regions,
         start_date=start.isoformat() if start else None,
         end_date=end.isoformat() if end else None,
     )
@@ -1419,6 +1433,9 @@ async def execute_search_task(
         "source_detail_breakdown": dict(stats.source_detail_breakdown),
         "stage_durations_ms": dict(stats.stage_durations_ms),
         "effective_concurrency": dict(stats.effective_concurrency),
+        "requested_regions": list(stats.requested_regions),
+        "effective_regions": list(stats.effective_regions),
+        "region_scope": stats.region_scope,
     }
     await db.commit()
     await db.refresh(execution)

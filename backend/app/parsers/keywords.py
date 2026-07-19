@@ -9,6 +9,7 @@ from app.parsers.regions import strip_regions
 # 噪声词与句式填充
 _STOP_PHRASES = [
     "最近",
+    "我想知道",
     "帮我",
     "看看",
     "请",
@@ -32,6 +33,7 @@ _STOP_PHRASES = [
     "内的",
     "的",
     "和",
+    "或",
     "与",
     "在",
     "到",
@@ -65,6 +67,8 @@ _NOISE_RE = re.compile(
 
 # 显式模式：…的XX招标 / 和XX有关 / 关于XX
 _EXPLICIT_PATTERNS = [
+    # 核电或核能相关 / 服务器、存储相关
+    re.compile(r"([\u4e00-\u9fffA-Za-z0-9、或]{2,40}?)\s*(?:有关|相关|方面)"),
     # 和充电设施建设有关 / 与XX相关
     re.compile(r"(?:和|与|关于)\s*([\u4e00-\u9fffA-Za-z0-9]{2,24}?)\s*(?:有关|相关|方面)"),
     re.compile(r"关于\s*([\u4e00-\u9fffA-Za-z0-9]{2,24})"),
@@ -123,9 +127,11 @@ def extract_keywords(text: str) -> list[str]:
     for src in corpus:
         for pattern in _EXPLICIT_PATTERNS:
             for m in pattern.finditer(src):
-                cand = _clean_candidate(m.group(1))
-                if _accept_keyword(cand) and cand not in keywords:
-                    keywords.append(cand)
+                cand = _clean_candidate(strip_regions(m.group(1)))
+                for part in re.split(r"(?:或者|或|、)", cand):
+                    part = _clean_candidate(part)
+                    if _accept_keyword(part) and part not in keywords:
+                        keywords.append(part)
 
     if keywords:
         return _dedupe_prefer_longer(keywords)
@@ -133,7 +139,7 @@ def extract_keywords(text: str) -> list[str]:
     # 2) 去区域、时间、句式后取剩余实质片段
     residual = strip_regions(text)
     residual = re.sub(
-        r"(最近|近|过去)\s*\d+\s*(年|个月|月|周|星期|天|日)",
+        r"(最近|近|过去)\s*(?:\d+|[一二三四五六七八九十两]+)\s*(年|个月|月|周|星期|天|日)",
         " ",
         residual,
     )

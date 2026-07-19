@@ -5,9 +5,9 @@ from __future__ import annotations
 import pytest
 from bs4 import BeautifulSoup
 
-from app.cleaners.filters import FilterContext, filter_list_item
+from app.cleaners.filters import FilterContext, filter_detail, filter_list_item
 from app.cleaners.html_cleaner import clean_html_to_text, extract_attachment_links
-from app.sources.base import ListItem
+from app.sources.base import DetailResult, ListItem, SearchQuery
 from app.sources.ccgp_source import CcgpSource, _parse_publish, _region_from_list_part
 
 
@@ -143,6 +143,42 @@ def test_filter_list_item_keyword_region():
     assert filter_list_item(item, ctx2).accepted is False
 
 
+def test_nationwide_filter_accepts_multiple_regions_and_or_keywords():
+    ctx = FilterContext(
+        keywords=["核电", "核能"],
+        regions=["全国"],
+        start_date=None,
+        end_date=None,
+    )
+    for region, keyword in (("北京市", "核电"), ("安徽省", "核能"), ("广东省", "核电")):
+        item = ListItem(
+            title=f"{region}{keyword}设备公开招标公告",
+            source_url=f"https://example.com/{region}",
+            region=region,
+        )
+        detail = DetailResult(
+            title=item.title,
+            source_url=item.source_url,
+            region=region,
+            clean_content=f"{region} {keyword}设备采购 招标人：测试单位",
+        )
+        assert filter_list_item(item, ctx).accepted is True
+        assert filter_detail(detail, ctx).accepted is True
+
+    restricted = FilterContext(
+        keywords=["核电", "核能"],
+        regions=["安徽省"],
+        start_date=None,
+        end_date=None,
+    )
+    beijing = ListItem(
+        title="北京市核电设备公开招标公告",
+        source_url="https://example.com/beijing",
+        region="北京市",
+    )
+    assert filter_list_item(beijing, restricted).accepted is False
+
+
 @pytest.mark.asyncio
 async def test_ccgp_search_with_mocked_html(monkeypatch):
     source = CcgpSource()
@@ -152,10 +188,23 @@ async def test_ccgp_search_with_mocked_html(monkeypatch):
         return SAMPLE_LIST_HTML
 
     monkeypatch.setattr(source.fetcher, "get_text", fake_get_text)
-    from app.sources.base import SearchQuery
-
     items = await source.search(
         SearchQuery(keywords=["服务器"], regions=["安徽省"], start_date="2026-03-01", end_date="2026-03-31")
     )
     assert len(items) >= 1
     assert any("服务器" in i.title for i in items)
+
+
+@pytest.mark.asyncio
+async def test_ccgp_nationwide_search_omits_display_zone(monkeypatch):
+    source = CcgpSource()
+    source.max_pages = 1
+    captured: dict = {}
+
+    async def fake_get_text(url, params=None):
+        captured.update(params or {})
+        return '<html><div class="vT-srch-result"></div></html>'
+
+    monkeypatch.setattr(source.fetcher, "get_text", fake_get_text)
+    await source.search(SearchQuery(keywords=["核电"], regions=["全国"]))
+    assert captured["displayZone"] == ""

@@ -16,6 +16,7 @@ from zoneinfo import ZoneInfo
 from bs4 import BeautifulSoup
 
 from app.cleaners.html_cleaner import clean_html_to_text, extract_attachment_links
+from app.parsers.regions import resolve_region_selection
 from app.sources.base import (
     DetailResult,
     HealthResult,
@@ -148,8 +149,9 @@ class CcgpSource(TenderSourceAdapter):
             "agentName": "",
         }
         # 区域：放入 displayZone 文本检索辅助
-        if query.regions:
-            params["displayZone"] = query.regions[0].replace("省", "").replace("市", "")
+        effective_regions = resolve_region_selection(query.regions).effective
+        if effective_regions:
+            params["displayZone"] = effective_regions[0].replace("省", "").replace("市", "")
 
         try:
             html = await self.fetcher.get_text(SEARCH_URL, params=params)

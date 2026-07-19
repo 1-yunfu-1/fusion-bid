@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from datetime import date, datetime
 from typing import Sequence
 
+from app.parsers.regions import resolve_region_selection
 from app.sources.base import DetailResult, ListItem
 
 _TENDER_HINTS = ("招标", "采购", "投标", "中标", "询价", "磋商", "谈判", "比选", "邀标", "竞价")
@@ -40,11 +41,12 @@ def _in_date_range(pub: datetime | None, start: date | None, end: date | None) -
 
 
 def _region_match(text: str, regions: Sequence[str]) -> bool:
-    if not regions:
+    effective_regions = resolve_region_selection(regions).effective
+    if not effective_regions:
         return True
     if not text:
         return True  # 未知区域：二次在详情再严格
-    for r in regions:
+    for r in effective_regions:
         short = r.replace("省", "").replace("市", "").replace("自治区", "").replace("特别行政区", "")
         if r in text or (short and short in text):
             return True

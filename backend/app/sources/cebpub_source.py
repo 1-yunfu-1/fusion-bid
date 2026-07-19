@@ -15,6 +15,7 @@ from zoneinfo import ZoneInfo
 from app.cleaners.html_cleaner import clean_html_to_text, extract_attachment_links
 from app.browser.pdf_detail import fetch_public_pdf_detail
 from app.core.config import get_settings
+from app.parsers.regions import resolve_region_selection
 from app.sources.base import (
     DetailResult,
     HealthResult,
@@ -249,9 +250,10 @@ class CebpubSource(TenderSourceAdapter):
 
     async def search(self, query: SearchQuery) -> list[ListItem]:
         keywords = query.keywords or [""]
+        effective_regions = resolve_region_selection(query.regions).effective
         area = ""
-        if query.regions:
-            area = query.regions[0].replace("省", "").replace("市", "")
+        if effective_regions:
+            area = effective_regions[0].replace("省", "").replace("市", "")
         items: list[ListItem] = []
         seen: set[str] = set()
         for kw in keywords[:3]:

@@ -308,7 +308,7 @@ export default function NewTaskPage() {
                 </Col>
                 <Col xs={24} md={12}>
                   <Form.Item name="regions" label="区域" rules={[{ required: true, type: "array", min: 1 }]}>
-                    <Select mode="tags" placeholder="如 安徽省、上海市" tokenSeparators={[",", "，"]} />
+                    <Select mode="tags" placeholder="如 全国、安徽省、上海市" tokenSeparators={[",", "，"]} />
                   </Form.Item>
                 </Col>
               </Row>

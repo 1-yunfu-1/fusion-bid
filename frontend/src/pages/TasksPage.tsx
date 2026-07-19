@@ -506,7 +506,7 @@ export default function TasksPage() {
                 label="区域"
                 rules={[{ required: true, type: "array", min: 1, message: "至少 1 个区域" }]}
               >
-                <Select mode="tags" placeholder="如 北京市、安徽省" tokenSeparators={[",", "，"]} />
+                <Select mode="tags" placeholder="如 全国、北京市、安徽省" tokenSeparators={[",", "，"]} />
               </Form.Item>
             </Col>
           </Row>

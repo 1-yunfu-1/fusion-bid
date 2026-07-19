@@ -6,6 +6,8 @@ import re
 from datetime import date, datetime
 from typing import Any, Sequence
 
+from app.parsers.regions import resolve_region_selection
+
 # 数据源正式中文名
 SOURCE_DISPLAY_NAMES: dict[str, str] = {
     "ccgp": "中国政府采购网",
@@ -1909,12 +1911,16 @@ def build_match_basis(
         kw_reason = "正文/标题未直接命中查询关键词（可能由列表摘要阶段入选）"
 
     # 区域
-    if not regions:
+    region_selection = resolve_region_selection(regions)
+    effective_regions = region_selection.effective
+    if region_selection.scope == "nationwide":
+        region_reason = "查询范围为全国，未限制地区"
+    elif not effective_regions:
         region_reason = "查询未指定区域"
     else:
         hits: list[str] = []
         foreign: list[str] = []
-        for r in regions:
+        for r in effective_regions:
             short = (
                 r.replace("省", "")
                 .replace("市", "")
@@ -1938,7 +1944,7 @@ def build_match_basis(
             "内蒙古", "广西", "西藏", "宁夏", "新疆", "香港", "澳门",
         )
         query_tokens = set()
-        for r in regions:
+        for r in effective_regions:
             query_tokens.add(r)
             query_tokens.add(
                 r.replace("省", "").replace("市", "").replace("自治区", "")

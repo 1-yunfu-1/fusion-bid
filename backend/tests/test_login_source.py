@@ -48,6 +48,30 @@ async def test_login_source_search_without_state(tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_login_source_nationwide_search_omits_region(tmp_path, monkeypatch):
+    from app.sources import login_portal_source as module
+
+    src = LoginPortalSource()
+    src.enabled = True
+    src.state_path = tmp_path / "state.json"
+    src.state_path.write_text("{}", encoding="utf-8")
+    src.search_url_template = "https://example.com/search?q={keyword}&region={region}"
+    captured: list[str] = []
+
+    async def fake_fetch(url, *, state_path):
+        captured.append(url)
+        return "<html>招标公告列表</html>"
+
+    monkeypatch.setattr(module, "fetch_page_with_state", fake_fetch)
+    monkeypatch.setattr(src, "_parse_list", lambda *args, **kwargs: [])
+    await src.search(SearchQuery(keywords=["核电"], regions=["全国"]))
+
+    assert captured
+    assert "region=" in captured[0]
+    assert "%E5%85%A8%E5%9B%BD" not in captured[0]
+
+
+@pytest.mark.asyncio
 async def test_login_source_disables_cross_site_configuration(monkeypatch):
     from app.core.config import get_settings
 

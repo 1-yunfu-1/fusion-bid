@@ -19,6 +19,21 @@ class FakeResp:
 
 
 @pytest.mark.asyncio
+async def test_cebpub_nationwide_search_uses_empty_area(monkeypatch):
+    source = CebpubSource()
+    source.max_pages = 1
+    captured: list[str] = []
+
+    async def fake_page(keyword, query, page_no, area):
+        captured.append(area)
+        return []
+
+    monkeypatch.setattr(source, "_fetch_page", fake_page)
+    await source.search(SearchQuery(keywords=["核电"], regions=["全国"]))
+    assert captured == [""]
+
+
+@pytest.mark.asyncio
 async def test_cebpub_search_mock(monkeypatch):
     source = CebpubSource()
     source.max_pages = 1

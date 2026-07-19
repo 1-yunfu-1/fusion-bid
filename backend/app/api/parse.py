@@ -11,6 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.config import get_settings
 from app.core.database import get_db
 from app.models.task import SearchTask
+from app.parsers.regions import resolve_region_selection
 from app.parsers.service import parse_user_query
 from app.parsers.validator import validate_intent
 from app.schemas.intent import ConfirmParseRequest, ConfirmParseResponse, ParseRequest, ParseResponse
@@ -52,6 +53,7 @@ async def confirm_parse(
     intent = body.intent
     intent.original_query = intent.original_query.strip()
     issues = validate_intent(intent, reference_time=now, timezone=settings.app_timezone)
+    intent.regions = resolve_region_selection(intent.regions).requested
     errors = [i for i in issues if i.severity == "error"]
     # 过期定时、冲突日期：禁止确认（含 force），不得静默创建过期任务
     hard = [e for e in errors if e.code in ("expired_schedule", "conflicting_dates")]

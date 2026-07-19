@@ -51,6 +51,9 @@ export interface TaskExecutionResponse {
   source_detail_breakdown: Record<string, Record<string, number>>;
   stage_durations_ms: Record<string, number>;
   effective_concurrency: Record<string, unknown>;
+  requested_regions: string[];
+  effective_regions: string[];
+  region_scope: "nationwide" | "restricted";
   filtered_out_count: number;
   duplicate_count: number;
   cross_source_merge_count: number;
@@ -108,6 +111,9 @@ export interface TaskExecutionItem {
   source_detail_breakdown: Record<string, Record<string, number>>;
   stage_durations_ms: Record<string, number>;
   effective_concurrency: Record<string, unknown>;
+  requested_regions: string[];
+  effective_regions: string[];
+  region_scope: "nationwide" | "restricted";
   report_filename?: string | null;
   report_download_url?: string | null;
   analysis_status: string;
