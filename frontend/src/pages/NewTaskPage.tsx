@@ -487,6 +487,7 @@ export default function NewTaskPage() {
                     <Col xs={12} md={6}><Statistic title="仅元数据" value={executionResult.detail_metadata_only_count} /></Col>
                     <Col xs={12} md={6}><Statistic title="真实采集失败" value={executionResult.detail_failed_count} /></Col>
                     <Col xs={12} md={6}><Statistic title="站点阻断未尝试" value={executionResult.detail_not_attempted_count} /></Col>
+                    <Col xs={12} md={6}><Statistic title="复用历史完整正文" value={executionResult.cached_full_reused_count || 0} /></Col>
                   </Row>
                   <Descriptions size="small" column={{ xs: 1, md: 2 }} bordered>
                     <Descriptions.Item label="任务状态">
@@ -516,10 +517,30 @@ export default function NewTaskPage() {
                           pdf_incomplete: "PDF 不完整",
                           identity_conflict: "身份冲突",
                           extraction_failure: "抽取失败（已规则降级）",
+                          html_parse_failure: "HTML 解析失败",
+                          html_content_empty: "详情正文为空",
+                          http_detail_failure: "HTTP 详情失败",
+                          outer_detail_unavailable: "公告外层页暂不可用",
+                          official_content_unavailable: "官方正文暂停访问",
                           metadata_only_other: "其他仅元数据",
                         };
                         return <Tag key={reason}>{labels[reason] || reason} {count}</Tag>;
                       })}
+                    />
+                  )}
+                  {Object.keys(executionResult.failure_breakdown_by_source || {}).length > 0 && (
+                    <Alert
+                      type="info"
+                      showIcon
+                      message="按数据源定位失败"
+                      description={Object.entries(executionResult.failure_breakdown_by_source).map(([source, failures]) => (
+                        <div key={source}>
+                          <Typography.Text strong>{source}：</Typography.Text>
+                          {Object.entries(failures).map(([reason, count]) => (
+                            <Tag key={`${source}-${reason}`}>{reason} {count}</Tag>
+                          ))}
+                        </div>
+                      ))}
                     />
                   )}
                   {executionResult.analysis_preview?.portfolio_summary && (

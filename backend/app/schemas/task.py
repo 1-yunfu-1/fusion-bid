@@ -90,7 +90,10 @@ class TaskExecutionResponse(BaseModel):
     detail_failed_count: int = 0
     detail_human_verification_count: int = 0
     detail_not_attempted_count: int = 0
+    cached_full_reused_count: int = 0
     failure_breakdown: dict[str, int] = Field(default_factory=dict)
+    failure_breakdown_by_source: dict[str, dict[str, int]] = Field(default_factory=dict)
+    source_detail_breakdown: dict[str, dict[str, int]] = Field(default_factory=dict)
     stage_durations_ms: dict[str, int] = Field(default_factory=dict)
     effective_concurrency: dict[str, Any] = Field(default_factory=dict)
     filtered_out_count: int = 0
@@ -133,7 +136,10 @@ class TaskExecutionItem(BaseModel):
     detail_failed_count: int = 0
     detail_human_verification_count: int = 0
     detail_not_attempted_count: int = 0
+    cached_full_reused_count: int = 0
     failure_breakdown: dict[str, int] = Field(default_factory=dict)
+    failure_breakdown_by_source: dict[str, dict[str, int]] = Field(default_factory=dict)
+    source_detail_breakdown: dict[str, dict[str, int]] = Field(default_factory=dict)
     stage_durations_ms: dict[str, int] = Field(default_factory=dict)
     effective_concurrency: dict[str, Any] = Field(default_factory=dict)
     report_filename: str | None = None

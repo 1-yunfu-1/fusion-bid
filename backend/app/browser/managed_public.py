@@ -163,6 +163,19 @@ class ManagedPublicBrowser:
             )
         except OSError:
             profile_ready = False
+        try:
+            from app.browser.pdf_detail import pdf_pipeline_status
+
+            pdf_pipeline = pdf_pipeline_status()
+        except Exception:  # noqa: BLE001
+            pdf_pipeline = {
+                "memory_pdf_bytes": True,
+                "text_parser": False,
+                "rasterizer": False,
+                "ocr_engine": False,
+                "text_ready": False,
+                "scanned_pdf_ready": False,
+            }
         return {
             "state": state,
             "engine": self._engine,
@@ -172,6 +185,7 @@ class ManagedPublicBrowser:
             "active_workers": self._active_auto + int(self._interactive_active),
             "queue_size": self._queued_leases,
             "adaptive_mode": self._adaptive_mode,
+            "pdf_pipeline": pdf_pipeline,
         }
 
     async def _cdp_ready(self, port: int, timeout_seconds: float = 20) -> bool:

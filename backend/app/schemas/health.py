@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+from typing import Any
 
 from pydantic import BaseModel, Field
 
@@ -16,6 +17,7 @@ class PublicBrowserStatus(BaseModel):
     active_workers: int = 0
     queue_size: int = 0
     adaptive_mode: bool = False
+    pdf_pipeline: dict[str, Any] = Field(default_factory=dict)
 
 
 class HealthResponse(BaseModel):

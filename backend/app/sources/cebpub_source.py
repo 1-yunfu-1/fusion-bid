@@ -380,6 +380,8 @@ class CebpubSource(TenderSourceAdapter):
                 "duration_ms": pdf_detail.duration_ms,
                 "validation_signals": pdf_detail.validation_signals,
                 "site_blocked": pdf_detail.site_blocked,
+                "acquisition_path": pdf_detail.acquisition_path,
+                "document_page_count": pdf_detail.document_page_count,
             }
             if pdf_detail.status == "full":
                 raw_json = json.dumps(

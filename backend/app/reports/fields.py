@@ -28,7 +28,8 @@ _FIELD_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
         r"([^\n。；;]{2,80})"
     )),
     ("agency", re.compile(
-        r"(?:招标代理机构|采购代理机构|委托代理机构|代理机构)"
+        r"(?:招标代理机构名称|采购代理机构名称|代理机构名称|招标代理机构|"
+        r"采购代理机构|委托代理机构|代理机构|招标机构)"
         r"[：:\s]*([^\n。；;]{2,80})"
     )),
     ("project_code", re.compile(
@@ -46,7 +47,7 @@ _FIELD_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
         r"[：:\s]*([^\n。；;]{4,40})"
     )),
     ("region_line", re.compile(
-        r"(?:项目所在地|交货地点|建设地点|采购地点|项目地点|行政区划|"
+        r"(?:项目所在地|交货地点|建设地点|采购地点|项目地点|行政区域|行政区划|"
         r"区域|所属地区|项目区域)"
         r"[：:\s]*([^\n。；;]{2,40})"
     )),
@@ -60,7 +61,8 @@ _FIELD_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
     )),
     ("qualification", re.compile(
         r"(?:投标人的资格要求|投标人资格要求|投标人资格能力要求|投标人资格|"
-        r"供应商资格要求|供应商资格条件|供应商资格|资格要求|申请人资格条件|申请人资格要求|资格条件)"
+        r"供应商资格要求|供应商资格条件|供应商资格|资格要求|申请人资格条件|"
+        r"申请人的资格要求|申请人资格要求|资格条件)"
         r"[：:\s]*([^\n]{4,300})"
     )),
 ]
@@ -87,6 +89,7 @@ _QUALIFICATION_LABELS = (
     "供应商资格",
     "资格要求",
     "申请人资格条件",
+    "申请人的资格要求",
     "申请人资格要求",
     "资格条件",
 )
@@ -95,7 +98,7 @@ _SECTION_STOP_RE = re.compile(
     r"^\s*(?:项目名称|项目编号|招标人(?:名称)?|采购人(?:名称)?|"
     r"招标代理(?:机构)?|采购代理(?:机构)?|预算(?:金额)?|最高限价|"
     r"投标截止|开标时间|公告(?:发布)?时间|联系方式|获取招标文件|"
-    r"递交投标文件|公告正文|一、|二、|三、|四、)"
+    r"递交投标文件|公告正文|[一二三四五六七八九十百]+[、．.])"
 )
 
 
@@ -177,10 +180,45 @@ _ENTITY_LABELS = {
     "建设单位",
     "招标单位",
     "招标代理机构",
+    "招标代理机构名称",
     "采购代理机构",
+    "采购代理机构名称",
     "委托代理机构",
     "代理机构",
+    "代理机构名称",
+    "招标机构",
 }
+_ENTITY_PLACEHOLDER_VALUES = {
+    "信息",
+    "名称",
+    "地址",
+    "联系方式",
+    "联系人",
+    "电话",
+    "/",
+    "-",
+    "—",
+    "无",
+    "未提供",
+    "详见公告正文",
+}
+
+
+def _is_entity_placeholder(value: str) -> bool:
+    return re.sub(r"\s+", "", value or "") in _ENTITY_PLACEHOLDER_VALUES
+
+
+def _usable_region(value: str | None) -> str:
+    """Reject list-page labels that were previously mistaken for a region."""
+    cleaned = _clean_capture(value or "")
+    if not cleaned:
+        return ""
+    if re.match(
+        r"^(?:采购人|采购单位|招标人|代理机构|采购代理机构|招标代理机构)\s*[：:]",
+        cleaned,
+    ):
+        return ""
+    return cleaned
 
 
 def _clean_entity_capture(text: str) -> str:
@@ -190,6 +228,11 @@ def _clean_entity_capture(text: str) -> str:
         r"(?=[0-9A-Za-z\u4e00-\u9fff（(])",
         "",
         text or "",
+    )
+    value = re.sub(
+        r"[（(]\s*(?:以下)?简称[^）)]*[）)]\s*$",
+        "",
+        value,
     )
     return _clean_capture(value)
 
@@ -378,7 +421,7 @@ def _normalise_datetime_text(value: str) -> str:
     text = re.sub(r"\s+", "", value or "")
     match = re.search(
         r"(20\d{2})[年\-/](\d{1,2})[月\-/](\d{1,2})日?"
-        r"(?:[T\s]*(\d{1,2})[时:](\d{1,2})(?:分)?)?",
+        r"(?:[T\s]*(\d{1,2})[时点:](\d{1,2})(?:分)?)?",
         text,
     )
     if not match:
@@ -396,23 +439,28 @@ def _extract_semantic_value(
     # For example an announcement may mention 项目业主 before 招标人; the
     # normalized procurement subject must still preserve source_label=招标人.
     for label in labels:
-        match = re.search(
+        matches = re.finditer(
             rf"(?P<label>{re.escape(label)})[ \t]*(?:[：:][ \t]*|为[ \t]*|"
             rf"是[ \t]*|[ \t]*\n[ \t]*|[ \t]+)"
             rf"(?P<value>[^\n，,。；;]{{1,{limit}}})",
             text or "",
         )
-        if match:
+        for match in matches:
             raw_value = match.group("value")
             evidence_end = match.end()
             if label in _ENTITY_LABELS:
                 raw_value, evidence_end = _extend_wrapped_entity(
                     text or "", end=match.end(), value=raw_value
                 )
-            return (
+            cleaned_value = (
                 _clean_entity_capture(raw_value)
                 if label in _ENTITY_LABELS
-                else _clean_capture(raw_value),
+                else _clean_capture(raw_value)
+            )
+            if label in _ENTITY_LABELS and _is_entity_placeholder(cleaned_value):
+                continue
+            return (
+                cleaned_value,
                 match.group("label"),
                 _clean_entity_capture((text or "")[match.start() : evidence_end])
                 if label in _ENTITY_LABELS
@@ -427,8 +475,13 @@ def _extract_semantic_value(
             text or "",
         )
         if concatenated:
+            concatenated_value = _clean_capture(concatenated.group("value"))
+            if label in _ENTITY_LABELS and _is_entity_placeholder(
+                concatenated_value
+            ):
+                continue
             return (
-                _clean_capture(concatenated.group("value")),
+                concatenated_value,
                 concatenated.group("label"),
                 _clean_capture(concatenated.group(0)),
             )
@@ -441,30 +494,42 @@ def _extract_date_around_field_label(
     """读取字段标签同一行或相邻行的日期，兼容 PDF 表格“值在标签上方”。"""
     options = "|".join(re.escape(label) for label in sorted(labels, key=len, reverse=True))
     label_pattern = re.compile(
-        rf"^\s*(?:\d+(?:\.\d+)*\s*)?(?P<label>{options})"
+        rf"^\s*(?:(?:\d+(?:\.\d+)*\s*[.、．]?)|"
+        rf"(?:[一二三四五六七八九十百]+[.、．])|"
+        rf"(?:[（(][一二三四五六七八九十百0-9]+[）)]))?\s*"
+        rf"(?P<label>{options})"
         r"(?:\s*[（(][^）)\n]{0,30}[）)])?\s*"
         r"(?:为|是|定于|[：:])?\s*(?P<tail>.*)$"
     )
     date_pattern = re.compile(
-        r"(?P<value>20\d{2}\s*[年\-/]\s*\d{1,2}\s*[月\-/]\s*\d{1,2}日?"
-        r"(?:\s*\d{1,2}\s*[时:]\s*\d{1,2}\s*分?)?)"
+        r"(?P<value>20\d{2}\s*[年\-/]\s*\d{1,2}\s*[月\-/]\s*\d{1,2}\s*日?"
+        r"(?:\s*\d{1,2}\s*[时点:]\s*\d{1,2}\s*分?)?)"
     )
     lines = (text or "").splitlines()
     for index, line in enumerate(lines):
         label_match = label_pattern.match(line)
         if not label_match:
             continue
-        candidates = [(label_match.group("tail"), index)]
-        if index > 0:
-            candidates.append((lines[index - 1], index - 1))
+        candidates: list[tuple[str, int, int]] = [
+            (label_match.group("tail"), index, index)
+        ]
+        if index > 0 and date_pattern.fullmatch(
+            lines[index - 1].lstrip("：: ").strip()
+        ):
+            candidates.append((lines[index - 1], index - 1, index - 1))
         if index + 1 < len(lines):
-            candidates.append((lines[index + 1], index + 1))
-        for candidate, candidate_index in candidates:
+            candidates.append((lines[index + 1], index + 1, index + 1))
+        # Government-procurement pages often wrap every date component in a
+        # separate inline element (``2026`` / ``年`` / ``8`` / ``月`` ...).
+        # Scan a small forward window anchored to the explicit field label.
+        forward_end = min(len(lines), index + 16)
+        candidates.append(("\n".join(lines[index:forward_end]), index, forward_end - 1))
+        for candidate, candidate_start, candidate_end in candidates:
             date_match = date_pattern.search(candidate)
             if not date_match:
                 continue
-            start = min(index, candidate_index)
-            end = max(index, candidate_index)
+            start = min(index, candidate_start)
+            end = max(index, candidate_end)
             quote = _clean_capture("\n".join(lines[start : end + 1]))
             return (
                 _normalise_datetime_text(date_match.group("value")),
@@ -750,6 +815,18 @@ def extract_fields(
     blob = "\n".join(
         x for x in [title or "", summary or "", clean_content or ""] if x
     )
+    detail_blob = clean_content or ""
+
+    def semantic_value(labels: Sequence[str]) -> tuple[str, str, str]:
+        value = _extract_semantic_value(detail_blob, labels)
+        if value[0]:
+            return value
+        return _extract_semantic_value(blob, labels)
+
+    def first_match(pattern: re.Pattern[str]) -> re.Match[str] | None:
+        match = pattern.search(detail_blob) if detail_blob else None
+        return match or pattern.search(blob)
+
     out: dict[str, Any] = {
         "purchaser": _MISSING,
         "purchaser_source_label": _MISSING,
@@ -769,7 +846,7 @@ def extract_fields(
         "deadline": _MISSING,
         "bid_deadline": _MISSING,
         "opening_time": _MISSING,
-        "region": (region or "").strip() or _MISSING,
+        "region": _usable_region(region) or _MISSING,
         "content": _MISSING,
         "announcement_type": _MISSING,
         "qualification": _MISSING,
@@ -784,8 +861,12 @@ def extract_fields(
     }
 
     purchaser, purchaser_label, purchaser_evidence = _extract_labeled_line(
-        blob, _PURCHASER_LABELS
+        detail_blob, _PURCHASER_LABELS
     )
+    if not purchaser:
+        purchaser, purchaser_label, purchaser_evidence = _extract_labeled_line(
+            blob, _PURCHASER_LABELS
+        )
     if purchaser:
         out["purchaser"] = purchaser
         out["purchaser_source_label"] = purchaser_label
@@ -796,7 +877,7 @@ def extract_fields(
         }
 
     qualification, qualification_label, qualification_evidence, qualification_items = (
-        _extract_qualification_section(blob)
+        _extract_qualification_section(detail_blob or blob)
     )
     if qualification:
         out["qualification"] = qualification
@@ -808,7 +889,10 @@ def extract_fields(
         }
 
     # 项目名称（正文优先；若与标题高度重合则留给报告层去重）
-    m = re.search(r"(?:项目名称|采购项目)[：:\s]*([^\n]{4,120})", blob)
+    project_name_pattern = re.compile(
+        r"(?:采购项目名称|项目名称)[：:\s]*([^\n]{4,120})"
+    )
+    m = first_match(project_name_pattern)
     if m:
         pn = _clean_capture(m.group(1))
         # 避免只抽到「招标公告」等后缀
@@ -823,7 +907,7 @@ def extract_fields(
             continue
         if key == "purchaser" and out["purchaser"] != _MISSING:
             continue
-        m = pat.search(blob)
+        m = first_match(pat)
         if not m:
             continue
         if key == "announcement_type":
@@ -844,7 +928,12 @@ def extract_fields(
             cn = format_cn_date(raw_dl)
             out["deadline"] = cn if cn != _MISSING else raw_dl
         elif key in out:
-            out[key] = _clean_capture(m.group(1))
+            captured_value = _clean_capture(m.group(1))
+            if key in {"purchaser", "agency"} and _is_entity_placeholder(
+                captured_value
+            ):
+                continue
+            out[key] = captured_value
             if key in {"purchaser", "agency", "project_code", "budget", "deadline"}:
                 out["field_evidence"].setdefault(
                     key,
@@ -871,11 +960,10 @@ def extract_fields(
 
     # v2 语义字段：相似名词必须分开提取，不使用「交易平台」作为代理机构，
     # 也不使用「公告结束时间」作为投标截止时间。
-    explicit_purchaser = _extract_semantic_value(
-        blob, ("采购人名称", "采购人", "采购单位")
+    explicit_purchaser = semantic_value(
+        ("采购人名称", "采购人", "采购单位")
     )
-    tenderer = _extract_semantic_value(
-        blob,
+    tenderer = semantic_value(
         (
             "招标人名称",
             "招标人",
@@ -909,15 +997,45 @@ def extract_fields(
             "quote": tenderer[2],
             "confidence": "normalised_tenderer",
         }
+    if out["purchaser"] == _MISSING:
+        purchasing_subject = re.search(
+            r"(?m)^\s*(?P<value>[^\n，,。；;]{2,100}?(?:有限责任公司|股份有限公司|"
+            r"有限公司|集团公司|研究院|研究所|中心))"
+            r"(?:[（(][^）)\n]{0,50}[）)])?\s*"
+            r"(?:根据[^，,。\n]{0,40}[，,])?\s*(?:拟采购|现采购|拟对[^。\n]{0,40}采购)",
+            blob,
+        )
+        if purchasing_subject:
+            value = _clean_entity_capture(purchasing_subject.group("value"))
+            quote = _clean_capture(purchasing_subject.group(0))
+            out["purchaser"] = value
+            out["purchaser_source_label"] = "拟采购主体"
+            out["field_evidence"]["purchaser"] = {
+                "source_label": "拟采购主体",
+                "quote": quote,
+                "confidence": "semantic_context",
+            }
 
     semantic_specs: list[tuple[str, Sequence[str]]] = [
-        ("agency", ("招标代理机构", "采购代理机构", "委托代理机构", "代理机构")),
+        (
+            "agency",
+            (
+                "招标代理机构名称",
+                "采购代理机构名称",
+                "代理机构名称",
+                "招标代理机构",
+                "采购代理机构",
+                "委托代理机构",
+                "代理机构",
+                "招标机构",
+            ),
+        ),
         ("transaction_platform", ("交易平台", "电子招标投标交易平台", "发布媒介")),
         ("funding_source", ("项目资金来源", "资金来源")),
         ("notice_end_time", ("公告结束时间", "公告截止时间")),
     ]
     for field_name, labels in semantic_specs:
-        value, label, quote = _extract_semantic_value(blob, labels)
+        value, label, quote = semantic_value(labels)
         if not value:
             continue
         out[field_name] = value
@@ -999,6 +1117,8 @@ def extract_fields(
             "bid_deadline",
             (
                 "投标文件递交的截止时间",
+                "提交（上传）投标文件截止时间",
+                "提交投标文件截止时间",
                 "投标截止时间",
                 "递交投标文件截止时间",
                 "投标截止",
@@ -1006,8 +1126,15 @@ def extract_fields(
         ),
         ("opening_time", ("开标时间", "开标日期")),
     ]
+    date_detail_blob = re.sub(
+        r"(提交(?:（上传）)?投标文件)\s*\n\s*(截止时间)",
+        r"\1\2",
+        detail_blob,
+    )
     for field_name, labels in date_specs:
-        value, label, quote = _extract_date_around_field_label(blob, labels)
+        value, label, quote = _extract_date_around_field_label(date_detail_blob, labels)
+        if not value:
+            value, label, quote = _extract_date_around_field_label(blob, labels)
         if not value:
             continue
         out[field_name] = value
@@ -1016,20 +1143,32 @@ def extract_fields(
             "quote": quote,
             "confidence": "direct_label",
         }
+    combined_deadline_heading = re.search(
+        r"(?m)^\s*(?:(?:\d+(?:\.\d+)*|[一二三四五六七八九十百]+)"
+        r"\s*[.、．]?)?(?:投标截止时间\s*[（(]开标时间[）)]|"
+        r"提交(?:（上传）)?投标文件\s*截止时间[^\n]{0,20}开标时间)",
+        date_detail_blob or blob,
+    )
     if (
         out["opening_time"] == _MISSING
         and out["bid_deadline"] != _MISSING
-        and re.search(
-            r"(?m)^\s*(?:\d+(?:\.\d+)*\s*)?投标截止时间\s*"
-            r"[（(]开标时间[）)]",
-            blob,
-        )
+        and combined_deadline_heading
     ):
         out["opening_time"] = out["bid_deadline"]
         out["field_evidence"]["opening_time"] = dict(
             out["field_evidence"]["bid_deadline"]
         )
         out["field_evidence"]["opening_time"]["source_label"] = "投标截止时间（开标时间）"
+    if (
+        out["bid_deadline"] == _MISSING
+        and out["opening_time"] != _MISSING
+        and combined_deadline_heading
+    ):
+        out["bid_deadline"] = out["opening_time"]
+        out["field_evidence"]["bid_deadline"] = dict(
+            out["field_evidence"]["opening_time"]
+        )
+        out["field_evidence"]["bid_deadline"]["source_label"] = "提交投标文件截止时间（开标时间）"
     if out["bid_deadline"] != _MISSING:
         out["deadline"] = out["bid_deadline"]
         out["field_evidence"]["deadline"] = dict(
@@ -1038,12 +1177,12 @@ def extract_fields(
 
     # 招标文件获取期间常在同一句中出现两个时间点。
     acquisition = re.search(
-        r"(?P<label>招标文件的获取|获取招标文件|招标文件获取时间)"
+        r"(?P<label>招标文件的获取|获取招标文件|招标文件获取时间|招标文件获取方式)"
         r"(?:(?!\n\s*[5-9](?:[.、．]|\s*\n)).){0,500}?"
         r"(?P<start>20\d{2}\s*[年\-/]\s*\d{1,2}\s*[月\-/]\s*\d{1,2}日?"
         r"(?:\s*\d{1,2}\s*[时:]\s*\d{1,2}\s*分?"
         r"(?:\s*\d{1,2}\s*秒)?)?)"
-        r"\s*(?:至|到|~|—)\s*"
+        r"\s*(?:起|开始)?\s*(?:至|到|~|—)\s*"
         r"(?P<end>20\d{2}\s*[年\-/]\s*\d{1,2}\s*[月\-/]\s*\d{1,2}日?"
         r"(?:\s*\d{1,2}\s*[时:]\s*\d{1,2}\s*分?"
         r"(?:\s*\d{1,2}\s*秒)?)?)",
@@ -1299,7 +1438,7 @@ _AI_EXTRACTABLE_FIELDS = {
 
 def _subject_label_rank(value: str | None) -> int:
     label = re.sub(r"\s+", "", str(value or ""))
-    if "采购人" in label:
+    if "采购人" in label or "采购单位" in label:
         return 4
     if "招标人" in label:
         return 3
@@ -1355,6 +1494,35 @@ def _validate_ai_extraction_rows(
                 allowed_labels.add("项目业主")
             if compact_label not in allowed_labels:
                 errors.append(f"{name}: source_label 不是采购人/招标人原文标签")
+                continue
+            if _is_entity_placeholder(value):
+                errors.append(f"{name}: value 是空值或占位符")
+                continue
+            if compact_label not in compact_quote or compact_value not in compact_quote:
+                errors.append(f"{name}: quote 未同时包含字段标签和值")
+                continue
+        if name == "agency":
+            agency_labels = (
+                "招标代理机构名称",
+                "采购代理机构名称",
+                "代理机构名称",
+                "招标代理机构",
+                "采购代理机构",
+                "委托代理机构",
+                "代理机构",
+                "招标机构",
+            )
+            agency_context = any(token in quote for token in agency_labels) or bool(
+                re.search(
+                    rf"{re.escape(value)}[^\n，,。；;]{{0,30}}受[^\n，,。；;]{{0,60}}委托",
+                    quote,
+                )
+            )
+            if not agency_context:
+                errors.append("agency: quote 不含代理/招标机构或受托语义")
+                continue
+            if _is_entity_placeholder(value) or compact_value not in compact_quote:
+                errors.append("agency: value 是占位符或不在证据片段中")
                 continue
         if name in {"bid_deadline", "opening_time"}:
             labels = (

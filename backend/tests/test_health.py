@@ -19,6 +19,7 @@ async def test_health_ok(client: AsyncClient):
     assert "browser-rendered-detail-capture-v1" in data["capabilities"]
     assert "managed-public-browser-v1" in data["capabilities"]
     assert "managed-public-browser-pool-v2" in data["capabilities"]
+    assert "pdfjs-memory-document-capture-v1" in data["capabilities"]
     assert data["public_browser"]["state"] in {
         "not_started",
         "starting",
@@ -31,6 +32,10 @@ async def test_health_ok(client: AsyncClient):
     assert "profile_dir" not in data["public_browser"]
     assert data["public_browser"]["pool_size"] == 2
     assert data["public_browser"]["active_workers"] == 0
+    pipeline = data["public_browser"]["pdf_pipeline"]
+    assert pipeline["memory_pdf_bytes"] is True
+    assert isinstance(pipeline["text_ready"], bool)
+    assert isinstance(pipeline["scanned_pdf_ready"], bool)
     assert "Asia/Shanghai" in data["timezone"]
     assert data["phase"] == "phase8-integration"
 

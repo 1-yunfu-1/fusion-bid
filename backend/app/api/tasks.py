@@ -218,7 +218,16 @@ async def execute_task(
             detail_not_attempted_count=getattr(
                 stats, "detail_not_attempted_count", 0
             ),
+            cached_full_reused_count=getattr(
+                stats, "cached_full_reused_count", 0
+            ),
             failure_breakdown=getattr(stats, "failure_breakdown", {}),
+            failure_breakdown_by_source=getattr(
+                stats, "failure_breakdown_by_source", {}
+            ),
+            source_detail_breakdown=getattr(
+                stats, "source_detail_breakdown", {}
+            ),
             stage_durations_ms=getattr(stats, "stage_durations_ms", {}),
             effective_concurrency=getattr(stats, "effective_concurrency", {}),
             filtered_out_count=stats.filtered_out_count,
@@ -374,7 +383,16 @@ async def list_executions(
                 detail_not_attempted_count=int(
                     diagnostics.get("detail_not_attempted_count") or 0
                 ),
+                cached_full_reused_count=int(
+                    diagnostics.get("cached_full_reused_count") or 0
+                ),
                 failure_breakdown=dict(diagnostics.get("failure_breakdown") or {}),
+                failure_breakdown_by_source=dict(
+                    diagnostics.get("failure_breakdown_by_source") or {}
+                ),
+                source_detail_breakdown=dict(
+                    diagnostics.get("source_detail_breakdown") or {}
+                ),
                 stage_durations_ms=dict(diagnostics.get("stage_durations_ms") or {}),
                 effective_concurrency=dict(
                     diagnostics.get("effective_concurrency") or {}

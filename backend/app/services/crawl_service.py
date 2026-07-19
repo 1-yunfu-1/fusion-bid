@@ -63,6 +63,7 @@ class CrawlStats:
     detail_metadata_only_count: int = 0
     detail_human_verification_count: int = 0
     detail_not_attempted_count: int = 0
+    cached_full_reused_count: int = 0
     detail_filtered_out: int = 0
     candidates_count: int = 0
     filtered_out_count: int = 0  # list + detail 过滤合计（兼容）
@@ -84,6 +85,8 @@ class CrawlStats:
     truncated: bool = False
     analysis_data: dict = field(default_factory=dict)
     failure_breakdown: dict[str, int] = field(default_factory=dict)
+    failure_breakdown_by_source: dict[str, dict[str, int]] = field(default_factory=dict)
+    source_detail_breakdown: dict[str, dict[str, int]] = field(default_factory=dict)
     stage_durations_ms: dict[str, int] = field(default_factory=dict)
     effective_concurrency: dict[str, object] = field(default_factory=dict)
 
@@ -225,13 +228,30 @@ def _failure_bucket(detail: DetailResult, *, extraction_failed: bool = False) ->
         "collector_exception",
     }:
         return "browser_failure"
+    if reason == "html_parse_failure":
+        return "html_parse_failure"
+    if reason == "html_content_empty":
+        return "html_content_empty"
+    if reason == "http_detail_fetch_failure":
+        return "http_detail_failure"
     if reason in {
         "content_unavailable",
         "incomplete_pdf_pages",
         "pdf_not_ready",
+        "pdf_not_loaded",
+        "pdf_document_unavailable",
+        "pdf_bytes_timeout",
+        "pdf_too_large",
+        "pdf_page_limit",
+        "pdf_parse_failure",
+        "ocr_failure",
         "collector_timeout",
     }:
         return "pdf_incomplete"
+    if reason == "outer_detail_unavailable":
+        return "outer_detail_unavailable"
+    if reason == "official_content_unavailable":
+        return "official_content_unavailable"
     if reason in {"identity_mismatch", "pdf_title_mismatch"}:
         return "identity_conflict"
     if detail.detail_status != "full":
@@ -508,13 +528,15 @@ async def _process_detail_work(
         except Exception as exc:  # noqa: BLE001
             acquisition_exception = True
             logger.warning("%s detail fail %s: %s", source.source_name, item.source_url, exc)
+            reason = str(getattr(exc, "failure_reason", "collector_exception"))
+            stage = str(getattr(exc, "failure_stage", "detail_acquisition"))
             detail = _metadata_detail(
                 item,
                 status="failed",
                 attempt_state="attempted",
-                reason="collector_exception",
+                reason=reason,
                 message=f"详情采集异常：{type(exc).__name__}",
-                failure_stage="detail_acquisition",
+                failure_stage=stage,
             )
 
     detail_duration_ms = int((time.monotonic() - detail_started) * 1000)
@@ -784,30 +806,43 @@ async def execute_search_task(
     source_stats_by_name = {row.source_name: row for row in stats.source_stats}
     for result in processed_details:
         detail = result.detail
-        source_stat = source_stats_by_name[result.source.source_name]
+        source_name = result.source.source_name
+        source_stat = source_stats_by_name[source_name]
         detail_meta[detail.source_url] = result.detail_meta
         attempt_state = (detail.source_metadata or {}).get("detail_attempt_state")
         if attempt_state == "not_attempted":
             stats.detail_not_attempted_count += 1
             source_stat.detail_metadata_only += 1
+            detail_outcome = "not_attempted"
         elif result.acquisition_exception:
             stats.detail_failed += 1
             source_stat.detail_metadata_only += 1
+            detail_outcome = "failed"
         elif detail.detail_fetched and detail.detail_status == "full":
             stats.detail_success_count += 1
             source_stat.detail_success += 1
+            detail_outcome = "full"
         elif detail.detail_status == "needs_human_verification":
             stats.detail_human_verification_count += 1
             source_stat.detail_metadata_only += 1
+            detail_outcome = "needs_human_verification"
         elif detail.detail_status == "failed":
             stats.detail_status_failed_count += 1
             source_stat.detail_metadata_only += 1
+            detail_outcome = "failed"
         else:
             stats.detail_metadata_only_count += 1
             source_stat.detail_metadata_only += 1
+            detail_outcome = "metadata_only"
+        source_outcomes = stats.source_detail_breakdown.setdefault(source_name, {})
+        source_outcomes[detail_outcome] = source_outcomes.get(detail_outcome, 0) + 1
         bucket = _failure_bucket(detail, extraction_failed=result.extraction_failed)
         if bucket:
             stats.failure_breakdown[bucket] = stats.failure_breakdown.get(bucket, 0) + 1
+            source_failures = stats.failure_breakdown_by_source.setdefault(
+                source_name, {}
+            )
+            source_failures[bucket] = source_failures.get(bucket, 0) + 1
         if not result.accepted:
             stats.detail_filtered_out += 1
             stats.filtered_out_count += 1
@@ -912,6 +947,30 @@ async def execute_search_task(
             # 已核验的详情优先于列表元数据；同等详情质量时才按内容长度更新。
             rec_is_full = rec.detail_status == "full"
             existing_is_full = existing.detail_status == "full"
+            reused_cached_full = existing_is_full and not rec_is_full
+            if reused_cached_full:
+                current_metadata = dict(rec.source_metadata or {})
+                preserved_metadata = dict(existing.source_metadata or {})
+                preserved_metadata["last_attempt"] = {
+                    "attempted_at": crawl_time.isoformat(),
+                    "status": rec.detail_status or "metadata_only",
+                    "detail_fetched": False,
+                    "detail_attempt_state": current_metadata.get(
+                        "detail_attempt_state", "attempted"
+                    ),
+                    "failure_reason": current_metadata.get("failure_reason"),
+                    "failure_stage": current_metadata.get("failure_stage"),
+                    "acquisition_path": current_metadata.get("acquisition_path"),
+                    "message": str(current_metadata.get("message") or "")[:500],
+                    "attempt_count": int(current_metadata.get("attempt_count") or 0),
+                    "duration_ms": int(current_metadata.get("duration_ms") or 0),
+                }
+                preserved_metadata["using_cached_full"] = True
+                preserved_metadata["cached_full_captured_at"] = (
+                    existing.crawl_time.isoformat() if existing.crawl_time else None
+                )
+                existing.source_metadata = preserved_metadata
+                stats.cached_full_reused_count += 1
             if rec.clean_content and (
                 (rec_is_full and not existing_is_full)
                 or (
@@ -935,6 +994,37 @@ async def execute_search_task(
                 existing.extraction_data = rec.extraction_data
                 existing.extraction_version = "v2"
                 existing.announcement_type = rec.announcement_type
+            elif rec_is_full and existing_is_full:
+                # 即使当前正文较短，本轮已验证成功也必须清除上次“历史正文复用”标记。
+                existing.source_metadata = rec.source_metadata
+                existing.extraction_data = rec.extraction_data
+                existing.extraction_version = "v2"
+                existing.announcement_type = rec.announcement_type
+                existing.detail_url = (
+                    rec.source_metadata.get("detail_url")
+                    if rec.source_metadata
+                    else rec.source_url
+                )
+                existing.content_format = (
+                    rec.source_metadata.get("content_format")
+                    if rec.source_metadata
+                    else existing.content_format
+                )
+            elif not rec_is_full and not existing_is_full:
+                # 非完整详情也要保存本轮真实状态，不能让旧的“待验证/超时”
+                # 永久覆盖后来得到的更准确失败码。
+                existing.detail_status = rec.detail_status or "metadata_only"
+                existing.source_metadata = rec.source_metadata
+                existing.detail_url = (
+                    rec.source_metadata.get("detail_url")
+                    if rec.source_metadata
+                    else rec.source_url
+                )
+                existing.content_format = (
+                    rec.source_metadata.get("content_format")
+                    if rec.source_metadata
+                    else None
+                )
             corrections = (
                 await db.execute(
                     select(AnnouncementFieldCorrection)
@@ -951,7 +1041,8 @@ async def execute_search_task(
                 if a not in atts:
                     atts.append(a)
             existing.attachment_links = atts
-            existing.content_hash = rec.content_hash or existing.content_hash
+            if rec_is_full or not existing_is_full:
+                existing.content_hash = rec.content_hash or existing.content_hash
             if rec.project_code and not existing.project_code:
                 existing.project_code = rec.project_code
             ann_id = existing.id
@@ -1062,6 +1153,8 @@ async def execute_search_task(
             "attachment_extract_failed": False,
             "requires_login": ann.requires_login,
         }
+        stored_metadata = ann.source_metadata or meta.get("source_metadata") or {}
+        cached_full_reused = bool(stored_metadata.get("using_cached_full"))
         output_items.append(
             {
                 "announcement_id": ann.id,
@@ -1086,12 +1179,16 @@ async def execute_search_task(
                 "project_code": ann.project_code,
                 "announcement_type": ann.announcement_type,
                 "detail_status": ann.detail_status or meta.get("detail_status", "unknown"),
-                "source_metadata": ann.source_metadata or meta.get("source_metadata") or {},
+                "source_metadata": stored_metadata,
                 "extraction_data": ann.extraction_data,
                 "attachment_links": ann.attachment_links or [],
                 "data_mode": ann.data_mode,
                 "requires_login": ann.requires_login,
-                "detail_fetched": meta.get("detail_fetched", ann.detail_status == "full"),
+                "detail_fetched": ann.detail_status == "full",
+                "current_attempt_detail_fetched": meta.get(
+                    "detail_fetched", not cached_full_reused
+                ),
+                "cached_full_reused": cached_full_reused,
                 "attachment_extract_failed": meta.get("attachment_extract_failed", False),
                 "detail_url": ann.detail_url or ann.source_url,
                 "content_format": ann.content_format,
@@ -1212,6 +1309,11 @@ async def execute_search_task(
             f"{stats.detail_not_attempted_count} 条详情因官方站点连续阻断而未继续请求；"
             "这些记录不计为采集失败，仍保留列表元数据。"
         )
+    if stats.cached_full_reused_count:
+        warnings.append(
+            f"{stats.cached_full_reused_count} 条公告本轮详情采集失败，但库中已有经校验的完整正文；"
+            "报告继续使用历史完整正文，并在项目详情中单独标注，不计为本轮采集成功。"
+        )
     if stats.truncated:
         warnings.append(
             "本次快照已达每源 500 条安全上限，truncated=true；"
@@ -1311,7 +1413,10 @@ async def execute_search_task(
     )
     execution.crawl_diagnostics = {
         "detail_not_attempted_count": stats.detail_not_attempted_count,
+        "cached_full_reused_count": stats.cached_full_reused_count,
         "failure_breakdown": dict(stats.failure_breakdown),
+        "failure_breakdown_by_source": dict(stats.failure_breakdown_by_source),
+        "source_detail_breakdown": dict(stats.source_detail_breakdown),
         "stage_durations_ms": dict(stats.stage_durations_ms),
         "effective_concurrency": dict(stats.effective_concurrency),
     }

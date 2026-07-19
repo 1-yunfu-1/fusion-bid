@@ -96,6 +96,30 @@ def test_pdf_title_identity_rejects_unrelated_document():
     )
 
 
+def test_pdf_identity_accepts_two_ordered_title_spans_with_one_bad_connector():
+    signals = pdf_detail_module._pdf_identity_signals(
+        "云服务器租赁机DNS解析",
+        (
+            "拟采购云服务器租赁，现开展询比价工作。"
+            "物资包括香港云服务器租赁和DNS企业版解析基础防御版。"
+        ),
+    )
+
+    assert signals["accepted"] is True
+    assert signals["method"] == "ordered_title_spans"
+    assert signals["title_span_coverage"] >= 0.75
+
+
+def test_pdf_identity_does_not_accept_one_generic_title_fragment():
+    signals = pdf_detail_module._pdf_identity_signals(
+        "云服务器租赁机DNS解析",
+        "另一采购项目需要服务器设备，但没有对应项目名称或采购内容。",
+    )
+
+    assert signals["accepted"] is False
+    assert signals["title_span_match"] is False
+
+
 @pytest.mark.parametrize(
     ("outer_title", "pdf_text", "project_code"),
     [
@@ -195,6 +219,34 @@ async def test_pdf_collection_uses_blank_navigation_boundary_before_hash_route()
 
 
 @pytest.mark.asyncio
+async def test_blank_spa_without_challenge_is_not_reported_as_verification():
+    class Locator:
+        async def inner_text(self, **_kwargs):
+            return "首页\n联系我们"
+
+    class Page:
+        async def goto(self, *_args, **_kwargs):
+            return None
+
+        async def wait_for_selector(self, *_args, **_kwargs):
+            raise TimeoutError
+
+        def locator(self, _selector):
+            return Locator()
+
+    result = await pdf_detail_module._collect_public_pdf_detail(
+        Page(),
+        detail_url="https://ctbpsp.com/#/bulletinDetail?uuid=" + "d" * 32,
+        expected_id="d" * 32,
+        expected_title="测试服务器采购项目招标公告",
+    )
+
+    assert result.status == "metadata_only"
+    assert result.failure_reason == "outer_detail_unavailable"
+    assert result.failure_reason != "verification_required"
+
+
+@pytest.mark.asyncio
 async def test_scanned_pdf_ocr_renders_loaded_pdfjs_document_without_dom_canvas(
     monkeypatch,
 ):
@@ -224,6 +276,64 @@ async def test_scanned_pdf_ocr_renders_loaded_pdfjs_document_without_dom_canvas(
 
     assert pages == [{"page": 1, "text": "采购人：测试单位", "method": "ocr"}]
     assert frame.render_calls == 1
+
+
+def test_local_pdf_parser_uses_ocr_for_a_textless_page(monkeypatch):
+    fitz = pytest.importorskip("fitz")
+    document = fitz.open()
+    document.new_page(width=320, height=240)
+    data = document.tobytes()
+    document.close()
+    monkeypatch.setattr(
+        pdf_detail_module,
+        "_recognise_image_bytes",
+        lambda _data: "采购人：扫描件测试单位\n资格要求：依法注册",
+    )
+
+    pages, page_count, reason = pdf_detail_module._parse_pdf_bytes_sync(
+        data, max_pages=10
+    )
+
+    assert reason is None
+    assert page_count == 1
+    assert pages[0]["method"] == "ocr"
+    assert "扫描件测试单位" in pages[0]["text"]
+
+
+@pytest.mark.asyncio
+async def test_access_prompt_pdf_is_rejected_after_memory_capture(monkeypatch):
+    monkeypatch.setattr(
+        pdf_detail_module,
+        "_parse_pdf_bytes_sync",
+        lambda _data, *, max_pages: (
+            [
+                {
+                    "page": 1,
+                    "text": "页面访问提示：当前页面已暂停访问，且不再提供PDF文件的查看服务。",
+                    "method": "pypdf_text",
+                }
+            ],
+            1,
+            None,
+        ),
+    )
+    captured = PublicPdfDetail(
+        status="captured",
+        detail_url="https://ctbpsp.com/#/bulletinDetail?uuid=" + "f" * 32,
+        document_page_count=1,
+        document_bytes=b"%PDF-1.4 test-only",
+    )
+
+    result = await pdf_detail_module._finalise_captured_pdf(
+        captured,
+        expected_title="测试服务器采购项目招标公告",
+        expected_project_code=None,
+    )
+
+    assert result.status == "metadata_only"
+    assert result.failure_reason == "official_content_unavailable"
+    assert result.pages == []
+    assert result.document_bytes is None
 
 
 @pytest.mark.asyncio
@@ -691,7 +801,7 @@ async def test_pdf_collection_restarts_managed_browser_once_after_crash(monkeypa
 
 
 @pytest.mark.asyncio
-async def test_pdf_collection_timeout_releases_page_without_retrying(monkeypatch):
+async def test_pdf_collection_timeout_releases_page_and_retries_once(monkeypatch):
     class FakeBroker:
         acquire_count = 0
 
@@ -728,9 +838,9 @@ async def test_pdf_collection_timeout_releases_page_without_retrying(monkeypatch
     )
 
     assert result.failure_reason == "collector_timeout"
-    assert result.failure_stage == "pdf_pages"
-    assert result.attempt_count == 1
-    assert broker.acquire_count == 1
+    assert result.failure_stage == "pdf_frame"
+    assert result.attempt_count == 2
+    assert broker.acquire_count == 2
 
 
 @pytest.mark.asyncio
@@ -796,5 +906,66 @@ async def test_identity_failure_rebuilds_only_current_page_then_succeeds(monkeyp
 
     assert result.status == "full"
     assert result.attempt_count == 2
-    assert broker.acquire_count == 1
+    assert broker.acquire_count == 2
     assert broker.replace_count == 1
+
+
+@pytest.mark.asyncio
+async def test_pdf_bytes_are_parsed_after_browser_lease_is_released(monkeypatch):
+    class FakeBroker:
+        active = False
+
+        @asynccontextmanager
+        async def acquire(self, *, interactive=False):
+            self.active = True
+            try:
+                yield SimpleNamespace(
+                    context=object(), page=object(), reused=True, engine="chrome"
+                )
+            finally:
+                self.active = False
+
+        @property
+        def is_connected(self):
+            return True
+
+        def status(self):
+            return {"state": "ready"}
+
+        def mark_needs_verification(self):
+            return None
+
+    broker = FakeBroker()
+    monkeypatch.setattr(managed_module, "get_managed_public_browser", lambda: broker)
+
+    async def collect(_page, **kwargs):
+        return PublicPdfDetail(
+            status="captured",
+            detail_url=kwargs["detail_url"],
+            document_page_count=1,
+            document_bytes=b"%PDF-1.4 test-only",
+        )
+
+    def parse(_data, *, max_pages):
+        assert broker.active is False
+        assert max_pages >= 1
+        return (
+            [{"page": 1, "text": "测试服务器采购项目 招标人：测试单位", "method": "pypdf_text"}],
+            1,
+            None,
+        )
+
+    monkeypatch.setattr(pdf_detail_module, "_collect_public_pdf_detail", collect)
+    monkeypatch.setattr(pdf_detail_module, "_parse_pdf_bytes_sync", parse)
+    result = await pdf_detail_module._fetch_managed_public_pdf_detail(
+        detail_url="https://ctbpsp.com/#/bulletinDetail?uuid=" + "e" * 32,
+        expected_id="e" * 32,
+        expected_title="测试服务器采购项目招标公告",
+        timeout_ms=60_000,
+        headless=True,
+    )
+
+    assert result.status == "full"
+    assert result.acquisition_path == "pdfjs_memory_bytes+local_parser"
+    assert result.document_bytes is None
+    assert result.document_page_count == 1

@@ -698,6 +698,7 @@ def _page3_overview(doc: Document, ctx: ReportContext, items: list[dict]) -> Non
     rows = []
     for i, it in enumerate(items, 1):
         f = it.get("fields") or {}
+        cached_full_reused = bool(it.get("cached_full_reused"))
         rows.append(
             [
                 str(i),
@@ -705,13 +706,15 @@ def _page3_overview(doc: Document, ctx: ReportContext, items: list[dict]) -> Non
                 f.get("region") or _MISSING,
                 f.get("purchaser") or _MISSING,
                 (it.get("opportunity_analysis") or {}).get("priority") or "待核验",
-                {
-                    "full": "已核验详情",
-                    "metadata_only": "仅元数据",
-                    "failed": "详情失败",
-                    "needs_human_verification": "待人工验证",
-                }.get(
-                    it.get("detail_status"), "状态未知"
+                (
+                    "历史完整正文（本轮失败）"
+                    if cached_full_reused
+                    else {
+                        "full": "已核验详情",
+                        "metadata_only": "仅元数据",
+                        "failed": "详情失败",
+                        "needs_human_verification": "待人工验证",
+                    }.get(it.get("detail_status"), "状态未知")
                 ),
                 f.get("announcement_type") or _MISSING,
                 it.get("publish_time_cn") or _MISSING,
@@ -826,13 +829,26 @@ def _detail_pages(doc: Document, ctx: ReportContext, items: list[dict]) -> None:
         _add_label_value(
             doc,
             "详情状态：",
-            {
-                "full": "已核验公告详情",
-                "metadata_only": "仅列表元数据（不作为公告正文）",
-                "failed": "详情抓取失败",
-                "needs_human_verification": "详情页需人工完成安全验证（系统未绕过）",
-            }.get(it.get("detail_status"), "状态未知"),
+            (
+                "使用历史已核验完整正文（本轮采集未成功，不计为本轮完整详情）"
+                if it.get("cached_full_reused")
+                else {
+                    "full": "已核验公告详情",
+                    "metadata_only": "仅列表元数据（不作为公告正文）",
+                    "failed": "详情抓取失败",
+                    "needs_human_verification": "详情页需人工完成安全验证（系统未绕过）",
+                }.get(it.get("detail_status"), "状态未知")
+            ),
         )
+        if it.get("cached_full_reused"):
+            last_attempt = (it.get("source_metadata") or {}).get("last_attempt") or {}
+            attempt_reason = last_attempt.get("failure_reason") or "详情未取得"
+            attempt_message = last_attempt.get("message") or "本轮未取得新正文"
+            _add_label_value(
+                doc,
+                "本轮采集：",
+                f"失败（{attempt_reason}）：{attempt_message}",
+            )
         _add_label_value(doc, "数据模式：", it.get("data_mode") or "live")
         _add_label_value(
             doc,

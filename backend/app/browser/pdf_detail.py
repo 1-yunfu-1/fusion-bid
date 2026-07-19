@@ -9,19 +9,28 @@ from __future__ import annotations
 
 import asyncio
 import base64
+from contextlib import asynccontextmanager
 from difflib import SequenceMatcher
+import importlib.util
+import io
 import logging
 import re
 import threading
 import time
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, AsyncIterator
 from urllib.parse import parse_qs, unquote, urlparse
+from weakref import WeakKeyDictionary
+
+from app.core.config import get_settings
 
 logger = logging.getLogger(__name__)
 
 _RAPID_OCR: Any | None = None
 _RAPID_OCR_LOCK = threading.Lock()
+_PDF_PARSE_SEMAPHORES: WeakKeyDictionary[
+    asyncio.AbstractEventLoop, asyncio.Semaphore
+] = WeakKeyDictionary()
 
 
 def _recognise_image_bytes(image_bytes: bytes) -> str:
@@ -35,6 +44,37 @@ def _recognise_image_bytes(image_bytes: bytes) -> str:
         result = _RAPID_OCR(image_bytes)
     texts = tuple(getattr(result, "txts", None) or ())
     return "\n".join(str(value).strip() for value in texts if str(value).strip())
+
+
+def pdf_pipeline_status() -> dict[str, Any]:
+    """Return dependency readiness without importing models or exposing paths."""
+    text_parser = importlib.util.find_spec("pypdf") is not None
+    rasterizer = importlib.util.find_spec("fitz") is not None
+    ocr_engine = (
+        importlib.util.find_spec("rapidocr") is not None
+        and importlib.util.find_spec("onnxruntime") is not None
+    )
+    return {
+        "memory_pdf_bytes": True,
+        "text_parser": text_parser,
+        "rasterizer": rasterizer,
+        "ocr_engine": ocr_engine,
+        "text_ready": text_parser or rasterizer,
+        "scanned_pdf_ready": rasterizer and ocr_engine,
+        "parse_concurrency": get_settings().cebpub_pdf_parse_concurrency,
+        "ocr_concurrency": 1,
+    }
+
+
+@asynccontextmanager
+async def _pdf_parse_slot() -> AsyncIterator[None]:
+    loop = asyncio.get_running_loop()
+    semaphore = _PDF_PARSE_SEMAPHORES.get(loop)
+    if semaphore is None:
+        semaphore = asyncio.Semaphore(get_settings().cebpub_pdf_parse_concurrency)
+        _PDF_PARSE_SEMAPHORES[loop] = semaphore
+    async with semaphore:
+        yield
 
 _VERIFY_MARKERS = (
     "安全验证",
@@ -54,9 +94,17 @@ _FAILURE_STAGES = {
     "site_rate_limited": "navigation",
     "verification_required": "outer_page",
     "verification_timeout": "outer_page",
+    "outer_detail_unavailable": "outer_page",
     "pdf_not_loaded": "pdf_frame",
     "identity_mismatch": "outer_identity",
     "pdf_not_ready": "pdf_frame",
+    "pdf_document_unavailable": "pdf_frame",
+    "pdf_bytes_timeout": "pdf_bytes",
+    "pdf_too_large": "pdf_bytes",
+    "pdf_page_limit": "pdf_parse",
+    "pdf_parse_failure": "pdf_parse",
+    "ocr_failure": "pdf_ocr",
+    "official_content_unavailable": "pdf_identity",
     "content_unavailable": "pdf_pages",
     "incomplete_pdf_pages": "pdf_pages",
     "collector_timeout": "pdf_pages",
@@ -82,6 +130,9 @@ class PublicPdfDetail:
     duration_ms: int = 0
     validation_signals: dict[str, Any] = field(default_factory=dict)
     site_blocked: bool = False
+    acquisition_path: str | None = None
+    document_page_count: int = 0
+    document_bytes: bytes | None = field(default=None, repr=False)
 
 
 def _normalise_identity(value: str) -> str:
@@ -221,10 +272,19 @@ def _pdf_identity_signals(
     company_match = any(
         len(value) >= 6 and value in expected for value in normalised_subjects
     )
-    longest_common = (
-        SequenceMatcher(None, core, actual, autojunk=False).find_longest_match().size
-        if core and actual
-        else 0
+    matcher = SequenceMatcher(None, core, actual, autojunk=False) if core and actual else None
+    matching_blocks = matcher.get_matching_blocks() if matcher else []
+    longest_common = max((block.size for block in matching_blocks), default=0)
+    substantial_blocks = [block for block in matching_blocks if block.size >= 3]
+    covered_chars = sum(block.size for block in substantial_blocks)
+    span_coverage = covered_chars / len(core) if core else 0.0
+    # 列表标题偶有一个连接字错误，或把两个物资名称连写；PDF 表格中又会分行。
+    # 仅在两个以上有序片段覆盖标题主体至少 75% 时接受，避免退化成单关键词命中。
+    title_span_match = bool(
+        len(core) >= 8
+        and len(substantial_blocks) >= 2
+        and longest_common >= 4
+        and span_coverage >= 0.75
     )
     subject_overlap = longest_common >= 8
     matched_code = next(
@@ -236,6 +296,7 @@ def _pdf_identity_signals(
         exact_title
         or core_in_document
         or project_name_match
+        or title_span_match
         or (company_match and subject_overlap)
         or (project_code_match and (company_match or longest_common >= 6))
     )
@@ -245,6 +306,8 @@ def _pdf_identity_signals(
         method = "title_core"
     elif project_name_match:
         method = "project_name"
+    elif title_span_match:
+        method = "ordered_title_spans"
     elif company_match and subject_overlap:
         method = "subject+project_overlap"
     elif project_code_match and (company_match or longest_common >= 6):
@@ -257,6 +320,8 @@ def _pdf_identity_signals(
         "exact_title": exact_title,
         "title_core_match": core_in_document,
         "project_name_match": project_name_match,
+        "title_span_match": title_span_match,
+        "title_span_coverage": round(span_coverage, 3),
         "project_code_match": project_code_match,
         "company_match": company_match,
         "longest_common_chars": longest_common,
@@ -332,7 +397,278 @@ def restore_reading_order(items: list[dict[str, Any]]) -> str:
         else:
             lines[target].append(item)
     text_lines = [_join_pdf_line(line) for line in lines]
-    return "\n".join(line for line in text_lines if line).strip()
+    output: list[str] = []
+    for line in text_lines:
+        if not line:
+            continue
+        # Overlay PDFs often draw the same row twice.  Coordinate-level
+        # deduplication handles most cases; this removes only exact adjacent
+        # line duplicates and therefore does not merge legitimate clauses.
+        if output and line == output[-1]:
+            continue
+        output.append(line)
+    return "\n".join(output).strip()
+
+
+async def _read_loaded_pdf_bytes(
+    frame, *, timeout_ms: int, max_bytes: int
+) -> tuple[bytes | None, int, str | None]:
+    """Read the PDF already held by PDF.js without requesting its URL again."""
+    handle = None
+    try:
+        handle = await asyncio.wait_for(
+            frame.evaluate_handle(
+                """async () => {
+                    const doc = window.PDFViewerApplication?.pdfDocument;
+                    if (!doc) return null;
+                    return await doc.getData();
+                }"""
+            ),
+            timeout=max(5, min(timeout_ms, 15_000) / 1000),
+        )
+        length = int(
+            await handle.evaluate(
+                "data => data ? (data.byteLength || data.length || 0) : 0"
+            )
+        )
+        if length <= 0:
+            return None, 0, "pdf_document_unavailable"
+        if length > max_bytes:
+            return None, 0, "pdf_too_large"
+
+        chunks: list[bytes] = []
+        chunk_size = 256 * 1024
+        for offset in range(0, length, chunk_size):
+            encoded = await handle.evaluate(
+                """(data, range) => {
+                    const chunk = data.subarray(
+                        range.offset,
+                        Math.min(data.length, range.offset + range.size)
+                    );
+                    let binary = '';
+                    for (let i = 0; i < chunk.length; i += 1) {
+                        binary += String.fromCharCode(chunk[i]);
+                    }
+                    return btoa(binary);
+                }""",
+                {"offset": offset, "size": chunk_size},
+            )
+            chunks.append(base64.b64decode(encoded))
+        data = b"".join(chunks)
+        if len(data) != length or not data.startswith(b"%PDF-"):
+            return None, 0, "pdf_parse_failure"
+        try:
+            page_count = int(
+                await frame.evaluate(
+                    "() => window.PDFViewerApplication?.pdfDocument?.numPages || 0"
+                )
+            )
+        except Exception:  # noqa: BLE001
+            page_count = 0
+        return data, page_count, None
+    except TimeoutError:
+        return None, 0, "pdf_bytes_timeout"
+    except Exception as exc:  # noqa: BLE001
+        logger.info("loaded PDF bytes unavailable: %s", type(exc).__name__)
+        return None, 0, "pdf_document_unavailable"
+    finally:
+        if handle is not None:
+            try:
+                await handle.dispose()
+            except Exception:  # noqa: BLE001
+                pass
+
+
+def _fitz_page_text(page: Any) -> str:
+    payload = page.get_text("dict") or {}
+    page_height = float(page.rect.height)
+    items: list[dict[str, Any]] = []
+    for block in payload.get("blocks") or []:
+        if int(block.get("type") or 0) != 0:
+            continue
+        for line in block.get("lines") or []:
+            for span in line.get("spans") or []:
+                text = str(span.get("text") or "").strip()
+                bbox = span.get("bbox") or (0, 0, 0, 0)
+                if not text or len(bbox) < 4:
+                    continue
+                x0, y0, x1, y1 = (float(value or 0) for value in bbox[:4])
+                items.append(
+                    {
+                        "text": text,
+                        "x": x0,
+                        "y": page_height - y1,
+                        "width": max(0.0, x1 - x0),
+                        "height": max(0.0, y1 - y0),
+                    }
+                )
+    return restore_reading_order(items)
+
+
+def _parse_pdf_bytes_sync(
+    data: bytes, *, max_pages: int
+) -> tuple[list[dict[str, Any]], int, str | None]:
+    """Extract every page locally; OCR only pages without usable text."""
+    fitz_error: Exception | None = None
+    try:
+        import fitz
+
+        document = fitz.open(stream=data, filetype="pdf")
+        try:
+            page_count = len(document)
+            if page_count > max_pages:
+                return [], page_count, "pdf_page_limit"
+            pages: list[dict[str, Any]] = []
+            missing: list[int] = []
+            for index, page in enumerate(document):
+                text = _fitz_page_text(page).strip()
+                method = "pymupdf_text"
+                if len(_normalise_identity(text)) < 20:
+                    try:
+                        pixmap = page.get_pixmap(matrix=fitz.Matrix(2, 2), alpha=False)
+                        ocr_text = _recognise_image_bytes(pixmap.tobytes("png")).strip()
+                    except Exception as exc:  # noqa: BLE001
+                        logger.info("local PDF OCR page %s failed: %s", index + 1, exc)
+                        ocr_text = ""
+                    if len(_normalise_identity(ocr_text)) > len(
+                        _normalise_identity(text)
+                    ):
+                        text = ocr_text
+                        method = "ocr"
+                if text:
+                    pages.append(
+                        {"page": index + 1, "text": text, "method": method}
+                    )
+                else:
+                    missing.append(index + 1)
+            if missing:
+                reason = "ocr_failure" if len(missing) == page_count else "incomplete_pdf_pages"
+                return pages, page_count, reason
+            return pages, page_count, None
+        finally:
+            document.close()
+    except Exception as exc:  # noqa: BLE001
+        fitz_error = exc
+        logger.info("PyMuPDF extraction unavailable: %s", type(exc).__name__)
+
+    try:
+        from pypdf import PdfReader
+
+        reader = PdfReader(io.BytesIO(data))
+        page_count = len(reader.pages)
+        if page_count > max_pages:
+            return [], page_count, "pdf_page_limit"
+        pages = []
+        missing = []
+        for index, page in enumerate(reader.pages):
+            try:
+                text = (page.extract_text(extraction_mode="layout") or "").strip()
+            except TypeError:
+                text = (page.extract_text() or "").strip()
+            if text:
+                pages.append(
+                    {"page": index + 1, "text": text, "method": "pypdf_text"}
+                )
+            else:
+                missing.append(index + 1)
+        if missing:
+            return pages, page_count, "incomplete_pdf_pages"
+        return pages, page_count, None
+    except Exception as exc:  # noqa: BLE001
+        logger.info(
+            "local PDF parsing failed: fitz=%s pypdf=%s",
+            type(fitz_error).__name__ if fitz_error else "none",
+            type(exc).__name__,
+        )
+        return [], 0, "pdf_parse_failure"
+
+
+async def _finalise_captured_pdf(
+    captured: PublicPdfDetail,
+    *,
+    expected_title: str,
+    expected_project_code: str | None,
+) -> PublicPdfDetail:
+    data = captured.document_bytes
+    captured.document_bytes = None
+    if not data:
+        captured.status = "metadata_only"
+        captured.failure_reason = "pdf_document_unavailable"
+        captured.failure_stage = "pdf_frame"
+        captured.message = "PDF.js 未提供可解析的文档字节"
+        return captured
+
+    settings = get_settings()
+    async with _pdf_parse_slot():
+        pages, page_count, parse_reason = await asyncio.to_thread(
+            _parse_pdf_bytes_sync,
+            data,
+            max_pages=settings.cebpub_pdf_max_pages,
+        )
+    captured.document_page_count = page_count or captured.document_page_count
+    captured.acquisition_path = "pdfjs_memory_bytes+local_parser"
+    if parse_reason:
+        captured.status = "metadata_only"
+        captured.failure_reason = parse_reason
+        captured.failure_stage = _FAILURE_STAGES.get(parse_reason, "pdf_parse")
+        if parse_reason == "pdf_page_limit":
+            captured.message = (
+                f"PDF 共 {captured.document_page_count} 页，超过本机安全上限，未标记为完整正文"
+            )
+        elif parse_reason == "ocr_failure":
+            captured.message = "PDF 页面无可用文字，本地 OCR 未识别到正文"
+        elif parse_reason == "incomplete_pdf_pages":
+            captured.message = "PDF 存在未能读取的页面，未标记为完整正文"
+        else:
+            captured.message = "已取得 PDF，但本地解析失败"
+        captured.pages = pages
+        return captured
+
+    full_text = "\n".join(str(row.get("text") or "") for row in pages)
+    if any(
+        marker in full_text
+        for marker in ("页面访问提示", "当前页面已暂停访问", "不再提供PDF文件")
+    ):
+        captured.status = "metadata_only"
+        captured.failure_reason = "official_content_unavailable"
+        captured.failure_stage = "pdf_identity"
+        captured.message = "官方查看器返回暂停访问提示，未将提示页当作公告正文"
+        captured.pages = []
+        return captured
+
+    validation_signals = _pdf_identity_signals(
+        expected_title,
+        full_text,
+        expected_project_code=expected_project_code,
+    )
+    validation_signals.update(captured.validation_signals)
+    validation_signals["complete_pages"] = len(pages) == captured.document_page_count
+    captured.validation_signals = validation_signals
+    if not validation_signals["accepted"]:
+        captured.status = "failed"
+        captured.failure_reason = "pdf_title_mismatch"
+        captured.failure_stage = "pdf_identity"
+        captured.message = "PDF 正文身份与列表记录不一致，已拒绝使用"
+        captured.pages = []
+        return captured
+
+    methods = {str(row.get("method") or "") for row in pages}
+    if methods == {"ocr"}:
+        content_format = "pdf_ocr"
+    elif "ocr" in methods:
+        content_format = "pdf_mixed"
+    else:
+        content_format = "pdf_text"
+    captured.status = "full"
+    captured.content_format = content_format
+    captured.pages = pages
+    captured.clean_content = "\n".join(
+        f"【第{row['page']}页】\n{row['text']}" for row in pages
+    )
+    captured.failure_reason = None
+    captured.failure_stage = None
+    captured.message = f"已从官方查看器内存读取并解析 {len(pages)} 页 PDF 正文"
+    return captured
 
 
 async def _launch_public_browser(playwright, *, headless: bool = True):
@@ -560,14 +896,6 @@ async def _collect_public_pdf_detail(
                     failure_stage="navigation",
                 )
             lower = body.lower()
-            if not headless:
-                return PublicPdfDetail(
-                    status="needs_human_verification",
-                    detail_url=detail_url,
-                    message=f"{timeout_ms // 1000} 秒内未检测到公告 PDF，请完成官方验证",
-                    failure_reason="verification_timeout",
-                    failure_stage="outer_page",
-                )
             if any(marker.lower() in lower for marker in _VERIFY_MARKERS):
                 return PublicPdfDetail(
                     status="needs_human_verification",
@@ -578,10 +906,10 @@ async def _collect_public_pdf_detail(
                 )
             if _normalise_identity(expected_title) not in _normalise_identity(body):
                 return PublicPdfDetail(
-                    status="needs_human_verification",
+                    status="metadata_only",
                     detail_url=detail_url,
-                    message="站点安全策略未放行公告详情，需在专用浏览器完成验证",
-                    failure_reason="verification_required",
+                    message="官方 SPA 未返回当前公告详情，未发现明确验证码或限流证据",
+                    failure_reason="outer_detail_unavailable",
                     failure_stage="outer_page",
                 )
             return PublicPdfDetail(
@@ -624,10 +952,9 @@ async def _collect_public_pdf_detail(
         pdf_query = parse_qs(urlparse(pdf_frame.url).query).get("file", [None])[0]
         pdf_url = unquote(pdf_query) if pdf_query else None
 
+        document_page_count = 0
+        bytes_failure_reason: str | None = None
         try:
-            # iframe 元素出现时 PDF.js 可能仍在初始化。过早读取会得到空数组，
-            # 随后退到 DOM 文字层；该文字层会把日期数字、表格值和标签拆开。
-            # 优先等待官方阅读器已经持有完整文档对象，再读取逐页文本对象。
             await pdf_frame.wait_for_function(
                 "() => (window.PDFViewerApplication?.pdfDocument?.numPages || 0) > 0",
                 timeout=min(timeout_ms, 20_000),
@@ -637,6 +964,44 @@ async def _collect_public_pdf_detail(
                     "() => window.PDFViewerApplication?.pdfDocument?.numPages || 0"
                 )
             )
+        except Exception:  # noqa: BLE001
+            document_page_count = 0
+
+        if document_page_count:
+            pdf_bytes, memory_page_count, bytes_failure_reason = await _read_loaded_pdf_bytes(
+                pdf_frame,
+                timeout_ms=timeout_ms,
+                max_bytes=get_settings().cebpub_pdf_max_bytes_mb * 1024 * 1024,
+            )
+            if pdf_bytes:
+                return PublicPdfDetail(
+                    status="captured",
+                    detail_url=detail_url,
+                    pdf_url=pdf_url,
+                    message="已从官方 PDF.js 查看器取得文档字节，等待本地解析",
+                    validation_signals={
+                        "uuid_match": id_ok,
+                        "outer_title_match": title_ok,
+                    },
+                    acquisition_path="pdfjs_memory_bytes",
+                    document_page_count=memory_page_count or document_page_count,
+                    document_bytes=pdf_bytes,
+                )
+            if bytes_failure_reason == "pdf_too_large":
+                return PublicPdfDetail(
+                    status="metadata_only",
+                    detail_url=detail_url,
+                    pdf_url=pdf_url,
+                    message="PDF 超过本机安全大小上限，未读取正文",
+                    failure_reason="pdf_too_large",
+                    failure_stage="pdf_bytes",
+                    acquisition_path="pdfjs_memory_bytes",
+                    document_page_count=document_page_count,
+                )
+
+        try:
+            # Only fall back to the viewer's text objects when the already
+            # loaded document bytes cannot be obtained.
             raw_pages = await pdf_frame.evaluate(
                 """async () => {
                 const doc = window.PDFViewerApplication?.pdfDocument;
@@ -705,13 +1070,15 @@ async def _collect_public_pdf_detail(
         else:
             content_format = "pdf_text"
         if not pages:
+            reason = bytes_failure_reason or "content_unavailable"
             return PublicPdfDetail(
                 status="metadata_only",
                 detail_url=detail_url,
                 pdf_url=pdf_url,
-                message="PDF 无可用文本层，且本地 OCR 不可用或未识别到文字",
-                failure_reason="content_unavailable",
-                failure_stage="pdf_pages",
+                message="PDF.js 未提供可用文档字节或完整文字层",
+                failure_reason=reason,
+                failure_stage=_FAILURE_STAGES.get(reason, "pdf_pages"),
+                acquisition_path="pdfjs_text_layer_fallback",
             )
         if missing_numbers:
             missing = "、".join(str(number) for number in sorted(missing_numbers))
@@ -756,6 +1123,7 @@ async def _collect_public_pdf_detail(
             pdf_url=pdf_url,
             message=f"已验证并读取 {len(pages)} 页 PDF 正文",
             validation_signals=validation_signals,
+            acquisition_path="pdfjs_text_layer_fallback",
         )
     except Exception as exc:  # noqa: BLE001
         logger.info("public PDF detail unavailable for %s: %s", expected_id, exc)
@@ -787,10 +1155,26 @@ async def _fetch_managed_public_pdf_detail(
     last_result: PublicPdfDetail | None = None
     started_at = time.monotonic()
     attempt_count = 0
-    for browser_attempt in range(2):
+    retryable_reasons = {
+        "outer_detail_unavailable",
+        "pdf_not_loaded",
+        "pdf_not_ready",
+        "pdf_document_unavailable",
+        "pdf_bytes_timeout",
+        "collector_timeout",
+        "identity_mismatch",
+        "pdf_title_mismatch",
+        "incomplete_pdf_pages",
+    }
+
+    for collection_attempt in range(2):
         try:
+            captured: PublicPdfDetail
             async with broker.acquire(interactive=not headless) as lease:
-                page = lease.page
+                if collection_attempt and hasattr(broker, "replace_page"):
+                    page = await broker.replace_page(lease)
+                else:
+                    page = lease.page
                 blocked_statuses: set[int] = set()
 
                 def remember_blocked_response(response) -> None:
@@ -804,83 +1188,83 @@ async def _fetch_managed_public_pdf_detail(
                 listener_supported = hasattr(page, "on") and hasattr(
                     page, "remove_listener"
                 )
-                for page_attempt in range(2):
-                    if listener_supported:
-                        page.on("response", remember_blocked_response)
-                    attempt_count += 1
+                if listener_supported:
+                    page.on("response", remember_blocked_response)
+                attempt_count += 1
+                try:
                     try:
-                        try:
-                            result = await asyncio.wait_for(
-                                _collect_public_pdf_detail(
-                                    page,
-                                    detail_url=detail_url,
-                                    expected_id=expected_id,
-                                    expected_title=expected_title,
-                                    expected_project_code=expected_project_code,
-                                    timeout_ms=timeout_ms,
-                                    headless=headless,
-                                ),
-                                timeout=max(15, timeout_ms / 1000 + 5),
-                            )
-                        except TimeoutError:
-                            result = PublicPdfDetail(
-                                status="metadata_only",
+                        captured = await asyncio.wait_for(
+                            _collect_public_pdf_detail(
+                                page,
                                 detail_url=detail_url,
-                                message=(
-                                    "PDF 内容流在采集时限内未完成，已释放工作页，"
-                                    "后续公告继续采集"
-                                ),
-                                failure_reason="collector_timeout",
-                                failure_stage="pdf_pages",
-                            )
-                    finally:
-                        if listener_supported:
-                            try:
-                                page.remove_listener("response", remember_blocked_response)
-                            except Exception:  # noqa: BLE001
-                                pass
-                    result.attempt_count = attempt_count
-                    result.duration_ms = int((time.monotonic() - started_at) * 1000)
-                    result.acquisition_mode = "managed_chrome"
-                    result.browser_reused = lease.reused
-                    if blocked_statuses and result.status != "full":
-                        result.site_blocked = True
-                        result.failure_reason = "site_rate_limited"
-                        result.failure_stage = "navigation"
-                        result.message = (
-                            f"官方站点返回 {min(blocked_statuses)}，本次详情未继续读取"
+                                expected_id=expected_id,
+                                expected_title=expected_title,
+                                expected_project_code=expected_project_code,
+                                timeout_ms=timeout_ms,
+                                headless=headless,
+                            ),
+                            timeout=max(15, timeout_ms / 1000 + 5),
                         )
-                    # 返回发生在租约退出之前，此刻内部状态仍是 busy；对调用方
-                    # 应报告本次操作完成后的可用状态，避免成功响应看起来仍在跑。
-                    result.browser_state = (
-                        "ready" if broker.is_connected else "unavailable"
+                    except TimeoutError:
+                        captured = PublicPdfDetail(
+                            status="metadata_only",
+                            detail_url=detail_url,
+                            message=(
+                                "官方查看器在采集时限内未返回文档，已释放工作页并退避重试"
+                            ),
+                            failure_reason="collector_timeout",
+                            failure_stage="pdf_frame",
+                        )
+                finally:
+                    if listener_supported:
+                        try:
+                            page.remove_listener("response", remember_blocked_response)
+                        except Exception:  # noqa: BLE001
+                            pass
+
+                captured.browser_reused = lease.reused
+                if blocked_statuses and captured.status != "full":
+                    captured.document_bytes = None
+                    captured.site_blocked = True
+                    captured.status = "needs_human_verification"
+                    captured.failure_reason = "site_rate_limited"
+                    captured.failure_stage = "navigation"
+                    captured.message = (
+                        f"官方站点返回 {min(blocked_statuses)}，本次详情未继续读取"
                     )
-                    last_result = result
-                    if result.failure_reason == "browser_closed":
-                        raise RuntimeError("managed public browser page closed")
-                    if result.status == "full":
-                        return result
-                    if result.status == "needs_human_verification":
-                        broker.mark_needs_verification()
-                        result.browser_state = "needs_verification"
-                        return result
-                    if result.failure_reason in {
-                        "identity_mismatch",
-                        "pdf_title_mismatch",
-                        "incomplete_pdf_pages",
-                    } and page_attempt == 0:
-                        page = await broker.replace_page(lease)
-                        continue
-                    if result.failure_reason in {
-                        "identity_mismatch",
-                        "pdf_title_mismatch",
-                        "incomplete_pdf_pages",
-                        "site_rate_limited",
-                    }:
-                        return result
-                    return result
-                if broker.is_connected:
-                    return last_result
+
+            # PDF 字节已经复制到本机内存。先退出浏览器租约、释放标签页，
+            # 再执行坐标文本恢复、OCR 和身份校验，避免本地解析占住浏览器池。
+            if captured.status == "captured":
+                captured = await _finalise_captured_pdf(
+                    captured,
+                    expected_title=expected_title,
+                    expected_project_code=expected_project_code,
+                )
+
+            captured.attempt_count = attempt_count
+            captured.duration_ms = int((time.monotonic() - started_at) * 1000)
+            captured.acquisition_mode = "managed_chrome"
+            captured.browser_state = (
+                "ready" if broker.is_connected else "unavailable"
+            )
+            last_result = captured
+
+            if captured.failure_reason == "browser_closed":
+                raise RuntimeError("managed public browser page closed")
+            if captured.status == "full":
+                return captured
+            if captured.status == "needs_human_verification":
+                broker.mark_needs_verification()
+                captured.browser_state = "needs_verification"
+                return captured
+            if (
+                collection_attempt == 0
+                and captured.failure_reason in retryable_reasons
+            ):
+                await asyncio.sleep(0.35)
+                continue
+            return captured
         except ManagedPublicBrowserError as exc:
             return PublicPdfDetail(
                 status="needs_human_verification" if not headless else "metadata_only",
@@ -910,7 +1294,8 @@ async def _fetch_managed_public_pdf_detail(
                 attempt_count=attempt_count,
                 duration_ms=int((time.monotonic() - started_at) * 1000),
             )
-            if browser_attempt == 0:
+            if collection_attempt == 0:
+                await asyncio.sleep(0.35)
                 continue
             return last_result
     return last_result or PublicPdfDetail(
@@ -944,6 +1329,7 @@ async def _fetch_legacy_public_pdf_detail(
             message="Playwright 未安装，无法读取 PDF.js 详情",
             failure_reason="playwright_missing",
         )
+    captured: PublicPdfDetail
     async with async_playwright() as playwright:
         browser = None
         try:
@@ -953,7 +1339,7 @@ async def _fetch_legacy_public_pdf_detail(
             )
             page = await context.new_page()
             try:
-                return await _collect_public_pdf_detail(
+                captured = await _collect_public_pdf_detail(
                     page,
                     detail_url=detail_url,
                     expected_id=expected_id,
@@ -967,6 +1353,13 @@ async def _fetch_legacy_public_pdf_detail(
         finally:
             if browser is not None:
                 await browser.close()
+    if captured.status == "captured":
+        captured = await _finalise_captured_pdf(
+            captured,
+            expected_title=expected_title,
+            expected_project_code=expected_project_code,
+        )
+    return captured
 
 
 async def fetch_public_pdf_detail(

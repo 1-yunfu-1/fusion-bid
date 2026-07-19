@@ -16,6 +16,10 @@ dependencies = [
     "python-dotenv>=1.0.0",
     "python-multipart>=0.0.12",
     "pypdf>=5.0.0",
+    "PyMuPDF>=1.24.0",
+    "Pillow>=11.0.0",
+    "rapidocr>=3.9.0",
+    "onnxruntime>=1.24.0",
     "dateparser>=1.2.0",
     "beautifulsoup4>=4.12.0",
     "lxml>=5.3.0",
@@ -34,10 +38,6 @@ dev = [
 ]
 full = [
     "playwright>=1.61.0",
-    "PyMuPDF>=1.24.0",
-    "Pillow>=11.0.0",
-    "rapidocr>=3.9.0",
-    "onnxruntime>=1.24.0",
 ]
 
 [build-system]

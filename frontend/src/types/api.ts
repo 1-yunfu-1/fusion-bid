@@ -19,6 +19,16 @@ export interface HealthResponse {
     active_workers?: number;
     queue_size?: number;
     adaptive_mode?: boolean;
+    pdf_pipeline?: {
+      memory_pdf_bytes?: boolean;
+      text_parser?: boolean;
+      rasterizer?: boolean;
+      ocr_engine?: boolean;
+      text_ready?: boolean;
+      scanned_pdf_ready?: boolean;
+      parse_concurrency?: number;
+      ocr_concurrency?: number;
+    };
   };
   message: string;
 }

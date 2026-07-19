@@ -8,7 +8,7 @@ from bs4 import BeautifulSoup
 from app.cleaners.filters import FilterContext, filter_list_item
 from app.cleaners.html_cleaner import clean_html_to_text, extract_attachment_links
 from app.sources.base import ListItem
-from app.sources.ccgp_source import CcgpSource, _parse_publish
+from app.sources.ccgp_source import CcgpSource, _parse_publish, _region_from_list_part
 
 
 SAMPLE_LIST_HTML = """
@@ -55,6 +55,13 @@ def test_parse_list_structure():
     assert pub.year == 2026
 
 
+def test_region_parser_rejects_purchaser_label_containing_province_name():
+    assert _region_from_list_part("采购人：安徽省产品质量监督检验研究院") is None
+    assert _region_from_list_part("代理机构：安徽省招标集团股份有限公司") is None
+    assert _region_from_list_part("安徽省") == "安徽省"
+    assert _region_from_list_part("行政区域：合肥市") == "合肥市"
+
+
 def test_clean_and_attachments():
     text = clean_html_to_text(SAMPLE_DETAIL_HTML)
     assert "网站导航" not in text
@@ -64,6 +71,58 @@ def test_clean_and_attachments():
         SAMPLE_DETAIL_HTML, base_url="http://www.ccgp.gov.cn/cggg/x.htm"
     )
     assert any(x.endswith(".pdf") for x in links)
+
+
+def test_cleaner_survives_descendants_of_decomposed_nodes():
+    html = """
+    <html><body>
+      <script><span class="menu">invalid child</span></script>
+      <iframe><div id="header">invalid frame child</div></iframe>
+      <div class="vF_detail_content">
+        <h1>服务器采购公告</h1>
+        <p>采购人：测试单位</p>
+        <p>资格要求：具备独立法人资格并具有履约能力。</p>
+      </div>
+    </body></html>
+    """
+
+    text = clean_html_to_text(html)
+
+    assert "invalid child" not in text
+    assert "invalid frame child" not in text
+    assert "采购人：测试单位" in text
+
+
+def test_cleaner_preserves_ccgp_article_wrapped_in_large_form():
+    paragraphs = "".join(
+        f"<p>{index}. 公告正文：服务器采购项目资格与成交信息。</p>"
+        for index in range(20)
+    )
+    html = f"""
+    <html><body>
+      <div class="vF_detail_content_container">
+        <div class="vF_detail_main">
+          <div class="table">
+            <table><tr><td>采购单位</td><td>测试采购单位</td></tr></table>
+          </div>
+          <div class="vF_detail_content">
+            <form id="aspnetForm">
+              <h1>服务器采购项目结果公告</h1>
+              {paragraphs}
+            </form>
+          </div>
+        </div>
+      </div>
+      <form class="search"><input name="keyword"><button>搜索</button></form>
+    </body></html>
+    """
+
+    text = clean_html_to_text(html)
+
+    assert "服务器采购项目结果公告" in text
+    assert "采购单位\n测试采购单位" in text
+    assert len(text) > 200
+    assert "搜索" not in text
 
 
 def test_filter_list_item_keyword_region():

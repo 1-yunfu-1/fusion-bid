@@ -51,6 +51,29 @@ def test_pdf_qualification_numbers_need_no_space_before_chinese_text():
     ]
 
 
+def test_chinese_numbered_section_stops_qualification_before_next_chapter():
+    content = """
+四、投标人资格要求
+1、依法注册并具有履约能力
+2、本项目不接受联合体投标
+五、招标文件获取方式
+1、登录交易平台下载招标文件
+六、投标截止时间
+""".strip()
+
+    fields = build_extraction_data(
+        title="数据采集服务器采购项目招标公告",
+        clean_content=content,
+        detail_status="full",
+    )["fields"]
+
+    assert fields["qualification_items"] == [
+        "1、 依法注册并具有履约能力",
+        "2、 本项目不接受联合体投标",
+    ]
+    assert "招标文件获取方式" not in fields["qualification"]
+
+
 SAMPLE = """
 【第1页】
 服务器、数据库、数据库集群软件招标公告
@@ -133,6 +156,155 @@ def test_missing_detail_is_not_reported_as_originally_unspecified():
     assert enriched["completeness"]["label"].startswith("不可评估")
 
 
+def test_purchasing_subject_context_is_not_misclassified_as_agency():
+    content = (
+        '询价公示\n安徽智质工程技术有限公司（以下，简称"智质公司"）'
+        "根据生产需要，拟采购云服务器租赁，现开展询比价工作。"
+    )
+
+    fields = build_extraction_data(
+        title="云服务器租赁及DNS解析",
+        clean_content=content,
+        detail_status="full",
+        source_metadata={"content_pages": [{"page": 1, "text": content}]},
+    )["fields"]
+
+    assert fields["purchaser"] == "安徽智质工程技术有限公司"
+    assert fields["purchaser_source_label"] == "拟采购主体"
+    assert fields["agency"] == "原文未明确说明"
+
+
+def test_ai_agency_requires_agency_or_entrustment_semantics_in_quote():
+    content = (
+        '安徽智质工程技术有限公司（以下，简称"智质公司"）'
+        "根据生产需要，拟采购云服务器租赁。"
+    )
+    rows, errors = _validate_ai_extraction_rows(
+        {
+            "fields": [
+                {
+                    "name": "agency",
+                    "value": "安徽智质工程技术有限公司",
+                    "source_label": "询价公示",
+                    "quote": content,
+                    "page": 1,
+                }
+            ]
+        },
+        clean_content=content,
+        source_metadata={"content_pages": [{"page": 1, "text": content}]},
+    )
+
+    assert rows == []
+    assert any("不含代理/招标机构或受托语义" in error for error in errors)
+
+
+def test_ccgp_overview_names_override_generic_information_headings():
+    content = """
+采购人
+信息
+采购单位
+中国医科大学附属盛京医院
+采购代理机构信息
+名称
+代理机构名称
+辽宁省公共资源交易中心(辽宁省政府采购中心)
+""".strip()
+
+    fields = build_extraction_data(
+        title="服务器及存储设备项目中标公告",
+        clean_content=content,
+        detail_status="full",
+    )["fields"]
+
+    assert fields["purchaser"] == "中国医科大学附属盛京医院"
+    assert fields["purchaser_source_label"] == "采购单位"
+    assert fields["agency"] == "辽宁省公共资源交易中心(辽宁省政府采购中心)"
+
+
+def test_ccgp_detail_beats_label_only_summary_and_extracts_wrapped_fields():
+    content = """
+公告概要：
+采购项目名称
+安徽省产品质量监督检验研究院服务器采购项目
+采购单位
+安徽省产品质量监督检验研究院
+行政区域
+安徽省
+采购单位联系方式
+/
+代理机构名称
+安徽省招标集团股份有限公司
+二、申请人的资格要求：
+1.
+满足《中华人民共和国政府采购法》第二十二条规定。
+2.
+落实政府采购政策需满足的资格要求：无。
+3.
+本项目的特定资格要求：无。
+三、获取招标文件
+四、提交投标文件
+截止时间、开标时间和地点
+时间：
+2026
+年
+8
+月
+7
+日
+10
+点
+00
+分（北京时间）
+""".strip()
+    summary = """
+采购项目名称
+采购单位
+获取招标文件的地点
+采购单位
+采购单位地址
+采购单位联系方式
+""".strip()
+
+    fields = build_extraction_data(
+        title="安徽省产品质量监督检验研究院服务器采购项目招标公告",
+        summary=summary,
+        clean_content=content,
+        region="采购人：安徽省产品质量监督检验研究院",
+        detail_status="full",
+    )["fields"]
+
+    assert fields["purchaser"] == "安徽省产品质量监督检验研究院"
+    assert fields["purchaser_source_label"] == "采购单位"
+    assert fields["agency"] == "安徽省招标集团股份有限公司"
+    assert fields["region"] == "安徽省"
+    assert fields["project_name"] == "安徽省产品质量监督检验研究院服务器采购项目"
+    assert len(fields["qualification_items"]) == 3
+    assert fields["bid_deadline"] == "2026年8月7日 10:00"
+    assert fields["opening_time"] == "2026年8月7日 10:00"
+
+
+def test_ai_entity_placeholder_is_rejected_even_with_exact_quote():
+    content = "采购人\n/\n采购单位\n安徽省产品质量监督检验研究院"
+    rows, errors = _validate_ai_extraction_rows(
+        {
+            "fields": [
+                {
+                    "name": "purchaser",
+                    "value": "/",
+                    "source_label": "采购人",
+                    "quote": "采购人\n/",
+                }
+            ]
+        },
+        clean_content=content,
+        source_metadata=None,
+    )
+
+    assert rows == []
+    assert any("占位符" in error for error in errors)
+
+
 def test_ai_value_without_exact_source_evidence_is_rejected():
     valid, errors = _validate_ai_extraction_rows(
         {
@@ -176,6 +348,7 @@ def test_ai_purchaser_requires_real_source_label():
 
 def test_subject_label_priority_prefers_tenderer_over_project_owner():
     assert _subject_label_rank("采购人") > _subject_label_rank("招标人")
+    assert _subject_label_rank("采购单位") == _subject_label_rank("采购人")
     assert _subject_label_rank("招标人") > _subject_label_rank("项目业主")
 
 
@@ -367,6 +540,31 @@ C1100000189017141002001 服务器、数据库、数据库集群软件 1.000 套 
     assert fields["document_acquisition_end"] == "2026年7月23日 22:00"
     assert fields["bid_deadline"] == "2026年8月6日 14:00"
     assert fields["opening_time"] == "2026年8月6日 14:00"
+
+
+def test_real_style_numbered_deadline_agency_and_started_range_are_extracted():
+    content = """
+五、招标文件获取方式
+1、有意向的潜在投标人，可自2026年7月16日起至2026年7月22日23:59止（北京时间），登录平台获取招标文件。
+六、投标截止时间、文件递交地点
+1、投标截止时间：2026年7月29日15时00分（北京时间）
+八、联系方式
+2、招标机构：安徽省皖北煤电集团有限责任公司招标中心（以下简称“招标中心”）
+招标人：安徽恒源煤电股份有限公司供应分公司
+""".strip()
+
+    fields = build_extraction_data(
+        title="数据采集服务器采购项目招标公告",
+        clean_content=content,
+        detail_status="full",
+        source_metadata={"content_pages": [{"page": 1, "text": content}]},
+    )["fields"]
+
+    assert fields["purchaser"] == "安徽恒源煤电股份有限公司供应分公司"
+    assert fields["agency"] == "安徽省皖北煤电集团有限责任公司招标中心"
+    assert fields["document_acquisition_start"] == "2026年7月16日"
+    assert fields["document_acquisition_end"] == "2026年7月22日 23:59"
+    assert fields["bid_deadline"] == "2026年7月29日 15:00"
 
 
 class _FakeLayer:

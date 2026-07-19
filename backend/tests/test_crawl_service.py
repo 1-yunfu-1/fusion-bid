@@ -13,6 +13,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_asyn
 from app.core.database import Base
 from app.models.task import SearchTask
 from app.models.delivery import DeliveryHistory
+from app.models.announcement import TenderAnnouncement
 from app.services import crawl_service
 from app.sources.base import DetailResult, HealthResult, ListItem, SearchQuery, TenderSourceAdapter
 
@@ -527,5 +528,139 @@ async def test_cebpub_site_block_downgrades_then_marks_remaining_not_attempted(
         assert stats.effective_concurrency["cebpub_adaptive"] is True
         assert stats.effective_concurrency["cebpub_circuit_open"] is True
         assert execution.status == "partial"
+
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_failed_current_detail_preserves_and_labels_cached_full_text(
+    monkeypatch, tmp_path
+):
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    factory = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+
+    class CachedFailureSource(TenderSourceAdapter):
+        source_name = "cached_source"
+        requires_login = False
+        enabled = True
+
+        async def health_check(self) -> HealthResult:
+            return HealthResult(ok=True)
+
+        async def search(self, _query: SearchQuery) -> list[ListItem]:
+            return [
+                ListItem(
+                    title="安徽省服务器采购项目招标公告",
+                    source_url="https://example.com/cached-a1",
+                    source_item_id="a1",
+                    publish_time=datetime(2026, 6, 1, tzinfo=TZ),
+                    region="安徽省",
+                    snippet="安徽省服务器招标",
+                )
+            ]
+
+        async def fetch_detail(
+            self, item: ListItem, *, interactive: bool = False
+        ) -> DetailResult:
+            return DetailResult(
+                title=item.title,
+                source_url=item.source_url,
+                publish_time=item.publish_time,
+                region=item.region,
+                clean_content="安徽省服务器招标（仅列表元数据）",
+                detail_fetched=False,
+                detail_status="metadata_only",
+                source_metadata={
+                    "detail_attempt_state": "attempted",
+                    "failure_reason": "outer_detail_unavailable",
+                    "failure_stage": "outer_page",
+                    "message": "官方外层页暂未返回详情",
+                    "attempt_count": 2,
+                    "duration_ms": 1200,
+                },
+            )
+
+        async def extract_attachments(self, _detail: DetailResult) -> list[str]:
+            return []
+
+    monkeypatch.setattr(
+        crawl_service,
+        "build_sources",
+        lambda only_enabled=True: [CachedFailureSource()],
+    )
+
+    def fake_report(*_args, **_kwargs):
+        path = tmp_path / "cached.docx"
+        path.write_bytes(b"docx")
+        return path
+
+    monkeypatch.setattr(crawl_service, "generate_report_file", fake_report)
+
+    async with factory() as db:
+        historical_content = "招标人：历史已核验单位\n资格要求：具备服务器项目能力"
+        existing = TenderAnnouncement(
+            title="安徽省服务器采购项目招标公告",
+            source_name="cached_source",
+            source_url="https://example.com/cached-a1",
+            source_item_id="a1",
+            data_mode="live",
+            publish_time=datetime(2026, 6, 1, tzinfo=TZ),
+            region="安徽省",
+            clean_content=historical_content,
+            raw_content=historical_content,
+            detail_status="full",
+            content_format="html",
+            source_metadata={"detail_status": "full", "detail_fetched": True},
+            extraction_data={},
+            attachment_links=[],
+            content_hash="historical-full-hash",
+            deduplication_key="cached_source:a1",
+            is_primary=True,
+            crawl_time=datetime(2026, 6, 1, tzinfo=TZ),
+            first_seen_at=datetime(2026, 6, 1, tzinfo=TZ),
+            last_seen_at=datetime(2026, 6, 1, tzinfo=TZ),
+        )
+        task = SearchTask(
+            original_query="安徽省服务器招标",
+            keywords=["服务器"],
+            regions=["安徽省"],
+            start_date=date(2026, 5, 1),
+            end_date=date(2026, 7, 17),
+            status="confirmed",
+        )
+        db.add_all([existing, task])
+        await db.commit()
+        await db.refresh(task)
+
+        execution, stats = await crawl_service.execute_search_task(
+            db, task, max_details_per_source=1
+        )
+        saved = await db.scalar(
+            select(TenderAnnouncement).where(
+                TenderAnnouncement.source_item_id == "a1"
+            )
+        )
+
+        assert saved is not None
+        assert saved.detail_status == "full"
+        assert saved.clean_content == historical_content
+        assert saved.content_hash == "historical-full-hash"
+        assert saved.source_metadata["using_cached_full"] is True
+        assert saved.source_metadata["last_attempt"]["failure_reason"] == (
+            "outer_detail_unavailable"
+        )
+        assert stats.cached_full_reused_count == 1
+        assert stats.failure_breakdown_by_source == {
+            "cached_source": {"outer_detail_unavailable": 1}
+        }
+        assert stats.source_detail_breakdown == {
+            "cached_source": {"metadata_only": 1}
+        }
+        assert stats.output_items[0]["cached_full_reused"] is True
+        assert stats.output_items[0]["detail_fetched"] is True
+        assert stats.output_items[0]["current_attempt_detail_fetched"] is False
+        assert execution.crawl_diagnostics["cached_full_reused_count"] == 1
 
     await engine.dispose()
