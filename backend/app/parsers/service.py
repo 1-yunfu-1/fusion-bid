@@ -8,6 +8,7 @@ from zoneinfo import ZoneInfo
 from app.core.config import get_settings
 from app.core.llm_runtime import effective_llm_settings
 from app.llm.client import parse_intent_llm_chain
+from app.parsers.regions import resolve_region_selection
 from app.parsers.rule_parser import parse_intent_by_rules
 from app.parsers.validator import suggestions_for, validate_intent
 from app.schemas.intent import ParseResponse, ParsedIntent
@@ -83,7 +84,9 @@ async def parse_user_query(
         if merged and parser_used in ("api", "ollama"):
             parser_used = "hybrid"
 
+    region_selection = resolve_region_selection(intent.regions)
     issues = validate_intent(intent, reference_time=now, timezone=settings.app_timezone)
+    intent.regions = region_selection.requested
     errors = [i for i in issues if i.severity == "error"]
     warnings = [i.message for i in issues if i.severity == "warning"]
     tips = suggestions_for(issues)
@@ -96,6 +99,8 @@ async def parse_user_query(
         channel_notes.append(f"大模型不可用已降级规则解析：{llm_error}")
     else:
         channel_notes.append("未启用大模型，使用规则解析")
+    if region_selection.scope == "nationwide":
+        channel_notes.append("已识别为全国范围，不进行地区过滤")
 
     return ParseResponse(
         intent=intent,

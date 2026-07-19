@@ -16,11 +16,13 @@ from zoneinfo import ZoneInfo
 from bs4 import BeautifulSoup
 
 from app.cleaners.html_cleaner import clean_html_to_text, extract_attachment_links
+from app.parsers.regions import resolve_region_selection
 from app.sources.base import (
     DetailResult,
     HealthResult,
     ListItem,
     SearchQuery,
+    SourceDetailError,
     TenderSourceAdapter,
 )
 from app.sources.http_util import HttpFetcher
@@ -47,6 +49,30 @@ def _parse_publish(text: str) -> datetime | None:
         return datetime(int(m.group(1)), int(m.group(2)), int(m.group(3)), tzinfo=TZ)
     except ValueError:
         return None
+
+
+def _region_from_list_part(value: str) -> str | None:
+    """Read a real location token without treating purchaser labels as regions."""
+    part = re.sub(r"\s+", " ", value or "").strip()
+    if not part or len(part) >= 40:
+        return None
+    labelled = re.match(r"^(?:行政区域|行政区划|地区|区域)\s*[：:]\s*(.+)$", part)
+    if labelled:
+        part = labelled.group(1).strip()
+    elif "：" in part or ":" in part:
+        return None
+    if any(token in part for token in ("省", "市", "区", "县")):
+        return part
+    return None
+
+
+def _region_from_detail_text(text: str) -> str | None:
+    match = re.search(
+        r"(?m)^\s*(?:行政区域|行政区划)\s*(?:[：:]\s*|\n\s*)"
+        r"(?P<value>[^\n，,。；;]{2,40})\s*$",
+        text or "",
+    )
+    return _region_from_list_part(match.group("value")) if match else None
 
 
 class CcgpSource(TenderSourceAdapter):
@@ -123,8 +149,9 @@ class CcgpSource(TenderSourceAdapter):
             "agentName": "",
         }
         # 区域：放入 displayZone 文本检索辅助
-        if query.regions:
-            params["displayZone"] = query.regions[0].replace("省", "").replace("市", "")
+        effective_regions = resolve_region_selection(query.regions).effective
+        if effective_regions:
+            params["displayZone"] = effective_regions[0].replace("省", "").replace("市", "")
 
         try:
             html = await self.fetcher.get_text(SEARCH_URL, params=params)
@@ -159,8 +186,9 @@ class CcgpSource(TenderSourceAdapter):
                 if parts:
                     publish = _parse_publish(parts[0])
                 for part in parts[1:]:
-                    if any(x in part for x in ("省", "市", "区", "县")) and len(part) < 40:
-                        region = part
+                    parsed_region = _region_from_list_part(part)
+                    if parsed_region:
+                        region = parsed_region
                         break
             item_id = hashlib.md5(url.encode("utf-8")).hexdigest()
             results.append(
@@ -182,9 +210,26 @@ class CcgpSource(TenderSourceAdapter):
         try:
             html = await self.fetcher.get_text(item.source_url)
         except Exception as exc:  # noqa: BLE001
-            raise RuntimeError(f"详情抓取失败: {exc}") from exc
-        clean = clean_html_to_text(html)
-        atts = extract_attachment_links(html, base_url=item.source_url)
+            raise SourceDetailError(
+                f"详情抓取失败: {type(exc).__name__}",
+                reason="http_detail_fetch_failure",
+                stage="http_detail",
+            ) from exc
+        try:
+            clean = clean_html_to_text(html)
+            atts = extract_attachment_links(html, base_url=item.source_url)
+        except Exception as exc:  # noqa: BLE001
+            raise SourceDetailError(
+                f"详情页面解析失败: {type(exc).__name__}",
+                reason="html_parse_failure",
+                stage="html_parse",
+            ) from exc
+        if len(clean.strip()) < 40:
+            raise SourceDetailError(
+                "详情页面未包含足够的公告正文",
+                reason="html_content_empty",
+                stage="html_parse",
+            )
         pub = item.publish_time
         # 尝试从正文提时间
         if pub is None:
@@ -193,7 +238,7 @@ class CcgpSource(TenderSourceAdapter):
             title=item.title,
             source_url=item.source_url,
             publish_time=pub,
-            region=item.region,
+            region=_region_from_detail_text(clean) or item.region,
             raw_content=html[:200000],
             clean_content=clean,
             attachment_links=atts,

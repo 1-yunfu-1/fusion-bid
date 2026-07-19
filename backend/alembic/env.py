@@ -126,6 +126,10 @@ def do_run_migrations(connection: Connection) -> None:
     )
     with context.begin_transaction():
         context.run_migrations()
+    # SQLite DDL 会立即生效，但通过异步连接运行时，alembic_version 的 UPDATE
+    # 仍可能留在隐式事务中并在连接关闭时回滚。显式提交保证结构与版本标识一致。
+    if connection.in_transaction():
+        connection.commit()
 
 
 async def run_async_migrations() -> None:

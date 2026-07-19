@@ -15,6 +15,7 @@ from app.core.config import get_settings
 from app.core.database import get_db
 from app.models.execution import TaskExecution
 from app.models.task import SearchTask
+from app.parsers.regions import resolve_region_selection
 from app.parsers.validator import validate_intent
 from app.schemas.task import (
     TaskExecuteRequest,
@@ -74,6 +75,7 @@ async def update_task(
     now = datetime.now(ZoneInfo(settings.app_timezone))
     intent = body.intent
     issues = validate_intent(intent, reference_time=now, timezone=settings.app_timezone)
+    intent.regions = resolve_region_selection(intent.regions).requested
     errors = [i for i in issues if i.severity == "error"]
     hard = [e for e in errors if e.code in ("expired_schedule", "conflicting_dates")]
     if hard:
@@ -173,12 +175,16 @@ async def execute_task(
         trigger_type = body.trigger_type if body else "manual"
         report_mode = body.report_mode if body else "incremental"
         report_scope = "snapshot" if report_mode == "full_snapshot" else "incremental"
+        search_depth = body.search_depth if body else "standard"
+        refresh_extraction = body.refresh_extraction if body else False
         execution, stats = await execute_search_task(
             db,
             task,
             trigger_type=trigger_type,
             report_mode=report_mode,
             report_scope=report_scope,
+            search_depth=search_depth,
+            refresh_extraction=refresh_extraction,
         )
         # 接口语义以当次请求为准；同时保留 report_scope 供旧客户端读取。
         execution.report_mode = report_mode
@@ -215,6 +221,36 @@ async def execute_task(
             detail_human_verification_count=getattr(
                 stats, "detail_human_verification_count", 0
             ),
+            detail_not_attempted_count=getattr(
+                stats, "detail_not_attempted_count", 0
+            ),
+            cached_full_reused_count=getattr(
+                stats, "cached_full_reused_count", 0
+            ),
+            failure_breakdown=getattr(stats, "failure_breakdown", {}),
+            failure_breakdown_by_source=getattr(
+                stats, "failure_breakdown_by_source", {}
+            ),
+            source_detail_breakdown=getattr(
+                stats, "source_detail_breakdown", {}
+            ),
+            stage_durations_ms=getattr(stats, "stage_durations_ms", {}),
+            effective_concurrency=getattr(stats, "effective_concurrency", {}),
+            requested_regions=getattr(stats, "requested_regions", []),
+            effective_regions=getattr(stats, "effective_regions", []),
+            region_scope=getattr(stats, "region_scope", "restricted"),
+            detail_cap=getattr(stats, "detail_cap", 30),
+            detail_cap_skipped=getattr(stats, "detail_cap_skipped", 0),
+            coverage_status=getattr(stats, "coverage_status", "complete"),
+            search_depth=getattr(stats, "search_depth", search_depth),
+            extraction_cache_hit_count=getattr(
+                stats, "extraction_cache_hit_count", 0
+            ),
+            llm_call_count=getattr(stats, "llm_call_count", 0),
+            llm_timeout_count=getattr(stats, "llm_timeout_count", 0),
+            opportunity_count=getattr(stats, "opportunity_count", 0),
+            lifecycle_count=getattr(stats, "lifecycle_count", 0),
+            source_outcomes=getattr(stats, "source_outcomes", {}),
             filtered_out_count=stats.filtered_out_count,
             duplicate_count=stats.duplicate_count,
             cross_source_merge_count=stats.cross_source_merge_count,
@@ -340,6 +376,7 @@ async def list_executions(
     items: list[TaskExecutionItem] = []
     for e in rows:
         report_filename, report_download_url = _report_fields(e.report_path)
+        diagnostics = getattr(e, "crawl_diagnostics", None) or {}
         items.append(
             TaskExecutionItem(
                 id=e.id,
@@ -364,6 +401,70 @@ async def list_executions(
                 detail_human_verification_count=getattr(
                     e, "detail_human_verification_count", 0
                 ),
+                detail_not_attempted_count=int(
+                    diagnostics.get("detail_not_attempted_count") or 0
+                ),
+                cached_full_reused_count=int(
+                    diagnostics.get("cached_full_reused_count") or 0
+                ),
+                failure_breakdown=dict(diagnostics.get("failure_breakdown") or {}),
+                failure_breakdown_by_source=dict(
+                    diagnostics.get("failure_breakdown_by_source") or {}
+                ),
+                source_detail_breakdown=dict(
+                    diagnostics.get("source_detail_breakdown") or {}
+                ),
+                stage_durations_ms=dict(diagnostics.get("stage_durations_ms") or {}),
+                effective_concurrency=dict(
+                    diagnostics.get("effective_concurrency") or {}
+                ),
+                requested_regions=list(diagnostics.get("requested_regions") or []),
+                effective_regions=list(diagnostics.get("effective_regions") or []),
+                region_scope=str(diagnostics.get("region_scope") or "restricted"),
+                detail_cap=int(
+                    diagnostics.get("detail_cap")
+                    or getattr(e, "detail_cap", 30)
+                    or 30
+                ),
+                detail_cap_skipped=int(
+                    diagnostics.get("detail_cap_skipped")
+                    or getattr(e, "detail_cap_skipped", 0)
+                    or 0
+                ),
+                coverage_status=str(
+                    diagnostics.get("coverage_status")
+                    or getattr(e, "coverage_status", "complete")
+                ),
+                search_depth=str(
+                    diagnostics.get("search_depth")
+                    or getattr(e, "search_depth", "standard")
+                ),
+                extraction_cache_hit_count=int(
+                    diagnostics.get("extraction_cache_hit_count")
+                    or getattr(e, "extraction_cache_hit_count", 0)
+                    or 0
+                ),
+                llm_call_count=int(
+                    diagnostics.get("llm_call_count")
+                    or getattr(e, "llm_call_count", 0)
+                    or 0
+                ),
+                llm_timeout_count=int(
+                    diagnostics.get("llm_timeout_count")
+                    or getattr(e, "llm_timeout_count", 0)
+                    or 0
+                ),
+                opportunity_count=int(
+                    diagnostics.get("opportunity_count")
+                    or getattr(e, "opportunity_count", 0)
+                    or 0
+                ),
+                lifecycle_count=int(
+                    diagnostics.get("lifecycle_count")
+                    or getattr(e, "lifecycle_count", 0)
+                    or 0
+                ),
+                source_outcomes=dict(diagnostics.get("source_outcomes") or {}),
                 report_filename=report_filename,
                 report_download_url=report_download_url,
                 analysis_status=(e.analysis_data or {}).get("status", "rule_only"),

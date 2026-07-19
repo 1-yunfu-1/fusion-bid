@@ -53,7 +53,7 @@ export default function AppLayout() {
     refetchInterval: 15000,
   });
   const apiCompatible = Boolean(
-    healthQuery.data?.capabilities?.includes("interactive-detail-recrawl-v1") &&
+    healthQuery.data?.capabilities?.includes("managed-public-browser-v1") &&
       healthQuery.data?.capabilities?.includes("official-document-import-v1"),
   );
   const {
@@ -123,7 +123,7 @@ export default function AppLayout() {
               showIcon
               style={{ marginBottom: 16 }}
               message="当前后端进程未加载详情采集新版本"
-              description="请使用 FusionBid 启动脚本安全重启服务。重启前已禁用自动重采和官方文件导入，避免旧接口继续生成缺少采购主体的结果。"
+              description="请使用 FusionBid 启动脚本安全重启服务。重启前已禁用全自动重采和官方文件导入，避免旧接口继续生成缺少采购主体的结果。"
             />
           ) : null}
           <Outlet />

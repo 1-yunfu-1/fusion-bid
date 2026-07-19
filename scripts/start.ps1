@@ -15,7 +15,8 @@ if ($portListener) {
         if ([string]$existingHealth.app -like "*FusionBid*") {
             if (
                 [string]$existingHealth.extraction_version -eq "v2" -and
-                [string]$existingHealth.database_revision -eq "20260718_0006"
+                [string]$existingHealth.database_revision -eq "20260718_0006" -and
+                $existingHealth.capabilities -contains "managed-public-browser-v1"
             ) {
                 Write-Host "FusionBid 已是当前版本，直接打开页面。" -ForegroundColor Green
                 Start-Process "http://127.0.0.1:8000/"
@@ -75,7 +76,7 @@ if (-not (Test-Path $venvPython)) {
 Write-Host "安装后端依赖..." -ForegroundColor Cyan
 Push-Location backend
 & $venvPython -m pip install -q -U pip
-& $venvPython -m pip install -q -e ".[dev]"
+& $venvPython -m pip install -q -e ".[dev,full]"
 & $venvPython -m alembic upgrade head
 Pop-Location
 

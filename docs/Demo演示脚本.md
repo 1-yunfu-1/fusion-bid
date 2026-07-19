@@ -149,7 +149,7 @@ cd F:\feishu\backend
 | 合规 | 限速、手动登录、不破解付费 |
 | 限制 | 网站改版/限流可能导致当次抓取变少 |
 | 代码 | 适配器分文件、可测、可 Docker Compose |
-| 测试 | `pytest` 97 项通过；外部站使用 mock/fixture，不高频访问 |
+| 测试 | 展示 `docs/测试报告.md` 最新结果；外部站使用 mock/fixture，不高频访问 |
 
 ---
 

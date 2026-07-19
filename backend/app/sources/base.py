@@ -8,6 +8,15 @@ from datetime import datetime
 from typing import Any
 
 
+class SourceDetailError(RuntimeError):
+    """A source detail failure with a stable public diagnostic code."""
+
+    def __init__(self, message: str, *, reason: str, stage: str) -> None:
+        super().__init__(message)
+        self.failure_reason = reason
+        self.failure_stage = stage
+
+
 @dataclass
 class HealthResult:
     ok: bool

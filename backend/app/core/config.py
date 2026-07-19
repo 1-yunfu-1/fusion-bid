@@ -74,6 +74,56 @@ class Settings(BaseSettings):
     crawl_max_concurrency: int = Field(default=3, alias="CRAWL_MAX_CONCURRENCY")
     crawl_rate_limit_per_second: float = Field(default=1.0, alias="CRAWL_RATE_LIMIT_PER_SECOND")
 
+    # --- CEBPUB 公开详情：专用普通 Chrome/Edge + 本机 CDP ---
+    cebpub_browser_mode: Literal["managed", "legacy"] = Field(
+        default="managed", alias="CEBPUB_BROWSER_MODE"
+    )
+    cebpub_browser_timeout_seconds: int = Field(
+        default=30, ge=15, le=300, alias="CEBPUB_BROWSER_TIMEOUT_SECONDS"
+    )
+    cebpub_pdf_ready_timeout_seconds: int = Field(
+        default=12, ge=3, le=60, alias="CEBPUB_PDF_READY_TIMEOUT_SECONDS"
+    )
+    cebpub_invalid_pdf_cooldown_hours: int = Field(
+        default=24, ge=0, le=720, alias="CEBPUB_INVALID_PDF_COOLDOWN_HOURS"
+    )
+    cebpub_ocr_timeout_seconds: int = Field(
+        default=60, ge=10, le=600, alias="CEBPUB_OCR_TIMEOUT_SECONDS"
+    )
+    cebpub_browser_concurrency: int = Field(
+        default=2, ge=1, le=4, alias="CEBPUB_BROWSER_CONCURRENCY"
+    )
+    cebpub_pdf_parse_concurrency: int = Field(
+        default=2, ge=1, le=4, alias="CEBPUB_PDF_PARSE_CONCURRENCY"
+    )
+    cebpub_pdf_max_bytes_mb: int = Field(
+        default=50, ge=1, le=200, alias="CEBPUB_PDF_MAX_BYTES_MB"
+    )
+    cebpub_pdf_max_pages: int = Field(
+        default=100, ge=1, le=500, alias="CEBPUB_PDF_MAX_PAGES"
+    )
+    llm_extraction_concurrency: int = Field(
+        default=2, ge=1, le=8, alias="LLM_EXTRACTION_CONCURRENCY"
+    )
+    llm_extraction_budget_seconds: int = Field(
+        default=75, ge=10, le=600, alias="LLM_EXTRACTION_BUDGET_SECONDS"
+    )
+    llm_extraction_timeout_threshold: int = Field(
+        default=2, ge=1, le=10, alias="LLM_EXTRACTION_TIMEOUT_THRESHOLD"
+    )
+    llm_extraction_execution_budget_seconds: int = Field(
+        default=150,
+        ge=30,
+        le=1800,
+        alias="LLM_EXTRACTION_EXECUTION_BUDGET_SECONDS",
+    )
+    llm_analysis_budget_seconds: int = Field(
+        default=30, ge=5, le=180, alias="LLM_ANALYSIS_BUDGET_SECONDS"
+    )
+    cebpub_site_block_threshold: int = Field(
+        default=2, ge=1, le=5, alias="CEBPUB_SITE_BLOCK_THRESHOLD"
+    )
+
     # --- 登录态数据源（Playwright 手动登录 + storage state）---
     login_source_enabled: bool = Field(default=True, alias="LOGIN_SOURCE_ENABLED")
     login_source_home_url: str = Field(

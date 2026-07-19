@@ -55,6 +55,8 @@ class TaskExecuteRequest(BaseModel):
     report_mode: Literal["incremental", "full_snapshot"] = "incremental"
     # 旧前端兼容；snapshot 等价于 full_snapshot。
     report_scope: Literal["incremental", "snapshot"] | None = None
+    search_depth: Literal["quick", "standard", "complete"] = "standard"
+    refresh_extraction: bool = False
 
     @model_validator(mode="before")
     @classmethod
@@ -89,6 +91,26 @@ class TaskExecutionResponse(BaseModel):
     detail_metadata_only_count: int = 0
     detail_failed_count: int = 0
     detail_human_verification_count: int = 0
+    detail_not_attempted_count: int = 0
+    cached_full_reused_count: int = 0
+    failure_breakdown: dict[str, int] = Field(default_factory=dict)
+    failure_breakdown_by_source: dict[str, dict[str, int]] = Field(default_factory=dict)
+    source_detail_breakdown: dict[str, dict[str, int]] = Field(default_factory=dict)
+    stage_durations_ms: dict[str, int] = Field(default_factory=dict)
+    effective_concurrency: dict[str, Any] = Field(default_factory=dict)
+    requested_regions: list[str] = Field(default_factory=list)
+    effective_regions: list[str] = Field(default_factory=list)
+    region_scope: Literal["nationwide", "restricted"] = "restricted"
+    detail_cap: int = 30
+    detail_cap_skipped: int = 0
+    coverage_status: str = "complete"
+    search_depth: str = "standard"
+    extraction_cache_hit_count: int = 0
+    llm_call_count: int = 0
+    llm_timeout_count: int = 0
+    opportunity_count: int = 0
+    lifecycle_count: int = 0
+    source_outcomes: dict[str, dict[str, Any]] = Field(default_factory=dict)
     filtered_out_count: int = 0
     duplicate_count: int = 0
     cross_source_merge_count: int = 0
@@ -128,6 +150,26 @@ class TaskExecutionItem(BaseModel):
     detail_metadata_count: int = 0
     detail_failed_count: int = 0
     detail_human_verification_count: int = 0
+    detail_not_attempted_count: int = 0
+    cached_full_reused_count: int = 0
+    failure_breakdown: dict[str, int] = Field(default_factory=dict)
+    failure_breakdown_by_source: dict[str, dict[str, int]] = Field(default_factory=dict)
+    source_detail_breakdown: dict[str, dict[str, int]] = Field(default_factory=dict)
+    stage_durations_ms: dict[str, int] = Field(default_factory=dict)
+    effective_concurrency: dict[str, Any] = Field(default_factory=dict)
+    requested_regions: list[str] = Field(default_factory=list)
+    effective_regions: list[str] = Field(default_factory=list)
+    region_scope: Literal["nationwide", "restricted"] = "restricted"
+    detail_cap: int = 30
+    detail_cap_skipped: int = 0
+    coverage_status: str = "complete"
+    search_depth: str = "standard"
+    extraction_cache_hit_count: int = 0
+    llm_call_count: int = 0
+    llm_timeout_count: int = 0
+    opportunity_count: int = 0
+    lifecycle_count: int = 0
+    source_outcomes: dict[str, dict[str, Any]] = Field(default_factory=dict)
     report_filename: str | None = None
     report_download_url: str | None = None
     analysis_status: str = "rule_only"

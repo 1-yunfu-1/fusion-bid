@@ -39,9 +39,15 @@ class TenderAnnouncement(Base):
     detail_url: Mapped[str | None] = mapped_column(String(2048), nullable=True)
     content_format: Mapped[str | None] = mapped_column(String(32), nullable=True)
     extraction_version: Mapped[str] = mapped_column(
-        String(16), default="v2", nullable=False, index=True
+        String(16), default="v3", nullable=False, index=True
     )
     announcement_type: Mapped[str | None] = mapped_column(
+        String(64), nullable=True, index=True
+    )
+    lifecycle_stage: Mapped[str | None] = mapped_column(
+        String(32), nullable=True, index=True
+    )
+    procurement_method: Mapped[str | None] = mapped_column(
         String(64), nullable=True, index=True
     )
     source_metadata: Mapped[dict | None] = mapped_column(JSON, nullable=True)
@@ -50,6 +56,10 @@ class TenderAnnouncement(Base):
     attachment_links: Mapped[list | None] = mapped_column(JSON, nullable=True)
     crawl_time: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     content_hash: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    document_hash: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    extraction_fingerprint: Mapped[str | None] = mapped_column(
+        String(64), nullable=True, index=True
+    )
     deduplication_key: Mapped[str | None] = mapped_column(String(256), nullable=True, index=True)
     # 去重合并元数据（主记录保留；被合并来源不无记录删除，信息写入 JSON）
     is_primary: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)

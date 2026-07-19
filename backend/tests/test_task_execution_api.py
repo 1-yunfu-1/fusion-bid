@@ -100,6 +100,8 @@ async def test_initial_execute_once_and_history_contract(client: AsyncClient, mo
     assert data["report_scope"] == "snapshot"
     assert data["task_status"] == "scheduled"
     assert data["sources_failed"] == {"mock_login": "未登录"}
+    assert data["detail_cap"] == 30
+    assert data["search_depth"] == "standard"
     assert "report_path" not in data
 
     history = await client.get(f"/api/tasks/{task_id}/executions")

@@ -68,7 +68,7 @@ async def test_detail_reextract_analyze_and_manual_correction(client, db_engine)
 
     reextract = await client.post(f"/api/announcements/{announcement_id}/reextract")
     assert reextract.status_code == 200, reextract.text
-    assert reextract.json()["announcement"]["extraction_version"] == "v2"
+    assert reextract.json()["announcement"]["extraction_version"] == "v3"
 
     corrected = await client.patch(
         f"/api/announcements/{announcement_id}/fields",
@@ -96,6 +96,18 @@ async def test_detail_reextract_analyze_and_manual_correction(client, db_engine)
         "不建议参与",
         "信息不足",
     }
+
+    feedback = await client.post(
+        f"/api/announcements/{announcement_id}/feedback",
+        json={"verdict": "incorrect", "reason": "代理机构字段仍需复核"},
+    )
+    assert feedback.status_code == 200, feedback.text
+    detail_after_feedback = await client.get(f"/api/announcements/{announcement_id}")
+    assert detail_after_feedback.json()["review_status"] == "needs_review"
+    assert detail_after_feedback.json()["feedback"][0]["verdict"] == "incorrect"
+    metrics = await client.get("/api/announcements/quality-metrics")
+    assert metrics.status_code == 200
+    assert metrics.json()["sample"]["feedback"] == 1
 
 
 async def test_company_profile_roundtrip(client):
@@ -191,7 +203,9 @@ async def test_recrawl_falls_back_to_interactive_and_extracts_purchaser(
                 raw_content=content,
                 source_metadata={
                     "content_pages": [{"page": 1, "text": content}],
-                    "acquisition_mode": "interactive",
+                    "acquisition_mode": "managed_chrome",
+                    "browser_reused": True,
+                    "browser_state": "ready",
                 },
             )
 
@@ -209,7 +223,9 @@ async def test_recrawl_falls_back_to_interactive_and_extracts_purchaser(
     payload = response.json()
     assert source.calls == [False, True]
     assert payload["ok"] is True
-    assert payload["acquisition_mode"] == "interactive"
+    assert payload["acquisition_mode"] == "managed_chrome"
+    assert payload["browser_reused"] is True
+    assert payload["browser_state"] == "ready"
     assert payload["verification_attempted"] is True
     assert payload["announcement"]["fields"]["purchaser"] == "西安航天动力试验技术研究所"
     assert payload["announcement"]["fields"]["purchaser_source_label"] == "招标人"
@@ -223,6 +239,170 @@ async def test_duplicate_recrawl_returns_409(client, db_engine):
     finally:
         announcements_api._active_recrawls.discard(announcement_id)
     assert response.status_code == 409
+
+
+async def test_default_recrawl_never_opens_interactive_browser(
+    client, db_engine, monkeypatch
+):
+    announcement_id = await _create_pending_announcement(db_engine)
+
+    class FakeSource:
+        enabled = True
+
+        def __init__(self):
+            self.calls = []
+
+        async def fetch_detail(self, item, *, interactive=False):
+            self.calls.append(interactive)
+            return DetailResult(
+                title=item.title,
+                source_url=item.source_url,
+                detail_url=item.source_url,
+                detail_status="needs_human_verification",
+                detail_fetched=False,
+                source_metadata={
+                    "message": "官方页面要求验证",
+                    "failure_reason": "verification_required",
+                    "acquisition_mode": "managed_chrome",
+                    "browser_state": "needs_verification",
+                },
+            )
+
+        async def extract_attachments(self, detail):
+            return []
+
+    source = FakeSource()
+    monkeypatch.setattr(announcements_api, "get_source", lambda _name: source)
+
+    response = await client.post(f"/api/announcements/{announcement_id}/recrawl")
+
+    assert response.status_code == 200, response.text
+    payload = response.json()
+    assert source.calls == [False]
+    assert payload["ok"] is False
+    assert payload["verification_attempted"] is False
+    assert payload["browser_state"] == "needs_verification"
+
+
+async def test_metadata_only_invalid_pdf_never_opens_interactive_browser(
+    client, db_engine, monkeypatch
+):
+    announcement_id = await _create_pending_announcement(db_engine)
+
+    class FakeSource:
+        enabled = True
+
+        def __init__(self):
+            self.calls = []
+
+        async def fetch_detail(self, item, *, interactive=False):
+            self.calls.append(interactive)
+            return DetailResult(
+                title=item.title,
+                source_url=item.source_url,
+                detail_url=item.source_url,
+                detail_status="metadata_only",
+                detail_fetched=False,
+                source_metadata={
+                    "message": "官方 PDF 无效或损坏",
+                    "failure_reason": "pdf_invalid_or_corrupt",
+                    "failure_stage": "pdf_validation",
+                    "terminal_failure": True,
+                    "retryable": False,
+                    "fallback_attempted": True,
+                    "fallback_result": "empty_or_unverified",
+                    "cooldown_until": "2026-07-20T12:00:00+08:00",
+                    "time_to_failure_ms": 800,
+                },
+            )
+
+        async def extract_attachments(self, detail):
+            return []
+
+    source = FakeSource()
+    monkeypatch.setattr(announcements_api, "get_source", lambda _name: source)
+    response = await client.post(
+        f"/api/announcements/{announcement_id}/recrawl",
+        json={"interactive_on_verification": True},
+    )
+
+    assert response.status_code == 200, response.text
+    payload = response.json()
+    assert source.calls == [False]
+    assert payload["ok"] is False
+    assert payload["verification_attempted"] is False
+    assert payload["terminal_failure"] is True
+    assert payload["fallback_result"] == "empty_or_unverified"
+    assert payload["cooldown_until"] == "2026-07-20T12:00:00+08:00"
+
+
+async def test_browser_text_layer_capture_extracts_verified_pages(client, db_engine):
+    await _create_pending_announcement(db_engine)
+    detail_url = (
+        "https://ctbpsp.com/#/bulletinDetail?"
+        "uuid=1d1600b68217477890a8076bc98a6880&inpvalue=&dataSource=0"
+    )
+    response = await client.post(
+        "/api/announcements/capture-rendered-detail",
+        json={
+            "source_name": "cebpub",
+            "source_item_id": "1d1600b68217477890a8076bc98a6880",
+            "detail_url": detail_url,
+            "outer_text": "服务器、数据库、数据库集群软件招标公告 接收时间",
+            "page_count": 2,
+            "pages": [
+                {
+                    "page": 1,
+                    "items": [
+                        {"text": "招标人：", "x": 10, "y": 100, "width": 40},
+                        {
+                            "text": "西安航天动力试验技术研究所",
+                            "x": 55,
+                            "y": 100,
+                            "width": 150,
+                        },
+                        {
+                            "text": "3.1 具备有效营业执照。",
+                            "x": 10,
+                            "y": 80,
+                            "width": 180,
+                        },
+                    ],
+                },
+                {
+                    "page": 2,
+                    "text": "招标代理机构：陕西铭源项目管理有限公司",
+                },
+            ],
+        },
+    )
+
+    assert response.status_code == 200, response.text
+    payload = response.json()
+    assert payload["ok"] is True
+    assert payload["acquisition_mode"] == "browser_extension"
+    assert payload["page_count"] == 2
+    assert payload["announcement"]["fields"]["purchaser"] == "西安航天动力试验技术研究所"
+    assert payload["announcement"]["source_metadata"]["browser_capture"]["cookies_received"] is False
+
+
+async def test_browser_capture_rejects_missing_page_without_mutation(client, db_engine):
+    announcement_id = await _create_pending_announcement(db_engine)
+    response = await client.post(
+        "/api/announcements/capture-rendered-detail",
+        json={
+            "source_name": "cebpub",
+            "source_item_id": "1d1600b68217477890a8076bc98a6880",
+            "detail_url": "https://ctbpsp.com/#/bulletinDetail?uuid=1d1600b68217477890a8076bc98a6880",
+            "outer_text": "服务器、数据库、数据库集群软件招标公告",
+            "page_count": 2,
+            "pages": [{"page": 1, "text": "只有第一页"}],
+        },
+    )
+
+    assert response.status_code == 422
+    detail = await client.get(f"/api/announcements/{announcement_id}")
+    assert detail.json()["detail_status"] == "metadata_only"
 
 
 async def test_import_official_html_extracts_and_analyzes(client, db_engine):

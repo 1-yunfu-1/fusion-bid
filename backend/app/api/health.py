@@ -9,6 +9,7 @@ from fastapi import APIRouter
 
 from app.core.config import get_settings
 from app.core.database import check_db, database_revision
+from app.browser.managed_public import managed_public_browser_status
 from app.schemas.health import HealthResponse, MetaResponse
 
 router = APIRouter()
@@ -21,7 +22,19 @@ async def health_check() -> HealthResponse:
     now = datetime.now(tz)
     db_ok = await check_db()
     revision = await database_revision() if db_ok else "unavailable"
-    status = "ok" if db_ok else "degraded"
+    public_browser = managed_public_browser_status()
+    pdf_pipeline = public_browser.get("pdf_pipeline") or {}
+    pdf_text_ready = bool(pdf_pipeline.get("text_ready"))
+    scanned_pdf_ready = bool(pdf_pipeline.get("scanned_pdf_ready"))
+    status = "ok" if db_ok and pdf_text_ready and scanned_pdf_ready else "degraded"
+    if not db_ok:
+        message = "数据库连接异常"
+    elif not pdf_text_ready:
+        message = "PDF 本地文本解析组件未就绪，详情采集将降级"
+    elif not scanned_pdf_ready:
+        message = "PDF 文本解析可用，扫描件 OCR 组件未就绪"
+    else:
+        message = "服务正常"
     return HealthResponse(
         status=status,
         app=settings.app_name,
@@ -32,14 +45,22 @@ async def health_check() -> HealthResponse:
         database="ok" if db_ok else "error",
         database_ok=db_ok,
         database_revision=revision,
-        extraction_version="v2",
+        extraction_version="v3",
         capabilities=[
             "detail-evidence-v2",
+            "lifecycle-extraction-v3",
+            "extraction-cache-v1",
+            "crawl-quality-audit-v1",
             "interactive-detail-recrawl-v1",
             "official-document-import-v1",
             "pdfjs-text-layer-capture-v1",
+            "browser-rendered-detail-capture-v1",
+            "managed-public-browser-v1",
+            "managed-public-browser-pool-v2",
+            "pdfjs-memory-document-capture-v1",
         ],
-        message="服务正常" if db_ok else "数据库连接异常",
+        public_browser=public_browser,
+        message=message,
     )
 
 

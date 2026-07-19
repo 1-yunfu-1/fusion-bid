@@ -12,6 +12,7 @@ from app.deduplication.normalize import (
     normalize_title,
 )
 from app.deduplication.similarity import content_similarity, title_similarity
+from app.reports.lifecycle import classify_lifecycle
 
 # 官方源优先（数值越小优先级越高）
 SOURCE_PRIORITY: dict[str, int] = {
@@ -47,6 +48,10 @@ class CandidateRecord:
     deduplication_key: str | None = None
     project_code: str | None = None
     announcement_type: str | None = None
+    lifecycle_stage: str | None = None
+    procurement_method: str | None = None
+    document_hash: str | None = None
+    extraction_fingerprint: str | None = None
     publisher: str | None = None
     # 入库后填充
     db_id: str | None = None
@@ -100,21 +105,11 @@ def _region_compatible(a: str | None, b: str | None) -> bool:
 
 def announcement_lifecycle_type(record: CandidateRecord) -> str:
     """识别公告生命周期节点，用于防止原公告被终止/更正公告覆盖。"""
-    explicit = (record.announcement_type or "").strip()
-    probe = f"{explicit} {record.title}"
-    rules = (
-        ("终止公告", ("终止公告", "终止招标", "招标终止")),
-        ("废标公告", ("废标公告", "流标公告", "采购失败")),
-        ("更正公告", ("更正公告", "变更公告", "澄清公告")),
-        ("中标公告", ("中标公告", "中标候选人公示", "中标结果")),
-        ("成交公告", ("成交公告", "成交结果")),
-        ("资格预审", ("资格预审",)),
-        ("招标公告", ("招标公告", "采购公告", "磋商公告", "询价公告")),
+    return record.lifecycle_stage or classify_lifecycle(
+        record.title,
+        explicit_label=record.announcement_type,
+        content=record.clean_content or "",
     )
-    for lifecycle, markers in rules:
-        if any(marker in probe for marker in markers):
-            return lifecycle
-    return explicit or "未知"
 
 
 def is_duplicate(left: CandidateRecord, right: CandidateRecord) -> tuple[bool, str]:

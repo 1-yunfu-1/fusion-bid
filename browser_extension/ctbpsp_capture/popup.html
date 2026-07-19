@@ -1,0 +1,19 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>FusionBid 公告采集</title>
+    <link rel="stylesheet" href="popup.css" />
+  </head>
+  <body>
+    <main>
+      <h1>FusionBid 公告采集</h1>
+      <p>请先在当前标签页完整打开官方公告，再开始采集。</p>
+      <button id="capture" type="button">采集当前 PDF 公告</button>
+      <div id="status" role="status" aria-live="polite">等待开始</div>
+      <small>只发送公告文字、页码和坐标到本机 127.0.0.1，不读取 Cookie 或登录状态。</small>
+    </main>
+    <script src="popup.js"></script>
+  </body>
+</html>

@@ -22,7 +22,7 @@ class DateRangeResult:
 
 
 _RELATIVE_RE = re.compile(
-    r"(最近|近|过去)\s*(\d+)\s*(年|个月|月|周|星期|天|日)"
+    r"(最近|近|过去)\s*(\d+|[一二三四五六七八九十两]+)\s*(年|个月|月|周|星期|天|日)"
 )
 _YEAR_MONTH_RE = re.compile(
     r"((?:20\d{2})\s*年)?\s*(\d{1,2})\s*月(?:份|份份)?"
@@ -46,6 +46,22 @@ _CN_MONTH = {
     "十一": 11,
     "十二": 12,
 }
+
+
+def _parse_positive_number(token: str) -> int | None:
+    if token.isdigit():
+        value = int(token)
+        return value if value > 0 else None
+    normalized = token.replace("两", "二")
+    if normalized == "十":
+        return 10
+    if "十" in normalized:
+        left, right = normalized.split("十", 1)
+        tens = _CN_MONTH.get(left, 1) if left else 1
+        units = _CN_MONTH.get(right, 0) if right else 0
+        value = tens * 10 + units
+        return value if value > 0 else None
+    return _CN_MONTH.get(normalized)
 
 
 def _parse_cn_month_token(token: str) -> int | None:
@@ -95,7 +111,9 @@ def parse_date_range(text: str, *, now: datetime, timezone: str = "Asia/Shanghai
     # 2) 最近 N 单位
     m = _RELATIVE_RE.search(text)
     if m:
-        n = int(m.group(2))
+        n = _parse_positive_number(m.group(2))
+        if n is None:
+            return DateRangeResult(None, None, m.group(0), ambiguous=True)
         unit = m.group(3)
         end = today
         if unit == "年":

@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from datetime import date, datetime
+import asyncio
+from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
 
 import pytest
@@ -12,10 +13,33 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_asyn
 from app.core.database import Base
 from app.models.task import SearchTask
 from app.models.delivery import DeliveryHistory
+from app.models.announcement import TenderAnnouncement
+from app.models.quality import AnnouncementCrawlAttempt
 from app.services import crawl_service
 from app.sources.base import DetailResult, HealthResult, ListItem, SearchQuery, TenderSourceAdapter
 
 TZ = ZoneInfo("Asia/Shanghai")
+
+
+@pytest.mark.asyncio
+async def test_extraction_timeout_circuit_opens_after_two_consecutive_timeouts():
+    controller = crawl_service._ExtractionRunController(
+        timeout_threshold=2, execution_budget_seconds=60
+    )
+    assert await controller.begin_call() is True
+    await controller.observe(timed_out=True)
+    assert await controller.begin_call() is True
+    await controller.observe(timed_out=True)
+    assert controller.circuit_open is True
+    assert controller.timeout_count == 2
+    assert await controller.begin_call() is False
+
+    budgeted = crawl_service._ExtractionRunController(
+        timeout_threshold=2, execution_budget_seconds=1
+    )
+    budgeted.started_at -= 2
+    assert await budgeted.begin_call() is False
+    assert budgeted.budget_exhausted is True
 
 
 class MockPublicSource(TenderSourceAdapter):
@@ -45,7 +69,9 @@ class MockPublicSource(TenderSourceAdapter):
             ),
         ]
 
-    async def fetch_detail(self, item: ListItem) -> DetailResult:
+    async def fetch_detail(
+        self, item: ListItem, *, interactive: bool = False
+    ) -> DetailResult:
         return DetailResult(
             title=item.title,
             source_url=item.source_url,
@@ -78,6 +104,122 @@ class MockMirrorSource(MockPublicSource):
         ]
 
 
+class NationwideSource(MockPublicSource):
+    source_name = "mock_nationwide"
+
+    def __init__(self, state: dict) -> None:
+        self.state = state
+
+    async def search(self, query: SearchQuery) -> list[ListItem]:
+        self.state["query_regions"] = list(query.regions)
+        return [
+            ListItem(
+                title=f"{region}{keyword}设备{index}公开招标公告",
+                source_url=f"https://example.com/nationwide/{index}",
+                source_item_id=f"nationwide-{index}",
+                publish_time=datetime(2026, 7, 1 + index, tzinfo=TZ),
+                region=region,
+                snippet=f"{region} {keyword} 设备招标",
+            )
+            for index, (region, keyword) in enumerate(
+                (("北京市", "核电"), ("安徽省", "核能"), ("广东省", "核电")),
+                start=1,
+            )
+        ]
+
+    async def fetch_detail(
+        self, item: ListItem, *, interactive: bool = False
+    ) -> DetailResult:
+        return DetailResult(
+            title=item.title,
+            source_url=item.source_url,
+            publish_time=item.publish_time,
+            region=item.region,
+            clean_content=(
+                f"招标人：{item.region}测试单位\n"
+                f"项目编号：NUCLEAR-{item.source_item_id}\n"
+                f"{item.region} {item.title}"
+            ),
+            detail_fetched=True,
+            detail_status="full",
+        )
+
+
+class ParallelCebpubSource(TenderSourceAdapter):
+    source_name = "cebpub"
+    requires_login = False
+    enabled = True
+
+    def __init__(self, state: dict, *, blocked: bool = False) -> None:
+        self.state = state
+        self.blocked = blocked
+
+    async def health_check(self) -> HealthResult:
+        return HealthResult(ok=True)
+
+    async def search(self, query: SearchQuery) -> list[ListItem]:
+        names = ("甲型", "乙型", "丙型", "丁型")
+        return [
+            ListItem(
+                title=f"安徽省{value}服务器采购项目招标公告",
+                source_url=f"https://ctbpsp.com/#/bulletinDetail?uuid={index:032x}",
+                source_item_id=f"{index:032x}",
+                publish_time=datetime(2026, 6, index + 1, tzinfo=TZ),
+                region="安徽省",
+                snippet=f"安徽省 {value} 服务器 招标",
+            )
+            for index, value in enumerate(names, start=1)
+        ]
+
+    async def fetch_detail(
+        self, item: ListItem, *, interactive: bool = False
+    ) -> DetailResult:
+        self.state["fetch_count"] = self.state.get("fetch_count", 0) + 1
+        self.state["detail_active"] = self.state.get("detail_active", 0) + 1
+        self.state["max_detail_active"] = max(
+            self.state.get("max_detail_active", 0), self.state["detail_active"]
+        )
+        if self.state.get("ai_active", 0):
+            self.state["overlap"] = True
+        await asyncio.sleep(0.04)
+        self.state["detail_active"] -= 1
+        if self.blocked:
+            return DetailResult(
+                title=item.title,
+                source_url=item.source_url,
+                publish_time=item.publish_time,
+                region=item.region,
+                clean_content=f"{item.title}\n安徽省服务器",
+                detail_fetched=False,
+                detail_status="needs_human_verification",
+                detail_url=item.source_url,
+                source_metadata={
+                    "detail_attempt_state": "blocked",
+                    "failure_reason": "verification_required",
+                    "failure_stage": "outer_page",
+                    "site_blocked": True,
+                },
+            )
+        return DetailResult(
+            title=item.title,
+            source_url=item.source_url,
+            publish_time=item.publish_time,
+            region=item.region,
+            clean_content=(
+                f"采购人：测试单位{item.source_item_id[-1:]}\n"
+                f"项目编号：CODE-{item.source_item_id[-4:]}\n安徽省服务器公开招标"
+            ),
+            detail_fetched=True,
+            detail_status="full",
+            detail_url=item.source_url,
+            content_format="pdf_text",
+            source_metadata={"detail_attempt_state": "attempted"},
+        )
+
+    async def extract_attachments(self, detail: DetailResult) -> list[str]:
+        return []
+
+
 @pytest.mark.asyncio
 async def test_execute_search_task_saves_announcements(monkeypatch):
     engine = create_async_engine("sqlite+aiosqlite:///:memory:")
@@ -106,6 +248,294 @@ async def test_execute_search_task_saves_announcements(monkeypatch):
         assert execution.status in ("success", "partial")
         assert stats.saved_count >= 1
         assert "mock_public" in stats.sources_succeeded
+
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_second_run_reuses_unchanged_extraction_and_default_cap_is_30(
+    monkeypatch, tmp_path
+):
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    factory = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+    calls = {"ai": 0, "detail": 0}
+
+    class ManyItemsSource(MockPublicSource):
+        source_name = "cache_source"
+
+        async def search(self, query: SearchQuery) -> list[ListItem]:
+            return [
+                ListItem(
+                    title=f"安徽省服务器采购项目{i}公开招标公告",
+                    source_url=f"https://example.test/cache/{i}",
+                    source_item_id=f"cache-{i}",
+                    publish_time=datetime(2026, 7, 1, tzinfo=TZ),
+                    region="安徽省",
+                    snippet="安徽省服务器采购",
+                )
+                for i in range(35)
+            ]
+
+        async def fetch_detail(
+            self, item: ListItem, *, interactive: bool = False
+        ) -> DetailResult:
+            calls["detail"] += 1
+            return DetailResult(
+                title=item.title,
+                source_url=item.source_url,
+                publish_time=item.publish_time,
+                region=item.region,
+                clean_content=(
+                    f"采购人：测试单位{item.source_item_id}\n"
+                    f"项目编号：PROJECT-{item.source_item_id}\n"
+                    "安徽省服务器公开招标"
+                ),
+                detail_fetched=True,
+                detail_status="full",
+            )
+
+    async def fake_ai(**kwargs):
+        calls["ai"] += 1
+        return crawl_service.build_extraction_data(**kwargs)
+
+    monkeypatch.setattr(
+        crawl_service, "build_sources", lambda only_enabled=True: [ManyItemsSource()]
+    )
+    monkeypatch.setattr(crawl_service, "build_extraction_data_with_ai", fake_ai)
+
+    def fake_report(*_args, **_kwargs):
+        path = tmp_path / "cache.docx"
+        path.write_bytes(b"docx")
+        return path
+
+    monkeypatch.setattr(crawl_service, "generate_report_file", fake_report)
+
+    async with factory() as db:
+        task = SearchTask(
+            original_query="安徽省服务器招标",
+            keywords=["服务器"],
+            regions=["安徽省"],
+            start_date=date(2026, 6, 1),
+            end_date=date(2026, 7, 19),
+            status="confirmed",
+        )
+        db.add(task)
+        await db.commit()
+        await db.refresh(task)
+
+        first_execution, first = await crawl_service.execute_search_task(db, task)
+        assert first.detail_cap == 30
+        assert first.detail_cap_skipped == 5
+        assert first.truncated is True
+        assert first.coverage_status == "truncated"
+        assert first.llm_call_count == 30
+        assert calls["ai"] == 30
+        assert first_execution.detail_cap_skipped == 5
+
+        _, second = await crawl_service.execute_search_task(db, task)
+        assert second.extraction_cache_hit_count == 30
+        assert second.llm_call_count == 0
+        assert calls["ai"] == 30
+        attempt_count = await db.scalar(
+            select(func.count()).select_from(AnnouncementCrawlAttempt)
+        )
+        assert attempt_count == 60
+
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_invalid_pdf_cooldown_skips_incremental_but_full_snapshot_bypasses(
+    monkeypatch, tmp_path
+):
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    factory = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+    business_id = "3d1600b68217477890a8076bc98a6880"
+    state = {"fetch_count": 0}
+
+    class CooldownSource(TenderSourceAdapter):
+        source_name = "cebpub"
+        requires_login = False
+        enabled = True
+
+        async def health_check(self) -> HealthResult:
+            return HealthResult(ok=True)
+
+        async def search(self, _query: SearchQuery) -> list[ListItem]:
+            return [
+                ListItem(
+                    title="安徽省服务器采购测试公告",
+                    source_url=f"https://ctbpsp.com/#/?uuid={business_id}",
+                    source_item_id=business_id,
+                    publish_time=datetime(2026, 7, 18, tzinfo=TZ),
+                    region="安徽省",
+                    snippet="安徽省服务器采购",
+                    raw={"businessId": business_id},
+                )
+            ]
+
+        async def fetch_detail(
+            self, item: ListItem, *, interactive: bool = False
+        ) -> DetailResult:
+            state["fetch_count"] += 1
+            content = f"{item.title}\n招标人：测试采购单位"
+            return DetailResult(
+                title=item.title,
+                source_url=item.source_url,
+                publish_time=item.publish_time,
+                region=item.region,
+                clean_content=content,
+                raw_content=content,
+                detail_fetched=True,
+                detail_status="full",
+                source_metadata={"detail_status": "full"},
+            )
+
+        async def extract_attachments(self, _detail: DetailResult) -> list[str]:
+            return []
+
+    monkeypatch.setattr(
+        crawl_service,
+        "build_sources",
+        lambda only_enabled=True: [CooldownSource()],
+    )
+
+    def fake_report(*_args, **_kwargs):
+        path = tmp_path / "cooldown.docx"
+        path.write_bytes(b"docx")
+        return path
+
+    monkeypatch.setattr(crawl_service, "generate_report_file", fake_report)
+
+    async with factory() as db:
+        attempted_at = datetime.now(TZ)
+        existing = TenderAnnouncement(
+            title="安徽省服务器采购测试公告",
+            source_name="cebpub",
+            source_url=f"https://ctbpsp.com/#/?uuid={business_id}",
+            source_item_id=business_id,
+            data_mode="live",
+            publish_time=datetime(2026, 7, 18, tzinfo=TZ),
+            region="安徽省",
+            clean_content="安徽省服务器采购测试公告",
+            raw_content="安徽省服务器采购测试公告",
+            detail_status="metadata_only",
+            source_metadata={
+                "last_attempt": {
+                    "attempted_at": attempted_at.isoformat(),
+                    "failure_reason": "pdf_invalid_or_corrupt",
+                    "failure_stage": "pdf_validation",
+                    "terminal_failure": True,
+                    "viewer_error_code": "pdf_invalid_or_corrupt",
+                    "viewer_error_message": "无效或损坏的 PDF 文件。",
+                    "cooldown_until": (attempted_at + timedelta(hours=24)).isoformat(),
+                }
+            },
+            extraction_data={},
+            attachment_links=[],
+            content_hash="cooldown-hash",
+            deduplication_key=f"cebpub:{business_id}",
+            is_primary=True,
+            crawl_time=attempted_at,
+            first_seen_at=attempted_at,
+            last_seen_at=attempted_at,
+        )
+        task = SearchTask(
+            original_query="安徽省服务器采购",
+            keywords=["服务器"],
+            regions=["安徽省"],
+            start_date=date(2026, 7, 1),
+            end_date=date(2026, 7, 19),
+            status="confirmed",
+        )
+        db.add_all([existing, task])
+        await db.commit()
+        await db.refresh(task)
+
+        _execution, stats = await crawl_service.execute_search_task(
+            db, task, max_details_per_source=1
+        )
+        assert state["fetch_count"] == 0
+        assert stats.detail_not_attempted_count == 1
+        assert stats.failure_breakdown == {"invalid_pdf_cooldown": 1}
+        saved = await db.scalar(
+            select(TenderAnnouncement).where(
+                TenderAnnouncement.source_item_id == business_id
+            )
+        )
+        assert saved is not None
+        assert saved.source_metadata["last_attempt"]["viewer_error_code"] == (
+            "pdf_invalid_or_corrupt"
+        )
+
+        await crawl_service.execute_search_task(
+            db,
+            task,
+            max_details_per_source=1,
+            report_mode="full_snapshot",
+        )
+        assert state["fetch_count"] == 1
+
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_legacy_nationwide_task_uses_unrestricted_source_and_detail_filters(
+    monkeypatch, tmp_path
+):
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    factory = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+    state: dict = {}
+    monkeypatch.setattr(
+        crawl_service,
+        "build_sources",
+        lambda only_enabled=True: [NationwideSource(state)],
+    )
+
+    def fake_report(*args, **kwargs):
+        path = tmp_path / "nationwide.docx"
+        path.write_bytes(b"docx")
+        return path
+
+    monkeypatch.setattr(crawl_service, "generate_report_file", fake_report)
+
+    async with factory() as db:
+        task = SearchTask(
+            original_query="最近一年全国核电或核能招标",
+            keywords=["核电", "核能"],
+            regions=["全国"],
+            start_date=date(2025, 7, 19),
+            end_date=date(2026, 7, 19),
+            execute_immediately=True,
+            schedule_enabled=False,
+            status="confirmed",
+        )
+        db.add(task)
+        await db.commit()
+        await db.refresh(task)
+
+        execution, stats = await crawl_service.execute_search_task(
+            db,
+            task,
+            max_details_per_source=8,
+            report_mode="full_snapshot",
+        )
+
+        assert execution.status == "success"
+        assert state["query_regions"] == []
+        assert stats.detail_success_count == 3
+        assert stats.detail_filtered_out == 0
+        assert stats.candidates_count == 3
+        assert stats.region_scope == "nationwide"
+        assert stats.requested_regions == ["全国"]
+        assert stats.effective_regions == []
+        assert execution.crawl_diagnostics["region_scope"] == "nationwide"
 
     await engine.dispose()
 
@@ -244,5 +674,344 @@ async def test_snapshot_recollects_all_current_items_without_duplicate_delivery(
             for item in stats.output_items
         )
         assert after == before
+
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_bounded_pipeline_runs_two_cebpub_and_two_ai_jobs_with_overlap(
+    monkeypatch, tmp_path
+):
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    factory = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+    state: dict[str, int | bool] = {}
+    source = ParallelCebpubSource(state)
+    monkeypatch.setattr(
+        crawl_service, "build_sources", lambda only_enabled=True: [source]
+    )
+
+    async def fake_ai(**kwargs):
+        state["ai_active"] = int(state.get("ai_active", 0)) + 1
+        state["max_ai_active"] = max(
+            int(state.get("max_ai_active", 0)), int(state["ai_active"])
+        )
+        if state.get("detail_active", 0):
+            state["overlap"] = True
+        await asyncio.sleep(0.06)
+        state["ai_active"] = int(state["ai_active"]) - 1
+        return crawl_service.build_extraction_data(**kwargs)
+
+    monkeypatch.setattr(crawl_service, "build_extraction_data_with_ai", fake_ai)
+
+    def fake_report(*_args, **_kwargs):
+        path = tmp_path / "parallel.docx"
+        path.write_bytes(b"docx")
+        return path
+
+    monkeypatch.setattr(crawl_service, "generate_report_file", fake_report)
+    async with factory() as db:
+        task = SearchTask(
+            original_query="安徽省服务器招标",
+            keywords=["服务器"],
+            regions=["安徽省"],
+            start_date=date(2026, 5, 1),
+            end_date=date(2026, 7, 17),
+            execute_immediately=True,
+            schedule_enabled=False,
+            status="confirmed",
+        )
+        db.add(task)
+        await db.commit()
+        await db.refresh(task)
+
+        execution, stats = await crawl_service.execute_search_task(
+            db, task, max_details_per_source=4
+        )
+
+        assert state["max_detail_active"] == 2
+        assert state["max_ai_active"] == 2
+        assert state["overlap"] is True
+        assert stats.detail_success_count == 4
+        assert stats.candidates_count == 4
+        assert stats.effective_concurrency["cebpub_browser"] == 2
+        assert stats.effective_concurrency["llm_extraction"] == 2
+        assert execution.crawl_diagnostics["stage_durations_ms"]["total_wall"] > 0
+
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_http_detail_limit_is_global_across_public_sources(monkeypatch, tmp_path):
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    factory = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+    state = {"active": 0, "maximum": 0}
+
+    class ParallelHttpSource(TenderSourceAdapter):
+        requires_login = False
+        enabled = True
+
+        def __init__(self, source_name: str) -> None:
+            self.source_name = source_name
+
+        async def health_check(self) -> HealthResult:
+            return HealthResult(ok=True)
+
+        async def search(self, _query: SearchQuery) -> list[ListItem]:
+            return [
+                ListItem(
+                    title=f"安徽省服务器采购项目{i}招标公告",
+                    source_url=f"https://{self.source_name}.example/{i}",
+                    source_item_id=f"{self.source_name}-{i}",
+                    publish_time=datetime(2026, 6, i + 1, tzinfo=TZ),
+                    region="安徽省",
+                    snippet="安徽省 服务器 招标",
+                )
+                for i in range(3)
+            ]
+
+        async def fetch_detail(
+            self, item: ListItem, *, interactive: bool = False
+        ) -> DetailResult:
+            state["active"] += 1
+            state["maximum"] = max(state["maximum"], state["active"])
+            await asyncio.sleep(0.03)
+            state["active"] -= 1
+            return DetailResult(
+                title=item.title,
+                source_url=item.source_url,
+                publish_time=item.publish_time,
+                region=item.region,
+                clean_content="采购人：测试单位\n安徽省服务器招标",
+                detail_fetched=True,
+                detail_status="full",
+            )
+
+        async def extract_attachments(self, _detail: DetailResult) -> list[str]:
+            return []
+
+    sources = [ParallelHttpSource("http_a"), ParallelHttpSource("http_b")]
+    monkeypatch.setattr(crawl_service, "build_sources", lambda only_enabled=True: sources)
+    monkeypatch.setattr(
+        crawl_service,
+        "build_extraction_data_with_ai",
+        lambda **kwargs: asyncio.sleep(
+            0, result=crawl_service.build_extraction_data(**kwargs)
+        ),
+    )
+
+    def fake_report(*_args, **_kwargs):
+        path = tmp_path / "http-parallel.docx"
+        path.write_bytes(b"docx")
+        return path
+
+    monkeypatch.setattr(crawl_service, "generate_report_file", fake_report)
+    async with factory() as db:
+        task = SearchTask(
+            original_query="安徽省服务器招标",
+            keywords=["服务器"],
+            regions=["安徽省"],
+            start_date=date(2026, 5, 1),
+            end_date=date(2026, 7, 17),
+            status="confirmed",
+        )
+        db.add(task)
+        await db.commit()
+        await db.refresh(task)
+
+        _, stats = await crawl_service.execute_search_task(
+            db, task, max_details_per_source=3
+        )
+
+        assert state["maximum"] == 3
+        assert stats.detail_success_count == 6
+        assert stats.effective_concurrency["http_detail"] == 3
+
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_cebpub_site_block_downgrades_then_marks_remaining_not_attempted(
+    monkeypatch, tmp_path
+):
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    factory = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+    state: dict[str, int | bool] = {}
+    source = ParallelCebpubSource(state, blocked=True)
+    monkeypatch.setattr(
+        crawl_service, "build_sources", lambda only_enabled=True: [source]
+    )
+
+    def fake_report(*_args, **_kwargs):
+        path = tmp_path / "blocked.docx"
+        path.write_bytes(b"docx")
+        return path
+
+    monkeypatch.setattr(crawl_service, "generate_report_file", fake_report)
+    async with factory() as db:
+        task = SearchTask(
+            original_query="安徽省服务器招标",
+            keywords=["服务器"],
+            regions=["安徽省"],
+            start_date=date(2026, 5, 1),
+            end_date=date(2026, 7, 17),
+            execute_immediately=True,
+            schedule_enabled=False,
+            status="confirmed",
+        )
+        db.add(task)
+        await db.commit()
+        await db.refresh(task)
+
+        execution, stats = await crawl_service.execute_search_task(
+            db, task, max_details_per_source=4
+        )
+
+        assert state["fetch_count"] == 2
+        assert stats.detail_human_verification_count == 2
+        assert stats.detail_not_attempted_count == 2
+        assert stats.failure_breakdown == {"site_blocked": 2, "not_attempted": 2}
+        assert stats.effective_concurrency["cebpub_adaptive"] is True
+        assert stats.effective_concurrency["cebpub_circuit_open"] is True
+        assert execution.status == "partial"
+
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_failed_current_detail_preserves_and_labels_cached_full_text(
+    monkeypatch, tmp_path
+):
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    factory = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+
+    class CachedFailureSource(TenderSourceAdapter):
+        source_name = "cached_source"
+        requires_login = False
+        enabled = True
+
+        async def health_check(self) -> HealthResult:
+            return HealthResult(ok=True)
+
+        async def search(self, _query: SearchQuery) -> list[ListItem]:
+            return [
+                ListItem(
+                    title="安徽省服务器采购项目招标公告",
+                    source_url="https://example.com/cached-a1",
+                    source_item_id="a1",
+                    publish_time=datetime(2026, 6, 1, tzinfo=TZ),
+                    region="安徽省",
+                    snippet="安徽省服务器招标",
+                )
+            ]
+
+        async def fetch_detail(
+            self, item: ListItem, *, interactive: bool = False
+        ) -> DetailResult:
+            return DetailResult(
+                title=item.title,
+                source_url=item.source_url,
+                publish_time=item.publish_time,
+                region=item.region,
+                clean_content="安徽省服务器招标（仅列表元数据）",
+                detail_fetched=False,
+                detail_status="metadata_only",
+                source_metadata={
+                    "detail_attempt_state": "attempted",
+                    "failure_reason": "outer_detail_unavailable",
+                    "failure_stage": "outer_page",
+                    "message": "官方外层页暂未返回详情",
+                    "attempt_count": 2,
+                    "duration_ms": 1200,
+                },
+            )
+
+        async def extract_attachments(self, _detail: DetailResult) -> list[str]:
+            return []
+
+    monkeypatch.setattr(
+        crawl_service,
+        "build_sources",
+        lambda only_enabled=True: [CachedFailureSource()],
+    )
+
+    def fake_report(*_args, **_kwargs):
+        path = tmp_path / "cached.docx"
+        path.write_bytes(b"docx")
+        return path
+
+    monkeypatch.setattr(crawl_service, "generate_report_file", fake_report)
+
+    async with factory() as db:
+        historical_content = "招标人：历史已核验单位\n资格要求：具备服务器项目能力"
+        existing = TenderAnnouncement(
+            title="安徽省服务器采购项目招标公告",
+            source_name="cached_source",
+            source_url="https://example.com/cached-a1",
+            source_item_id="a1",
+            data_mode="live",
+            publish_time=datetime(2026, 6, 1, tzinfo=TZ),
+            region="安徽省",
+            clean_content=historical_content,
+            raw_content=historical_content,
+            detail_status="full",
+            content_format="html",
+            source_metadata={"detail_status": "full", "detail_fetched": True},
+            extraction_data={},
+            attachment_links=[],
+            content_hash="historical-full-hash",
+            deduplication_key="cached_source:a1",
+            is_primary=True,
+            crawl_time=datetime(2026, 6, 1, tzinfo=TZ),
+            first_seen_at=datetime(2026, 6, 1, tzinfo=TZ),
+            last_seen_at=datetime(2026, 6, 1, tzinfo=TZ),
+        )
+        task = SearchTask(
+            original_query="安徽省服务器招标",
+            keywords=["服务器"],
+            regions=["安徽省"],
+            start_date=date(2026, 5, 1),
+            end_date=date(2026, 7, 17),
+            status="confirmed",
+        )
+        db.add_all([existing, task])
+        await db.commit()
+        await db.refresh(task)
+
+        execution, stats = await crawl_service.execute_search_task(
+            db, task, max_details_per_source=1
+        )
+        saved = await db.scalar(
+            select(TenderAnnouncement).where(
+                TenderAnnouncement.source_item_id == "a1"
+            )
+        )
+
+        assert saved is not None
+        assert saved.detail_status == "full"
+        assert saved.clean_content == historical_content
+        assert saved.content_hash == "historical-full-hash"
+        assert saved.source_metadata["using_cached_full"] is True
+        assert saved.source_metadata["last_attempt"]["failure_reason"] == (
+            "outer_detail_unavailable"
+        )
+        assert stats.cached_full_reused_count == 1
+        assert stats.failure_breakdown_by_source == {
+            "cached_source": {"outer_detail_unavailable": 1}
+        }
+        assert stats.source_detail_breakdown == {
+            "cached_source": {"metadata_only": 1}
+        }
+        assert stats.output_items[0]["cached_full_reused"] is True
+        assert stats.output_items[0]["detail_fetched"] is True
+        assert stats.output_items[0]["current_attempt_detail_fetched"] is False
+        assert execution.crawl_diagnostics["cached_full_reused_count"] == 1
 
     await engine.dispose()

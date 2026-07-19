@@ -10,6 +10,29 @@ export interface HealthResponse {
   database_revision?: string;
   extraction_version?: string;
   capabilities?: string[];
+  public_browser?: {
+    state: "not_started" | "starting" | "ready" | "busy" | "needs_verification" | "unavailable";
+    engine?: string | null;
+    profile_ready: boolean;
+    last_error?: string | null;
+    pool_size?: number;
+    active_workers?: number;
+    queue_size?: number;
+    adaptive_mode?: boolean;
+    pdf_pipeline?: {
+      memory_pdf_bytes?: boolean;
+      text_parser?: boolean;
+      rasterizer?: boolean;
+      ocr_engine?: boolean;
+      text_ready?: boolean;
+      scanned_pdf_ready?: boolean;
+      parse_concurrency?: number;
+      ocr_concurrency?: number;
+      viewer_ready_timeout_seconds?: number;
+      ocr_timeout_seconds?: number;
+      invalid_pdf_cooldown_hours?: number;
+    };
+  };
   message: string;
 }
 

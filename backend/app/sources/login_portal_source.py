@@ -33,6 +33,7 @@ from app.browser.session import (
 )
 from app.cleaners.html_cleaner import clean_html_to_text, extract_attachment_links
 from app.core.config import get_settings
+from app.parsers.regions import resolve_region_selection
 from app.sources.base import (
     DetailResult,
     HealthResult,
@@ -179,7 +180,8 @@ class LoginPortalSource(TenderSourceAdapter):
             )
 
         keywords = query.keywords or [""]
-        region = (query.regions or [""])[0]
+        effective_regions = resolve_region_selection(query.regions).effective
+        region = (effective_regions or [""])[0]
         items: list[ListItem] = []
         seen: set[str] = set()
 

@@ -5,15 +5,18 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import re
 from typing import Any
-from datetime import datetime
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 from app.cleaners.html_cleaner import clean_html_to_text, extract_attachment_links
 from app.browser.pdf_detail import fetch_public_pdf_detail
+from app.core.config import get_settings
+from app.parsers.regions import resolve_region_selection
 from app.sources.base import (
     DetailResult,
     HealthResult,
@@ -248,9 +251,10 @@ class CebpubSource(TenderSourceAdapter):
 
     async def search(self, query: SearchQuery) -> list[ListItem]:
         keywords = query.keywords or [""]
+        effective_regions = resolve_region_selection(query.regions).effective
         area = ""
-        if query.regions:
-            area = query.regions[0].replace("省", "").replace("市", "")
+        if effective_regions:
+            area = effective_regions[0].replace("省", "").replace("市", "")
         items: list[ListItem] = []
         seen: set[str] = set()
         for kw in keywords[:3]:
@@ -323,6 +327,105 @@ class CebpubSource(TenderSourceAdapter):
             )
         return results
 
+    async def _fetch_verified_legacy_detail(
+        self,
+        item: ListItem,
+        *,
+        business_id: str,
+        detail_url: str,
+        timeout_seconds: float | None = None,
+    ) -> DetailResult | None:
+        """Try the old official JSON chain without trusting empty/generic responses."""
+        raw = item.raw or {}
+        detail_form = {
+            "schemaVersion": raw.get("schemaVersion") or "V60.02",
+            "businessKeyWord": "tenderBulletin",
+            "tenderProjectCode": raw.get("tenderProjectCode") or "",
+            "businessId": business_id,
+            "businessObjectName": item.title,
+            "transactionPlatfName": raw.get("transactionPlatfName") or "",
+            "platformCode": raw.get("transactionPlatfCode")
+            or raw.get("platformCode")
+            or "",
+            "oldBusinessId": raw.get("oldBusinessId") or business_id,
+        }
+        api_form = {
+            "schemaVersion": detail_form["schemaVersion"],
+            "businessKeyWord": "tenderBulletin",
+            "tenderProjectCode": detail_form["tenderProjectCode"],
+            "businessObjectName": item.title,
+            "businessId": business_id,
+        }
+        request = self.fetcher.post_form_sequence(
+            [(DETAIL_PAGE, detail_form), (DETAIL_API, api_form)]
+        )
+        try:
+            responses = (
+                await asyncio.wait_for(request, timeout=timeout_seconds)
+                if timeout_seconds is not None
+                else await request
+            )
+            page_text = getattr(responses[0], "text", "") or ""
+            page_probe = _norm(page_text)
+            title_probe = _norm(item.title)[:16]
+            page_matches = bool(
+                business_id
+                and business_id in page_text
+                and title_probe
+                and title_probe in page_probe
+            )
+            detail_payload = responses[1].json()
+            current = _find_current_detail(
+                detail_payload, business_id=business_id, title=item.title
+            )
+            if not current:
+                return None
+            full_clean = _build_detail_content(item, current)
+            if not full_clean:
+                return None
+            raw_json = json.dumps(current, ensure_ascii=False, default=str)
+            metadata = {
+                "detail_status": "full",
+                "detail_fetched": True,
+                "detail_endpoint": DETAIL_API,
+                "business_id": business_id or None,
+                "tender_project_code": detail_form["tenderProjectCode"] or None,
+                "verified_by": "official_detail_chain+id+title",
+                "detail_url": detail_url,
+                "verified_title": current.get("businessObjectName")
+                or current.get("title")
+                or item.title,
+                "page_matches": page_matches,
+                "acquisition_path": "legacy_official_json",
+            }
+            return DetailResult(
+                title=item.title,
+                source_url=detail_url,
+                publish_time=item.publish_time,
+                region=item.region,
+                raw_content=raw_json[:500000],
+                clean_content=full_clean,
+                attachment_links=[],
+                detail_fetched=True,
+                detail_status="full",
+                detail_url=detail_url,
+                content_format="json",
+                source_metadata=metadata,
+                raw={
+                    **raw,
+                    "detail_fetched": True,
+                    "detail_status": "full",
+                    "detail_payload": current,
+                },
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.info(
+                "cebpub legacy detail fallback unavailable for %s: %s",
+                business_id or item.title,
+                type(exc).__name__,
+            )
+            return None
+
     async def fetch_detail(
         self, item: ListItem, *, interactive: bool = False
     ) -> DetailResult:
@@ -334,12 +437,22 @@ class CebpubSource(TenderSourceAdapter):
         # 真实平台 ID 为 32 位十六进制字符。此路径等待 PDF.js 文本层，
         # 避免把入口页、广告或同类项目内容当作公告正文。
         if re.fullmatch(r"[0-9a-fA-F]{32}", business_id):
+            settings = get_settings()
+            managed = settings.cebpub_browser_mode == "managed"
             pdf_detail = await fetch_public_pdf_detail(
                 detail_url=detail_url,
                 expected_id=business_id,
                 expected_title=item.title,
-                timeout_ms=300_000 if interactive else 25_000,
+                expected_project_code=(
+                    str(raw.get("tenderProjectCode") or "").strip() or None
+                ),
+                timeout_ms=(
+                    300_000
+                    if interactive
+                    else settings.cebpub_browser_timeout_seconds * 1_000
+                ),
                 headless=not interactive,
+                managed=managed,
             )
             pdf_metadata = {
                 "detail_status": pdf_detail.status,
@@ -347,12 +460,40 @@ class CebpubSource(TenderSourceAdapter):
                 "pdf_url": pdf_detail.pdf_url,
                 "business_id": business_id,
                 "tender_project_code": raw.get("tenderProjectCode") or None,
-                "verified_by": "uuid+page_title+pdf_title",
+                "verified_by": "official_origin+uuid+outer_title+pdf_identity_signals+complete_pages",
                 "content_format": pdf_detail.content_format,
                 "content_pages": pdf_detail.pages,
                 "message": pdf_detail.message,
                 "failure_reason": pdf_detail.failure_reason,
-                "acquisition_mode": "interactive" if interactive else "headless",
+                "acquisition_mode": pdf_detail.acquisition_mode
+                or (
+                    "managed_chrome"
+                    if managed
+                    else ("interactive" if interactive else "headless")
+                ),
+                "browser_reused": pdf_detail.browser_reused,
+                "browser_state": pdf_detail.browser_state,
+                "interaction_requested": interactive,
+                "detail_attempt_state": (
+                    "blocked" if pdf_detail.site_blocked else "attempted"
+                ),
+                "failure_stage": pdf_detail.failure_stage,
+                "attempt_count": pdf_detail.attempt_count,
+                "duration_ms": pdf_detail.duration_ms,
+                "validation_signals": pdf_detail.validation_signals,
+                "site_blocked": pdf_detail.site_blocked,
+                "acquisition_path": pdf_detail.acquisition_path,
+                "document_page_count": pdf_detail.document_page_count,
+                "terminal_failure": pdf_detail.terminal_failure,
+                "retryable": pdf_detail.retryable,
+                "viewer_error_code": pdf_detail.viewer_error_code,
+                "viewer_error_message": str(
+                    pdf_detail.viewer_error_message or ""
+                )[:500]
+                or None,
+                "fallback_attempted": pdf_detail.fallback_attempted,
+                "fallback_result": pdf_detail.fallback_result,
+                "time_to_failure_ms": pdf_detail.time_to_failure_ms,
             }
             if pdf_detail.status == "full":
                 raw_json = json.dumps(
@@ -379,105 +520,107 @@ class CebpubSource(TenderSourceAdapter):
                         "content_pages": pdf_detail.pages,
                     },
                 )
-            if pdf_detail.status in {"needs_human_verification", "failed"}:
-                return DetailResult(
-                    title=item.title,
-                    source_url=detail_url,
-                    publish_time=item.publish_time,
-                    region=item.region,
-                    raw_content=clean,
-                    clean_content=clean,
-                    attachment_links=[],
-                    detail_fetched=False,
-                    detail_status=pdf_detail.status,
+            # 旧官方 JSON 只作为 3 秒短兜底；空对象或身份校验失败绝不覆盖
+            # PDF.js 的真实失败原因，也不把通用门户内容当作公告正文。
+            fallback_allowed = not pdf_detail.site_blocked and pdf_detail.failure_reason not in {
+                "verification_required",
+                "verification_timeout",
+                "site_rate_limited",
+            }
+            fallback = None
+            if fallback_allowed:
+                pdf_metadata["fallback_attempted"] = True
+                fallback = await self._fetch_verified_legacy_detail(
+                    item,
+                    business_id=business_id,
                     detail_url=detail_url,
-                    content_format=pdf_detail.content_format,
-                    source_metadata=pdf_metadata,
-                    raw={
-                        **raw,
-                        "detail_fetched": False,
-                        "detail_status": pdf_detail.status,
-                    },
+                    timeout_seconds=3.0,
                 )
-        detail_form = {
-            "schemaVersion": raw.get("schemaVersion") or "V60.02",
-            "businessKeyWord": "tenderBulletin",
-            "tenderProjectCode": raw.get("tenderProjectCode") or "",
-            "businessId": business_id,
-            "businessObjectName": item.title,
-            "transactionPlatfName": raw.get("transactionPlatfName") or "",
-            "platformCode": raw.get("transactionPlatfCode") or raw.get("platformCode") or "",
-            "oldBusinessId": raw.get("oldBusinessId") or business_id,
-        }
-        api_form = {
-            "schemaVersion": detail_form["schemaVersion"],
-            "businessKeyWord": "tenderBulletin",
-            "tenderProjectCode": detail_form["tenderProjectCode"],
-            "businessObjectName": item.title,
-            "businessId": business_id,
-        }
+            if fallback is not None:
+                fallback_metadata = dict(fallback.source_metadata or {})
+                fallback_metadata.update(
+                    {
+                        "fallback_attempted": True,
+                        "fallback_result": "legacy_official_json_full",
+                        "primary_acquisition_path": pdf_detail.acquisition_path,
+                        "primary_failure_reason": pdf_detail.failure_reason,
+                        "primary_failure_stage": pdf_detail.failure_stage,
+                        "primary_duration_ms": pdf_detail.duration_ms,
+                    }
+                )
+                fallback.source_metadata = fallback_metadata
+                return fallback
+            if fallback_allowed:
+                pdf_metadata["fallback_result"] = "empty_or_unverified"
+
+            attempted_at = datetime.now(TZ)
+            cooldown_until = None
+            if (
+                pdf_detail.terminal_failure
+                and settings.cebpub_invalid_pdf_cooldown_hours > 0
+            ):
+                cooldown_until = attempted_at + timedelta(
+                    hours=settings.cebpub_invalid_pdf_cooldown_hours
+                )
+            pdf_metadata["cooldown_until"] = (
+                cooldown_until.isoformat() if cooldown_until else None
+            )
+            pdf_metadata["last_attempt"] = {
+                "attempted_at": attempted_at.isoformat(),
+                "status": pdf_detail.status,
+                "detail_fetched": False,
+                "detail_attempt_state": pdf_metadata["detail_attempt_state"],
+                "failure_reason": pdf_detail.failure_reason,
+                "failure_stage": pdf_detail.failure_stage,
+                "acquisition_path": pdf_detail.acquisition_path,
+                "message": str(pdf_detail.message or "")[:500],
+                "attempt_count": pdf_detail.attempt_count,
+                "duration_ms": pdf_detail.duration_ms,
+                "terminal_failure": pdf_detail.terminal_failure,
+                "retryable": pdf_detail.retryable,
+                "cooldown_until": pdf_metadata["cooldown_until"],
+                "fallback_attempted": bool(pdf_metadata["fallback_attempted"]),
+                "fallback_result": pdf_metadata.get("fallback_result"),
+                "viewer_error_code": pdf_metadata.get("viewer_error_code"),
+                "viewer_error_message": pdf_metadata.get("viewer_error_message"),
+                "time_to_failure_ms": pdf_metadata.get("time_to_failure_ms", 0),
+            }
+            return DetailResult(
+                title=item.title,
+                source_url=detail_url,
+                publish_time=item.publish_time,
+                region=item.region,
+                raw_content=clean,
+                clean_content=clean,
+                attachment_links=[],
+                detail_fetched=False,
+                detail_status=pdf_detail.status,
+                detail_url=detail_url,
+                content_format=pdf_detail.content_format,
+                source_metadata=pdf_metadata,
+                raw={
+                    **raw,
+                    "detail_fetched": False,
+                    "detail_status": pdf_detail.status,
+                },
+            )
+        fallback = await self._fetch_verified_legacy_detail(
+            item,
+            business_id=business_id,
+            detail_url=detail_url,
+        )
+        if fallback is not None:
+            return fallback
         metadata = {
             "detail_status": "metadata_only",
             "detail_endpoint": DETAIL_API,
             "business_id": business_id or None,
-            "tender_project_code": detail_form["tenderProjectCode"] or None,
+            "tender_project_code": raw.get("tenderProjectCode") or None,
             "verified_by": "official_detail_chain",
             "detail_url": detail_url,
+            "fallback_attempted": True,
+            "fallback_result": "empty_or_unverified",
         }
-        try:
-            responses = await self.fetcher.post_form_sequence(
-                [(DETAIL_PAGE, detail_form), (DETAIL_API, api_form)]
-            )
-            page_text = getattr(responses[0], "text", "") or ""
-            page_probe = _norm(page_text)
-            title_probe = _norm(item.title)[:16]
-            page_matches = bool(
-                business_id
-                and business_id in page_text
-                and title_probe
-                and title_probe in page_probe
-            )
-            detail_payload = responses[1].json()
-            current = _find_current_detail(
-                detail_payload, business_id=business_id, title=item.title
-            )
-            # JSON 节点已经以 ID + 标题双锚点校验；页面文本仅作额外审计信息。
-            if current:
-                full_clean = _build_detail_content(item, current)
-                if full_clean:
-                    raw_json = json.dumps(current, ensure_ascii=False, default=str)
-                    metadata.update(
-                        {
-                            "detail_status": "full",
-                            "detail_fetched": True,
-                            "verified_title": current.get("businessObjectName")
-                            or current.get("title")
-                            or item.title,
-                            "page_matches": page_matches,
-                        }
-                    )
-                    return DetailResult(
-                        title=item.title,
-                        source_url=detail_url,
-                        publish_time=item.publish_time,
-                        region=item.region,
-                        raw_content=raw_json[:500000],
-                        clean_content=full_clean,
-                        attachment_links=[],
-                        detail_fetched=True,
-                        detail_status="full",
-                        detail_url=detail_url,
-                        content_format="json",
-                        source_metadata=metadata,
-                        raw={
-                            **raw,
-                            "detail_fetched": True,
-                            "detail_status": "full",
-                            "detail_payload": current,
-                        },
-                    )
-        except Exception as exc:  # noqa: BLE001
-            logger.info("cebpub detail unavailable for %s: %s", business_id or item.title, exc)
         return DetailResult(
             title=item.title,
             source_url=detail_url,

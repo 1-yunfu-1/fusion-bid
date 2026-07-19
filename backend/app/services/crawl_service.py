@@ -2,13 +2,16 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
+import json
 import logging
+import time
 from dataclasses import dataclass, field
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
 
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.browser.session import LoginRequiredError
@@ -25,19 +28,38 @@ from app.models.announcement import TenderAnnouncement
 from app.models.company import CompanyProfile
 from app.models.company import AnnouncementFieldCorrection
 from app.models.execution import TaskExecution
+from app.models.quality import AnnouncementCrawlAttempt
 from app.models.task import SearchTask
+from app.parsers.regions import resolve_region_selection
 from app.reports.analysis import build_execution_analysis
 from app.reports.fields import (
     apply_manual_corrections,
+    build_extraction_data,
     build_extraction_data_with_ai,
     source_display_name,
 )
+from app.reports.lifecycle import classify_announcement, is_opportunity
 from app.reports.word_report import ReportContext, SourceRunStat, generate_report_file
-from app.sources.base import SearchQuery
+from app.sources.base import (
+    DetailResult,
+    ListItem,
+    SearchQuery,
+    TenderSourceAdapter,
+)
 from app.sources.registry import build_sources
 
 logger = logging.getLogger(__name__)
 TZ = ZoneInfo("Asia/Shanghai")
+
+_COOLDOWN_FAILURE_REASONS = {
+    "pdf_invalid_or_corrupt",
+    "pdf_too_large",
+    "pdf_page_limit",
+    "pdf_parse_failure",
+    "ocr_failure",
+    "ocr_timeout",
+    "official_content_unavailable",
+}
 
 
 @dataclass
@@ -54,6 +76,8 @@ class CrawlStats:
     detail_success_count: int = 0
     detail_metadata_only_count: int = 0
     detail_human_verification_count: int = 0
+    detail_not_attempted_count: int = 0
+    cached_full_reused_count: int = 0
     detail_filtered_out: int = 0
     candidates_count: int = 0
     filtered_out_count: int = 0  # list + detail 过滤合计（兼容）
@@ -74,11 +98,331 @@ class CrawlStats:
     deduplicate: bool = True
     truncated: bool = False
     analysis_data: dict = field(default_factory=dict)
+    failure_breakdown: dict[str, int] = field(default_factory=dict)
+    failure_breakdown_by_source: dict[str, dict[str, int]] = field(default_factory=dict)
+    source_detail_breakdown: dict[str, dict[str, int]] = field(default_factory=dict)
+    stage_durations_ms: dict[str, int] = field(default_factory=dict)
+    effective_concurrency: dict[str, object] = field(default_factory=dict)
+    requested_regions: list[str] = field(default_factory=list)
+    effective_regions: list[str] = field(default_factory=list)
+    region_scope: str = "restricted"
+    detail_cap: int = 30
+    coverage_status: str = "complete"
+    search_depth: str = "standard"
+    extraction_cache_hit_count: int = 0
+    llm_call_count: int = 0
+    llm_timeout_count: int = 0
+    opportunity_count: int = 0
+    lifecycle_count: int = 0
+    source_outcomes: dict[str, dict[str, object]] = field(default_factory=dict)
+
+
+@dataclass
+class _SourceDiscovery:
+    source: TenderSourceAdapter
+    source_stat: SourceRunStat
+    items: list[ListItem] = field(default_factory=list)
+    status: str = "success"
+    error: str | None = None
+    list_filtered_out: int = 0
+    detail_cap_skipped: int = 0
+    truncated: bool = False
+
+
+@dataclass
+class _ProcessedDetail:
+    source: TenderSourceAdapter
+    item: ListItem
+    detail: DetailResult
+    candidate: CandidateRecord | None
+    detail_meta: dict
+    accepted: bool = True
+    acquisition_exception: bool = False
+    extraction_failed: bool = False
+    detail_duration_ms: int = 0
+    extraction_duration_ms: int = 0
+    extraction_cache_hit: bool = False
+
+
+class _ExtractionRunController:
+    """单次执行内的模型预算、缓存计数和超时熔断。"""
+
+    def __init__(self, *, timeout_threshold: int, execution_budget_seconds: int) -> None:
+        self.timeout_threshold = max(1, timeout_threshold)
+        self._lock = asyncio.Lock()
+        self.timeout_streak = 0
+        self.call_count = 0
+        self.timeout_count = 0
+        self.cache_hit_count = 0
+        self.circuit_open = False
+        self.execution_budget_seconds = max(1, execution_budget_seconds)
+        self.started_at = time.monotonic()
+        self.budget_exhausted = False
+
+    async def cache_hit(self) -> None:
+        async with self._lock:
+            self.cache_hit_count += 1
+
+    async def begin_call(self) -> bool:
+        async with self._lock:
+            if time.monotonic() - self.started_at >= self.execution_budget_seconds:
+                self.budget_exhausted = True
+                return False
+            if self.circuit_open:
+                return False
+            self.call_count += 1
+            return True
+
+    async def observe(self, *, timed_out: bool) -> None:
+        async with self._lock:
+            if timed_out:
+                self.timeout_count += 1
+                self.timeout_streak += 1
+                if self.timeout_streak >= self.timeout_threshold:
+                    self.circuit_open = True
+            else:
+                self.timeout_streak = 0
+
+
+def _rules_need_ai(fields: dict[str, object]) -> bool:
+    missing_values = {
+        None,
+        "",
+        "原文未明确说明",
+        "本次未成功提取",
+        "提取失败，待复核",
+    }
+    lifecycle = str(fields.get("lifecycle_stage") or "机会公告")
+    required = {
+        "机会公告": ("purchaser", "project_code", "qualification", "bid_deadline"),
+        "结果公告": ("purchaser", "project_code", "awardee", "award_amount"),
+        "更正/澄清": ("project_code", "change_summary"),
+        "终止/废标": ("project_code", "termination_reason"),
+    }.get(lifecycle, ("purchaser", "project_code"))
+    return any(fields.get(name) in missing_values for name in required)
+
+
+class _CebpubRunController:
+    """单次执行内的 CEBPUB 并发、降速和断路状态。"""
+
+    def __init__(self, *, concurrency: int, block_threshold: int) -> None:
+        self.configured_concurrency = max(1, concurrency)
+        self.block_threshold = max(1, block_threshold)
+        self._condition = asyncio.Condition()
+        self._active = 0
+        self._block_streak = 0
+        self._cooldown_until = 0.0
+        self.degraded = False
+        self.circuit_open = False
+
+    @property
+    def effective_limit(self) -> int:
+        return 1 if self.degraded else self.configured_concurrency
+
+    async def acquire(self) -> bool:
+        async with self._condition:
+            await self._condition.wait_for(
+                lambda: self.circuit_open or self._active < self.effective_limit
+            )
+            if self.circuit_open:
+                return False
+            self._active += 1
+            cooldown = max(0.0, self._cooldown_until - time.monotonic())
+        if cooldown:
+            await asyncio.sleep(cooldown)
+        return True
+
+    async def release(self) -> None:
+        async with self._condition:
+            self._active = max(0, self._active - 1)
+            self._condition.notify_all()
+
+    async def observe(self, detail: DetailResult) -> None:
+        metadata = detail.source_metadata or {}
+        reason = str(metadata.get("failure_reason") or "")
+        blocked = bool(metadata.get("site_blocked")) or reason in {
+            "verification_required",
+            "verification_timeout",
+            "site_rate_limited",
+        }
+        async with self._condition:
+            if blocked:
+                self._block_streak += 1
+                self.degraded = True
+                self._cooldown_until = max(self._cooldown_until, time.monotonic() + 3)
+                if self._block_streak >= self.block_threshold:
+                    self.circuit_open = True
+            else:
+                self._block_streak = 0
+            self._condition.notify_all()
+
+
+def _metadata_detail(
+    item: ListItem,
+    *,
+    status: str,
+    attempt_state: str,
+    reason: str,
+    message: str,
+    failure_stage: str,
+) -> DetailResult:
+    content = "\n".join(
+        value for value in (item.title, item.snippet or "") if value
+    )
+    return DetailResult(
+        title=item.title,
+        source_url=item.source_url,
+        publish_time=item.publish_time,
+        region=item.region,
+        raw_content=content,
+        clean_content=content,
+        attachment_links=[],
+        detail_fetched=False,
+        detail_status=status,
+        detail_url=item.source_url,
+        source_metadata={
+            "detail_status": status,
+            "detail_attempt_state": attempt_state,
+            "failure_reason": reason,
+            "failure_stage": failure_stage,
+            "message": message,
+        },
+        raw=dict(item.raw or {}),
+    )
+
+
+def _failure_bucket(detail: DetailResult, *, extraction_failed: bool = False) -> str | None:
+    if extraction_failed:
+        return "extraction_failure"
+    metadata = detail.source_metadata or {}
+    attempt_state = metadata.get("detail_attempt_state")
+    reason = str(metadata.get("failure_reason") or "")
+    if reason == "invalid_pdf_cooldown":
+        return "invalid_pdf_cooldown"
+    if attempt_state == "not_attempted":
+        return "not_attempted"
+    if attempt_state == "blocked" or reason in {
+        "site_rate_limited",
+        "verification_required",
+        "verification_timeout",
+        "site_block_circuit_open",
+    }:
+        return "site_blocked"
+    if reason in {
+        "browser_closed",
+        "managed_browser_unavailable",
+        "collector_error",
+        "collector_exception",
+    }:
+        return "browser_failure"
+    if reason == "html_parse_failure":
+        return "html_parse_failure"
+    if reason == "html_content_empty":
+        return "html_content_empty"
+    if reason == "http_detail_fetch_failure":
+        return "http_detail_failure"
+    if reason in {"pdf_invalid_or_corrupt", "pdf_parse_failure"}:
+        return "invalid_pdf"
+    if reason in {"ocr_failure", "ocr_timeout"}:
+        return "ocr_failure"
+    if reason in {
+        "content_unavailable",
+        "incomplete_pdf_pages",
+        "pdf_too_large",
+        "pdf_page_limit",
+    }:
+        return "pdf_incomplete"
+    if reason in {
+        "pdf_not_ready",
+        "pdf_not_loaded",
+        "pdf_document_unavailable",
+        "pdf_bytes_timeout",
+        "collector_timeout",
+    }:
+        return "transient_pdf_timeout"
+    if reason == "outer_detail_unavailable":
+        return "outer_detail_unavailable"
+    if reason == "official_content_unavailable":
+        return "official_content_unavailable"
+    if reason in {"identity_mismatch", "pdf_title_mismatch"}:
+        return "identity_conflict"
+    if detail.detail_status != "full":
+        return "metadata_only_other"
+    return None
 
 
 def _content_hash(title: str, content: str, url: str) -> str:
-    raw = f"{title}|{content[:2000]}|{url}"
+    raw = f"{title}|{content}|{url}"
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def _document_hash(content: str) -> str:
+    """Hash the complete normalized document, independent of source URL."""
+    normalized = "\n".join(
+        line.rstrip() for line in (content or "").replace("\r\n", "\n").split("\n")
+    ).strip()
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+
+
+def _extraction_fingerprint(*, company_profile: dict | None = None) -> str:
+    settings = get_settings()
+    profile_blob = json.dumps(
+        company_profile or {}, ensure_ascii=False, sort_keys=True, default=str
+    )
+    raw = "|".join(
+        [
+            "extraction-v3",
+            "fields-prompt-20260719-v1",
+            settings.llm_prefer_order,
+            settings.llm_model,
+            settings.ollama_model,
+            hashlib.sha256(profile_blob.encode("utf-8")).hexdigest(),
+        ]
+    )
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+async def _load_extraction_cache(
+    db: AsyncSession,
+    work: list[tuple[TenderSourceAdapter, ListItem]],
+) -> dict[tuple[str, str], TenderAnnouncement]:
+    source_names = {source.source_name for source, _ in work}
+    source_item_ids = {str(item.source_item_id) for _, item in work if item.source_item_id}
+    urls = {item.source_url for _, item in work if item.source_url}
+    if not source_names or (not source_item_ids and not urls):
+        return {}
+    identities = []
+    if source_item_ids:
+        identities.append(TenderAnnouncement.source_item_id.in_(source_item_ids))
+    if urls:
+        identities.append(TenderAnnouncement.source_url.in_(urls))
+    rows = (
+        await db.execute(
+            select(TenderAnnouncement).where(
+                TenderAnnouncement.source_name.in_(source_names),
+                or_(*identities),
+            )
+        )
+    ).scalars().all()
+    cache: dict[tuple[str, str], TenderAnnouncement] = {}
+    for row in rows:
+        if row.source_item_id:
+            cache[(row.source_name, f"id:{row.source_item_id}")] = row
+        if row.source_url:
+            cache[(row.source_name, f"url:{row.source_url}")] = row
+    return cache
+
+
+def _cached_announcement_for(
+    cache: dict[tuple[str, str], TenderAnnouncement],
+    source: TenderSourceAdapter,
+    item: ListItem,
+) -> TenderAnnouncement | None:
+    if item.source_item_id:
+        row = cache.get((source.source_name, f"id:{item.source_item_id}"))
+        if row:
+            return row
+    return cache.get((source.source_name, f"url:{item.source_url}"))
 
 
 def _source_dedupe_key(source_name: str, item_id: str | None, url: str, title: str) -> str:
@@ -173,6 +517,10 @@ def _build_snapshot_output_items(
                 "region": record.region,
                 "project_code": record.project_code,
                 "announcement_type": record.announcement_type,
+                "lifecycle_stage": record.lifecycle_stage,
+                "procurement_method": record.procurement_method,
+                "document_hash": record.document_hash,
+                "extraction_fingerprint": record.extraction_fingerprint,
                 "detail_status": record.detail_status or meta.get("detail_status", "unknown"),
                 "source_metadata": record.source_metadata
                 or meta.get("source_metadata")
@@ -194,6 +542,473 @@ def _build_snapshot_output_items(
     return items
 
 
+async def _discover_source(
+    source: TenderSourceAdapter,
+    *,
+    query: SearchQuery,
+    ctx: FilterContext,
+    detail_cap: int,
+    report_mode: str,
+    semaphore: asyncio.Semaphore,
+) -> _SourceDiscovery:
+    source_stat = SourceRunStat(
+        source_name=source.source_name,
+        display_name=getattr(source, "display_name", None)
+        or source_display_name(source.source_name),
+    )
+    try:
+        async with semaphore:
+            if source.requires_login:
+                health = await source.health_check()
+                if not health.ok or health.login_ok is False:
+                    message = health.message or "登录态不可用，已跳过（公开源继续）"
+                    source_stat.status = "skipped"
+                    source_stat.message = message
+                    return _SourceDiscovery(
+                        source=source,
+                        source_stat=source_stat,
+                        status="skipped",
+                        error=message,
+                    )
+            list_items = await source.search(query)
+        kept: list[ListItem] = []
+        filtered_out = 0
+        for item in list_items:
+            result = filter_list_item(item, ctx)
+            if result.accepted:
+                kept.append(item)
+            else:
+                filtered_out += 1
+        source_stat.raw_count = len(list_items)
+        source_stat.list_kept = len(kept)
+        source_stat.status = "success"
+        source_stat.message = "检索完成"
+        return _SourceDiscovery(
+            source=source,
+            source_stat=source_stat,
+            items=kept[:detail_cap],
+            list_filtered_out=filtered_out,
+            detail_cap_skipped=max(0, len(kept) - detail_cap),
+            truncated=len(kept) > detail_cap,
+        )
+    except LoginRequiredError as exc:
+        message = str(exc)
+        source_stat.status = "skipped"
+        source_stat.message = message
+        return _SourceDiscovery(
+            source=source,
+            source_stat=source_stat,
+            status="skipped",
+            error=message,
+        )
+    except Exception as exc:  # noqa: BLE001
+        message = str(exc)
+        logger.exception("source %s failed", source.source_name)
+        source_stat.status = "failed"
+        source_stat.message = message
+        return _SourceDiscovery(
+            source=source,
+            source_stat=source_stat,
+            status="failed",
+            error=message,
+        )
+
+
+def _as_aware_datetime(value: object) -> datetime | None:
+    if isinstance(value, datetime):
+        parsed = value
+    elif isinstance(value, str) and value.strip():
+        try:
+            parsed = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+        except ValueError:
+            return None
+    else:
+        return None
+    return parsed.replace(tzinfo=TZ) if parsed.tzinfo is None else parsed
+
+
+def _active_pdf_cooldown(
+    metadata: dict[str, object],
+    *,
+    now: datetime,
+    cooldown_hours: int,
+) -> dict[str, object] | None:
+    attempts = [
+        metadata.get("last_recrawl"),
+        metadata.get("last_attempt"),
+        metadata,
+    ]
+    for value in attempts:
+        if not isinstance(value, dict):
+            continue
+        reason = str(value.get("failure_reason") or "")
+        terminal = bool(value.get("terminal_failure")) or reason in _COOLDOWN_FAILURE_REASONS
+        if not terminal or reason not in _COOLDOWN_FAILURE_REASONS:
+            continue
+        cooldown_until = _as_aware_datetime(
+            value.get("cooldown_until") or metadata.get("cooldown_until")
+        )
+        if cooldown_until is None:
+            attempted_at = _as_aware_datetime(
+                value.get("attempted_at") or value.get("at")
+            )
+            if attempted_at is None or cooldown_hours <= 0:
+                continue
+            cooldown_until = attempted_at + timedelta(hours=cooldown_hours)
+        if cooldown_until <= now:
+            continue
+        return {
+            "failure_reason": reason,
+            "cooldown_until": cooldown_until.isoformat(),
+            "last_attempt": dict(value),
+        }
+    return None
+
+
+async def _load_cebpub_cooldowns(
+    db: AsyncSession,
+    work: list[tuple[TenderSourceAdapter, ListItem]],
+    *,
+    now: datetime,
+    report_mode: str,
+) -> dict[str, dict[str, object]]:
+    settings = get_settings()
+    if (
+        report_mode == "full_snapshot"
+        or settings.cebpub_invalid_pdf_cooldown_hours <= 0
+    ):
+        return {}
+    source_ids = {
+        str(item.source_item_id)
+        for source, item in work
+        if source.source_name == "cebpub" and item.source_item_id
+    }
+    if not source_ids:
+        return {}
+    rows = (
+        await db.execute(
+            select(TenderAnnouncement).where(
+                TenderAnnouncement.source_name == "cebpub",
+                TenderAnnouncement.source_item_id.in_(source_ids),
+            )
+        )
+    ).scalars().all()
+    active: dict[str, dict[str, object]] = {}
+    for row in rows:
+        if not row.source_item_id:
+            continue
+        value = _active_pdf_cooldown(
+            dict(row.source_metadata or {}),
+            now=now,
+            cooldown_hours=settings.cebpub_invalid_pdf_cooldown_hours,
+        )
+        if value:
+            active[str(row.source_item_id)] = value
+    return active
+
+
+async def _process_detail_work(
+    source: TenderSourceAdapter,
+    item: ListItem,
+    *,
+    ctx: FilterContext,
+    keywords: list[str],
+    source_semaphore: asyncio.Semaphore,
+    llm_semaphore: asyncio.Semaphore,
+    cebpub_controller: _CebpubRunController,
+    extraction_controller: _ExtractionRunController,
+    extraction_fingerprint: str,
+    cached_announcement: TenderAnnouncement | None = None,
+    refresh_extraction: bool = False,
+    cooldown: dict[str, object] | None = None,
+) -> _ProcessedDetail:
+    detail_started = time.monotonic()
+    acquisition_exception = False
+    attachment_extract_failed = False
+    detail: DetailResult | None = None
+
+    async def fetch() -> DetailResult:
+        nonlocal attachment_extract_failed
+        detail_value = await source.fetch_detail(item, interactive=False)
+        try:
+            attachments = await source.extract_attachments(detail_value)
+            detail_value.attachment_links = attachments or []
+        except Exception as attachment_error:  # noqa: BLE001
+            logger.warning(
+                "%s attach extract fail %s: %s",
+                source.source_name,
+                item.source_url,
+                attachment_error,
+            )
+            detail_value.attachment_links = list(detail_value.attachment_links or [])
+            attachment_extract_failed = True
+        return detail_value
+
+    if source.source_name == "cebpub" and cooldown:
+        detail = _metadata_detail(
+            item,
+            status="metadata_only",
+            attempt_state="not_attempted",
+            reason="invalid_pdf_cooldown",
+            message=(
+                "该公告最近一次确定性 PDF 失败仍在冷却期，本轮已快速跳过；"
+                f"可在 {cooldown.get('cooldown_until')} 后自动重试"
+            ),
+            failure_stage="preflight",
+        )
+        detail.source_metadata.update(
+            {
+                "terminal_failure": True,
+                "retryable": False,
+                "cooldown_until": cooldown.get("cooldown_until"),
+                "last_failure_reason": cooldown.get("failure_reason"),
+                "last_attempt": cooldown.get("last_attempt") or {},
+                "fallback_attempted": False,
+                "fallback_result": "cooldown_skip",
+                "time_to_failure_ms": 0,
+            }
+        )
+    elif source.source_name == "cebpub":
+        allowed = await cebpub_controller.acquire()
+        if not allowed:
+            detail = _metadata_detail(
+                item,
+                status="metadata_only",
+                attempt_state="not_attempted",
+                reason="site_block_circuit_open",
+                message="本轮官方站点已连续阻断，剩余公告未继续请求",
+                failure_stage="navigation",
+            )
+        else:
+            try:
+                detail = await fetch()
+            except Exception as exc:  # noqa: BLE001
+                acquisition_exception = True
+                logger.warning("%s detail fail %s: %s", source.source_name, item.source_url, exc)
+                detail = _metadata_detail(
+                    item,
+                    status="failed",
+                    attempt_state="attempted",
+                    reason="collector_exception",
+                    message=f"详情采集异常：{type(exc).__name__}",
+                    failure_stage="detail_acquisition",
+                )
+            finally:
+                try:
+                    if detail is not None:
+                        await cebpub_controller.observe(detail)
+                        if cebpub_controller.degraded:
+                            try:
+                                from app.browser.managed_public import (
+                                    get_managed_public_browser,
+                                )
+
+                                get_managed_public_browser().set_adaptive_mode(True)
+                            except Exception:  # noqa: BLE001
+                                pass
+                finally:
+                    await cebpub_controller.release()
+    else:
+        try:
+            async with source_semaphore:
+                detail = await fetch()
+        except Exception as exc:  # noqa: BLE001
+            acquisition_exception = True
+            logger.warning("%s detail fail %s: %s", source.source_name, item.source_url, exc)
+            reason = str(getattr(exc, "failure_reason", "collector_exception"))
+            stage = str(getattr(exc, "failure_stage", "detail_acquisition"))
+            detail = _metadata_detail(
+                item,
+                status="failed",
+                attempt_state="attempted",
+                reason=reason,
+                message=f"详情采集异常：{type(exc).__name__}",
+                failure_stage=stage,
+            )
+
+    detail_duration_ms = int((time.monotonic() - detail_started) * 1000)
+    assert detail is not None
+    metadata = dict(detail.source_metadata or {})
+    metadata.setdefault("detail_attempt_state", "attempted")
+    metadata.setdefault("duration_ms", detail_duration_ms)
+    detail.source_metadata = metadata
+    detail_filter = filter_detail(detail, ctx)
+    detail_meta = {
+        "detail_fetched": detail.detail_fetched,
+        "detail_status": detail.detail_status,
+        "source_metadata": detail.source_metadata,
+        "attachment_extract_failed": attachment_extract_failed,
+        "requires_login": source.requires_login,
+        "detail_url": detail.detail_url or detail.source_url,
+        "content_format": detail.content_format,
+    }
+    if not detail_filter.accepted:
+        return _ProcessedDetail(
+            source=source,
+            item=item,
+            detail=detail,
+            candidate=None,
+            detail_meta=detail_meta,
+            accepted=False,
+            acquisition_exception=acquisition_exception,
+            detail_duration_ms=detail_duration_ms,
+        )
+
+    dedupe_key = _source_dedupe_key(
+        source.source_name, item.source_item_id, detail.source_url, detail.title
+    )
+    content_hash = _content_hash(detail.title, detail.clean_content, detail.source_url)
+    document_hash = _document_hash(detail.clean_content)
+    summary = simple_summary(detail.title, detail.clean_content)
+    project_code = normalize_bid_code(f"{detail.title} {detail.clean_content or ''}")
+    extraction_started = time.monotonic()
+    extraction_failed = False
+    extraction_cache_hit = bool(
+        not refresh_extraction
+        and detail.detail_status == "full"
+        and cached_announcement is not None
+        and cached_announcement.document_hash == document_hash
+        and cached_announcement.extraction_fingerprint == extraction_fingerprint
+        and cached_announcement.extraction_version == "v3"
+        and isinstance(cached_announcement.extraction_data, dict)
+    )
+    if extraction_cache_hit:
+        extraction_data = dict(cached_announcement.extraction_data or {})
+        detail.source_metadata["extraction_status"] = "cache_hit"
+        await extraction_controller.cache_hit()
+    else:
+        extraction_data = build_extraction_data(
+            title=detail.title,
+            clean_content=detail.clean_content,
+            summary=summary,
+            region=detail.region or item.region,
+            project_code=project_code,
+            publish_time=detail.publish_time,
+            detail_status=detail.detail_status,
+            source_metadata=detail.source_metadata,
+        )
+        should_call_ai = (
+            detail.detail_status == "full"
+            and bool(detail.clean_content.strip())
+            and _rules_need_ai(extraction_data.get("fields") or {})
+        )
+        if should_call_ai:
+            async with llm_semaphore:
+                should_call_ai = await extraction_controller.begin_call()
+                if should_call_ai:
+                    try:
+                        extraction_data = await asyncio.wait_for(
+                            build_extraction_data_with_ai(
+                                title=detail.title,
+                                clean_content=detail.clean_content,
+                                summary=summary,
+                                region=detail.region or item.region,
+                                project_code=project_code,
+                                publish_time=detail.publish_time,
+                                detail_status=detail.detail_status,
+                                source_metadata=detail.source_metadata,
+                            ),
+                            timeout=get_settings().llm_extraction_budget_seconds,
+                        )
+                        ai_validation = extraction_data.get("ai_validation") or {}
+                        timed_out = ai_validation.get("error_kind") == "timeout"
+                        await extraction_controller.observe(timed_out=timed_out)
+                        detail.source_metadata["extraction_status"] = (
+                            "rule_fallback_after_timeout"
+                            if timed_out
+                            else "completed"
+                        )
+                        if timed_out:
+                            detail.source_metadata["ai_pending"] = True
+                    except TimeoutError:
+                        await extraction_controller.observe(timed_out=True)
+                        detail.source_metadata["extraction_status"] = (
+                            "rule_fallback_after_timeout"
+                        )
+                        detail.source_metadata["extraction_failure"] = "TimeoutError"
+                        detail.source_metadata["ai_pending"] = True
+                    except Exception as exc:  # noqa: BLE001
+                        extraction_failed = True
+                        await extraction_controller.observe(timed_out=False)
+                        logger.warning(
+                            "%s extraction failed %s: %s",
+                            source.source_name,
+                            item.source_url,
+                            type(exc).__name__,
+                        )
+                        detail.source_metadata["extraction_status"] = (
+                            "rule_fallback_after_error"
+                        )
+                        detail.source_metadata["extraction_failure"] = type(exc).__name__
+                else:
+                    detail.source_metadata["extraction_status"] = (
+                        "rule_fallback_execution_budget"
+                        if extraction_controller.budget_exhausted
+                        else "rule_fallback_circuit_open"
+                    )
+                    detail.source_metadata["ai_pending"] = True
+        else:
+            detail.source_metadata["extraction_status"] = (
+                "rules_complete"
+                if detail.detail_status == "full"
+                else "rules_only_no_full_detail"
+            )
+    extraction_duration_ms = int((time.monotonic() - extraction_started) * 1000)
+    detail.source_metadata["extraction_duration_ms"] = extraction_duration_ms
+    detail.source_metadata["extraction_cache_hit"] = extraction_cache_hit
+    detail_meta["source_metadata"] = detail.source_metadata
+    extraction_fields = extraction_data.get("fields") or {}
+    lifecycle_stage, procurement_method = classify_announcement(
+        title=detail.title,
+        content=detail.clean_content,
+        explicit_type=extraction_fields.get("announcement_type"),
+    )
+    extraction_fields["lifecycle_stage"] = lifecycle_stage
+    extraction_fields["procurement_method"] = (
+        procurement_method or extraction_fields.get("procurement_method")
+    )
+    announcement_type = extraction_fields.get("announcement_type")
+    candidate = CandidateRecord(
+        title=detail.title[:512],
+        source_name=source.source_name,
+        source_url=detail.source_url,
+        source_item_id=item.source_item_id,
+        requires_login=source.requires_login,
+        data_mode="live",
+        publish_time=detail.publish_time,
+        region=detail.region or item.region,
+        province=None,
+        keywords=keywords,
+        summary=summary,
+        clean_content=detail.clean_content,
+        raw_content=(detail.raw_content or "")[:500000],
+        detail_status=detail.detail_status,
+        source_metadata=detail.source_metadata,
+        extraction_data=extraction_data,
+        attachment_links=list(detail.attachment_links or []),
+        content_hash=content_hash,
+        document_hash=document_hash,
+        extraction_fingerprint=extraction_fingerprint,
+        deduplication_key=dedupe_key,
+        project_code=project_code,
+        announcement_type=announcement_type,
+        lifecycle_stage=lifecycle_stage,
+        procurement_method=procurement_method,
+    )
+    return _ProcessedDetail(
+        source=source,
+        item=item,
+        detail=detail,
+        candidate=candidate,
+        detail_meta=detail_meta,
+        acquisition_exception=acquisition_exception,
+        extraction_failed=extraction_failed,
+        detail_duration_ms=detail_duration_ms,
+        extraction_duration_ms=extraction_duration_ms,
+        extraction_cache_hit=extraction_cache_hit,
+    )
+
+
 async def execute_search_task(
     db: AsyncSession,
     task: SearchTask,
@@ -202,22 +1017,31 @@ async def execute_search_task(
     trigger_type: str = "manual",
     report_mode: str | None = None,
     report_scope: str | None = None,
+    search_depth: str = "standard",
+    refresh_extraction: bool = False,
 ) -> tuple[TaskExecution, CrawlStats]:
-    get_settings()
+    settings = get_settings()
+    execution_wall_started = time.monotonic()
     if report_mode is None:
         report_mode = "full_snapshot" if report_scope == "snapshot" else "incremental"
     report_mode = (
         report_mode if report_mode in {"incremental", "full_snapshot"} else "incremental"
     )
     report_scope = "snapshot" if report_mode == "full_snapshot" else "incremental"
+    if report_mode == "full_snapshot":
+        search_depth = "complete"
+    if search_depth not in {"quick", "standard", "complete"}:
+        search_depth = "standard"
     detail_cap = max_details_per_source
     if detail_cap is None:
-        detail_cap = 500 if report_mode == "full_snapshot" else 8
+        detail_cap = {"quick": 8, "standard": 30, "complete": 500}[search_depth]
     detail_cap = min(max(int(detail_cap), 1), 500)
     stats = CrawlStats(
         report_scope=report_scope,
         report_mode=report_mode,
         deduplicate=report_mode != "full_snapshot",
+        detail_cap=detail_cap,
+        search_depth=search_depth,
     )
     now = datetime.now(TZ)
 
@@ -230,6 +1054,10 @@ async def execute_search_task(
         report_mode=report_mode,
         deduplicate=report_mode != "full_snapshot",
         truncated=False,
+        detail_cap=detail_cap,
+        detail_cap_skipped=0,
+        coverage_status="complete",
+        search_depth=search_depth,
         sources_requested=[],
         sources_succeeded=[],
         raw_result_count=0,
@@ -245,13 +1073,23 @@ async def execute_search_task(
     await db.refresh(execution)
 
     keywords = list(task.keywords or [])
-    regions = list(task.regions or [])
+    region_selection = resolve_region_selection(task.regions)
+    regions = region_selection.requested
+    effective_regions = region_selection.effective
+    stats.requested_regions = list(regions)
+    stats.effective_regions = list(effective_regions)
+    stats.region_scope = region_selection.scope
     start: date | None = task.start_date
     end: date | None = task.end_date
-    ctx = FilterContext(keywords=keywords, regions=regions, start_date=start, end_date=end)
+    ctx = FilterContext(
+        keywords=keywords,
+        regions=effective_regions,
+        start_date=start,
+        end_date=end,
+    )
     query = SearchQuery(
         keywords=keywords,
-        regions=regions,
+        regions=effective_regions,
         start_date=start.isoformat() if start else None,
         end_date=end.isoformat() if end else None,
     )
@@ -264,161 +1102,220 @@ async def execute_search_task(
     candidates: list[CandidateRecord] = []
     # 详情失败等元数据，供报告附件状态
     detail_meta: dict[str, dict] = {}  # key: source_url -> flags
-
-    for source in sources:
-        src_stat = SourceRunStat(
-            source_name=source.source_name,
-            display_name=getattr(source, "display_name", None)
-            or source_display_name(source.source_name),
+    discovery_started = time.monotonic()
+    discovery_semaphore = asyncio.Semaphore(settings.crawl_max_concurrency)
+    discoveries = await asyncio.gather(
+        *(
+            _discover_source(
+                source,
+                query=query,
+                ctx=ctx,
+                detail_cap=detail_cap,
+                report_mode=report_mode,
+                semaphore=discovery_semaphore,
+            )
+            for source in sources
         )
-        try:
-            if source.requires_login:
-                health = await source.health_check()
-                if not health.ok or health.login_ok is False:
-                    msg = health.message or "登录态不可用，已跳过（公开源继续）"
-                    stats.sources_failed[source.source_name] = msg
-                    src_stat.status = "skipped"
-                    src_stat.message = msg
-                    stats.source_stats.append(src_stat)
-                    continue
-            list_items = await source.search(query)
-            src_stat.raw_count = len(list_items)
-            stats.raw_result_count += len(list_items)
-            kept = []
-            for it in list_items:
-                fr = filter_list_item(it, ctx)
-                if fr.accepted:
-                    kept.append(it)
-                else:
-                    stats.list_filtered_out += 1
-                    stats.filtered_out_count += 1
+    )
+    stats.stage_durations_ms["discovery_wall"] = int(
+        (time.monotonic() - discovery_started) * 1000
+    )
 
-            src_stat.list_kept = len(kept)
-            if len(kept) > detail_cap:
-                stats.detail_cap_skipped += len(kept) - detail_cap
-            if report_mode == "full_snapshot" and len(kept) >= 500:
-                stats.truncated = True
+    work: list[tuple[TenderSourceAdapter, ListItem]] = []
+    for discovery in discoveries:
+        stats.source_stats.append(discovery.source_stat)
+        stats.raw_result_count += discovery.source_stat.raw_count
+        stats.list_filtered_out += discovery.list_filtered_out
+        stats.filtered_out_count += discovery.list_filtered_out
+        stats.detail_cap_skipped += discovery.detail_cap_skipped
+        stats.truncated = stats.truncated or discovery.truncated
+        if discovery.status == "success":
+            stats.sources_succeeded.append(discovery.source.source_name)
+            stats.source_outcomes[discovery.source.source_name] = {
+                "status": (
+                    "success_with_results"
+                    if discovery.source_stat.raw_count
+                    else "success_empty"
+                ),
+                "raw_count": discovery.source_stat.raw_count,
+                "kept_count": discovery.source_stat.list_kept,
+                "detail_attempted": len(discovery.items),
+                "detail_cap_skipped": discovery.detail_cap_skipped,
+            }
+            work.extend((discovery.source, item) for item in discovery.items)
+        else:
+            message = discovery.error or "数据源未完成"
+            stats.sources_failed[discovery.source.source_name] = message
+            stats.source_outcomes[discovery.source.source_name] = {
+                "status": (
+                    "login_required"
+                    if discovery.status == "skipped" and discovery.source.requires_login
+                    else "failed"
+                ),
+                "message": message[:500],
+            }
+            if discovery.status == "failed":
+                errors.append(f"{discovery.source.source_name}: {message}")
 
-            for it in kept[:detail_cap]:
-                att_extract_failed = False
-                try:
-                    detail = await source.fetch_detail(it)
-                    try:
-                        atts = await source.extract_attachments(detail)
-                        detail.attachment_links = atts or []
-                    except Exception as att_exc:  # noqa: BLE001
-                        logger.warning(
-                            "%s attach extract fail %s: %s",
-                            source.source_name,
-                            it.source_url,
-                            att_exc,
-                        )
-                        detail.attachment_links = list(detail.attachment_links or [])
-                        att_extract_failed = True
-                    if detail.detail_fetched and detail.detail_status == "full":
-                        stats.detail_success_count += 1
-                        src_stat.detail_success += 1
-                    elif detail.detail_status == "needs_human_verification":
-                        stats.detail_human_verification_count += 1
-                        src_stat.detail_metadata_only += 1
-                    elif detail.detail_status == "failed":
-                        stats.detail_status_failed_count += 1
-                        src_stat.detail_metadata_only += 1
-                    else:
-                        stats.detail_metadata_only_count += 1
-                        src_stat.detail_metadata_only += 1
-                except Exception as exc:  # noqa: BLE001
-                    logger.warning("%s detail fail %s: %s", source.source_name, it.source_url, exc)
-                    stats.detail_failed += 1
-                    detail_meta[it.source_url] = {
-                        "detail_fetched": False,
-                        "attachment_extract_failed": False,
-                    }
-                    continue
+    public_detail_semaphore = asyncio.Semaphore(settings.crawl_max_concurrency)
+    login_detail_semaphore = asyncio.Semaphore(1)
+    llm_semaphore = asyncio.Semaphore(settings.llm_extraction_concurrency)
+    cebpub_controller = _CebpubRunController(
+        concurrency=settings.cebpub_browser_concurrency,
+        block_threshold=settings.cebpub_site_block_threshold,
+    )
+    try:
+        from app.browser.managed_public import get_managed_public_browser
 
-                dfr = filter_detail(detail, ctx)
-                if not dfr.accepted:
-                    stats.detail_filtered_out += 1
-                    stats.filtered_out_count += 1
-                    continue
+        managed_browser = get_managed_public_browser()
+        managed_browser.set_adaptive_mode(False)
+    except Exception:  # noqa: BLE001
+        managed_browser = None
 
-                dkey = _source_dedupe_key(
-                    source.source_name, it.source_item_id, detail.source_url, detail.title
+    cebpub_cooldowns = await _load_cebpub_cooldowns(
+        db,
+        work,
+        now=datetime.now(TZ),
+        report_mode=report_mode,
+    )
+    profile_row = await db.scalar(
+        select(CompanyProfile).order_by(CompanyProfile.updated_at.desc())
+    )
+    extraction_fingerprint = _extraction_fingerprint(
+        company_profile=profile_row.profile_data if profile_row else None
+    )
+    extraction_cache = await _load_extraction_cache(db, work)
+    extraction_controller = _ExtractionRunController(
+        timeout_threshold=settings.llm_extraction_timeout_threshold,
+        execution_budget_seconds=settings.llm_extraction_execution_budget_seconds,
+    )
+
+    pipeline_started = time.monotonic()
+    processed_details: list[_ProcessedDetail] = []
+    try:
+        processed_details = await asyncio.gather(
+            *(
+                _process_detail_work(
+                    source,
+                    item,
+                    ctx=ctx,
+                    keywords=keywords,
+                    source_semaphore=(
+                        login_detail_semaphore
+                        if source.requires_login
+                        else public_detail_semaphore
+                    ),
+                    llm_semaphore=llm_semaphore,
+                    cebpub_controller=cebpub_controller,
+                    extraction_controller=extraction_controller,
+                    extraction_fingerprint=extraction_fingerprint,
+                    cached_announcement=_cached_announcement_for(
+                        extraction_cache, source, item
+                    ),
+                    refresh_extraction=refresh_extraction,
+                    cooldown=(
+                        cebpub_cooldowns.get(str(item.source_item_id))
+                        if item.source_item_id
+                        else None
+                    ),
                 )
-                chash = _content_hash(detail.title, detail.clean_content, detail.source_url)
-                summary = simple_summary(detail.title, detail.clean_content)
-                code = normalize_bid_code(f"{detail.title} {detail.clean_content or ''}")
-                extraction_data = await build_extraction_data_with_ai(
-                    title=detail.title,
-                    clean_content=detail.clean_content,
-                    summary=summary,
-                    region=detail.region or it.region,
-                    project_code=code,
-                    publish_time=detail.publish_time,
-                    detail_status=detail.detail_status,
-                    source_metadata=detail.source_metadata,
-                )
-                detail_meta[detail.source_url] = {
-                    "detail_fetched": detail.detail_fetched,
-                    "detail_status": detail.detail_status,
-                    "source_metadata": detail.source_metadata,
-                    "attachment_extract_failed": att_extract_failed,
-                    "requires_login": source.requires_login,
-                    "detail_url": detail.detail_url or detail.source_url,
-                    "content_format": detail.content_format,
-                }
+                for source, item in work
+            )
+        )
+    finally:
+        if managed_browser is not None:
+            managed_browser.set_adaptive_mode(False)
+    stats.stage_durations_ms["detail_pipeline_wall"] = int(
+        (time.monotonic() - pipeline_started) * 1000
+    )
+    stats.stage_durations_ms["detail_work_total"] = sum(
+        result.detail_duration_ms for result in processed_details
+    )
+    stats.stage_durations_ms["extraction_work_total"] = sum(
+        result.extraction_duration_ms for result in processed_details
+    )
+    stats.extraction_cache_hit_count = extraction_controller.cache_hit_count
+    stats.llm_call_count = extraction_controller.call_count
+    stats.llm_timeout_count = extraction_controller.timeout_count
+    source_stats_by_name = {row.source_name: row for row in stats.source_stats}
+    for result in processed_details:
+        detail = result.detail
+        source_name = result.source.source_name
+        source_stat = source_stats_by_name[source_name]
+        detail_meta[detail.source_url] = result.detail_meta
+        attempt_state = (detail.source_metadata or {}).get("detail_attempt_state")
+        if attempt_state == "not_attempted":
+            stats.detail_not_attempted_count += 1
+            source_stat.detail_metadata_only += 1
+            detail_outcome = "not_attempted"
+        elif result.acquisition_exception:
+            stats.detail_failed += 1
+            source_stat.detail_metadata_only += 1
+            detail_outcome = "failed"
+        elif detail.detail_fetched and detail.detail_status == "full":
+            stats.detail_success_count += 1
+            source_stat.detail_success += 1
+            detail_outcome = "full"
+        elif detail.detail_status == "needs_human_verification":
+            stats.detail_human_verification_count += 1
+            source_stat.detail_metadata_only += 1
+            detail_outcome = "needs_human_verification"
+        elif detail.detail_status == "failed":
+            stats.detail_status_failed_count += 1
+            source_stat.detail_metadata_only += 1
+            detail_outcome = "failed"
+        else:
+            stats.detail_metadata_only_count += 1
+            source_stat.detail_metadata_only += 1
+            detail_outcome = "metadata_only"
+        source_outcomes = stats.source_detail_breakdown.setdefault(source_name, {})
+        source_outcomes[detail_outcome] = source_outcomes.get(detail_outcome, 0) + 1
+        bucket = _failure_bucket(detail, extraction_failed=result.extraction_failed)
+        if bucket:
+            stats.failure_breakdown[bucket] = stats.failure_breakdown.get(bucket, 0) + 1
+            source_failures = stats.failure_breakdown_by_source.setdefault(
+                source_name, {}
+            )
+            source_failures[bucket] = source_failures.get(bucket, 0) + 1
+        if not result.accepted:
+            stats.detail_filtered_out += 1
+            stats.filtered_out_count += 1
+            continue
+        if result.candidate is not None:
+            candidates.append(result.candidate)
 
-                announcement_type = (extraction_data.get("fields") or {}).get(
-                    "announcement_type"
-                )
+    for source_name, outcome in stats.source_outcomes.items():
+        if outcome.get("status") in {"login_required", "failed"}:
+            continue
+        detail_counts = stats.source_detail_breakdown.get(source_name, {})
+        full_count = int(detail_counts.get("full") or 0)
+        failures = stats.failure_breakdown_by_source.get(source_name, {})
+        if full_count > 0:
+            outcome["status"] = "success_with_results"
+            if failures:
+                outcome["detail_failures"] = dict(failures)
+        elif int(outcome.get("raw_count") or 0) == 0:
+            outcome["status"] = "success_empty"
+        elif failures.get("site_blocked"):
+            outcome["status"] = "site_blocked"
+        elif failures:
+            outcome["status"] = "collection_failed"
 
-                candidates.append(
-                    CandidateRecord(
-                        title=detail.title[:512],
-                        source_name=source.source_name,
-                        source_url=detail.source_url,
-                        source_item_id=it.source_item_id,
-                        requires_login=source.requires_login,
-                        data_mode="live",
-                        publish_time=detail.publish_time,
-                        region=detail.region or it.region,
-                        province=None,
-                        keywords=keywords,
-                        summary=summary,
-                        clean_content=detail.clean_content,
-                        raw_content=(detail.raw_content or "")[:500000],
-                        detail_status=detail.detail_status,
-                        source_metadata=detail.source_metadata,
-                        extraction_data=extraction_data,
-                        attachment_links=list(detail.attachment_links or []),
-                        content_hash=chash,
-                        deduplication_key=dkey,
-                        project_code=code,
-                        announcement_type=announcement_type,
-                    )
-                )
-
-            stats.sources_succeeded.append(source.source_name)
-            src_stat.status = "success"
-            src_stat.message = "检索完成"
-            stats.source_stats.append(src_stat)
-        except LoginRequiredError as exc:
-            msg = str(exc)
-            logger.warning("login source %s skipped: %s", source.source_name, msg)
-            stats.sources_failed[source.source_name] = msg
-            src_stat.status = "skipped"
-            src_stat.message = msg
-            stats.source_stats.append(src_stat)
-        except Exception as exc:  # noqa: BLE001
-            msg = str(exc)
-            logger.exception("source %s failed", source.source_name)
-            stats.sources_failed[source.source_name] = msg
-            src_stat.status = "failed"
-            src_stat.message = msg
-            stats.source_stats.append(src_stat)
-            errors.append(f"{source.source_name}: {msg}")
+    stats.effective_concurrency = {
+        "source_discovery": settings.crawl_max_concurrency,
+        "http_detail": settings.crawl_max_concurrency,
+        "cebpub_browser": settings.cebpub_browser_concurrency,
+        "llm_extraction": settings.llm_extraction_concurrency,
+        "cebpub_adaptive": cebpub_controller.degraded,
+        "cebpub_circuit_open": cebpub_controller.circuit_open,
+        "llm_circuit_open": extraction_controller.circuit_open,
+        "llm_budget_exhausted": extraction_controller.budget_exhausted,
+    }
+    stats.coverage_status = "truncated" if stats.detail_cap_skipped else "complete"
+    stats.truncated = bool(stats.detail_cap_skipped)
 
     # ---- 跨源去重（本批次）----
+    postprocess_started = time.monotonic()
     stats.candidates_count = len(candidates)
     # ``snapshot`` is a report-only, source-record view.  Build it before the
     # dedupe engine mutates and merges candidate records.
@@ -431,6 +1328,10 @@ async def execute_search_task(
     stats.cross_source_merge_count = deduped.merged_count
     stats.duplicate_count = deduped.merged_count
     stats.primary_count = len(deduped.primaries)
+    stats.opportunity_count = sum(
+        1 for rec in deduped.primaries if is_opportunity(rec.lifecycle_stage)
+    )
+    stats.lifecycle_count = len(deduped.primaries) - stats.opportunity_count
     stats.dedupe_reasons = deduped.reasons
     # 闭合：候选 = 合并减少 + 主记录（若引擎定义不同则以实际为准）
     if stats.candidates_count and stats.cross_source_merge_count + stats.primary_count != stats.candidates_count:
@@ -451,15 +1352,15 @@ async def execute_search_task(
                 TenderAnnouncement.project_code == rec.project_code,
                 TenderAnnouncement.is_primary.is_(True),
             )
-            if rec.announcement_type:
+            if rec.lifecycle_stage:
                 sibling_stmt = sibling_stmt.where(
-                    TenderAnnouncement.announcement_type != rec.announcement_type
+                    TenderAnnouncement.lifecycle_stage != rec.lifecycle_stage
                 )
             lifecycle_siblings = list((await db.execute(sibling_stmt)).scalars().all())
             existing = await db.scalar(
                 select(TenderAnnouncement).where(
                     TenderAnnouncement.project_code == rec.project_code,
-                    TenderAnnouncement.announcement_type == rec.announcement_type,
+                    TenderAnnouncement.lifecycle_stage == rec.lifecycle_stage,
                     TenderAnnouncement.is_primary.is_(True),
                 )
             )
@@ -505,6 +1406,56 @@ async def execute_search_task(
             # 已核验的详情优先于列表元数据；同等详情质量时才按内容长度更新。
             rec_is_full = rec.detail_status == "full"
             existing_is_full = existing.detail_status == "full"
+            reused_cached_full = existing_is_full and not rec_is_full
+            if reused_cached_full:
+                current_metadata = dict(rec.source_metadata or {})
+                preserved_metadata = dict(existing.source_metadata or {})
+                current_event = {
+                    "attempted_at": crawl_time.isoformat(),
+                    "status": rec.detail_status or "metadata_only",
+                    "detail_fetched": False,
+                    "detail_attempt_state": current_metadata.get(
+                        "detail_attempt_state", "attempted"
+                    ),
+                    "failure_reason": current_metadata.get("failure_reason"),
+                    "failure_stage": current_metadata.get("failure_stage"),
+                    "acquisition_path": current_metadata.get("acquisition_path"),
+                    "message": str(current_metadata.get("message") or "")[:500],
+                    "attempt_count": int(current_metadata.get("attempt_count") or 0),
+                    "duration_ms": int(current_metadata.get("duration_ms") or 0),
+                    "terminal_failure": bool(
+                        current_metadata.get("terminal_failure", False)
+                    ),
+                    "retryable": bool(current_metadata.get("retryable", False)),
+                    "cooldown_until": current_metadata.get("cooldown_until"),
+                    "fallback_attempted": bool(
+                        current_metadata.get("fallback_attempted", False)
+                    ),
+                    "fallback_result": current_metadata.get("fallback_result"),
+                    "viewer_error_code": current_metadata.get("viewer_error_code"),
+                    "viewer_error_message": str(
+                        current_metadata.get("viewer_error_message") or ""
+                    )[:500]
+                    or None,
+                    "time_to_failure_ms": int(
+                        current_metadata.get("time_to_failure_ms")
+                        or current_metadata.get("duration_ms")
+                        or 0
+                    ),
+                }
+                if current_metadata.get("failure_reason") == "invalid_pdf_cooldown":
+                    prior_attempt = current_metadata.get("last_attempt")
+                    if isinstance(prior_attempt, dict) and prior_attempt:
+                        preserved_metadata["last_attempt"] = prior_attempt
+                    preserved_metadata["last_skip"] = current_event
+                else:
+                    preserved_metadata["last_attempt"] = current_event
+                preserved_metadata["using_cached_full"] = True
+                preserved_metadata["cached_full_captured_at"] = (
+                    existing.crawl_time.isoformat() if existing.crawl_time else None
+                )
+                existing.source_metadata = preserved_metadata
+                stats.cached_full_reused_count += 1
             if rec.clean_content and (
                 (rec_is_full and not existing_is_full)
                 or (
@@ -518,16 +1469,59 @@ async def execute_search_task(
                 existing.detail_status = rec.detail_status
                 existing.source_metadata = rec.source_metadata
                 existing.extraction_data = rec.extraction_data
-                existing.extraction_version = "v2"
+                existing.extraction_version = "v3"
                 existing.announcement_type = rec.announcement_type
+                existing.lifecycle_stage = rec.lifecycle_stage
+                existing.procurement_method = rec.procurement_method
+                existing.document_hash = rec.document_hash
+                existing.extraction_fingerprint = rec.extraction_fingerprint
                 existing.detail_url = rec.source_metadata.get("detail_url") if rec.source_metadata else rec.source_url
                 existing.content_format = rec.source_metadata.get("content_format") if rec.source_metadata else None
             elif existing.detail_status in {"unknown", "failed"} and rec.detail_status:
                 existing.detail_status = rec.detail_status
                 existing.source_metadata = rec.source_metadata
                 existing.extraction_data = rec.extraction_data
-                existing.extraction_version = "v2"
+                existing.extraction_version = "v3"
                 existing.announcement_type = rec.announcement_type
+                existing.lifecycle_stage = rec.lifecycle_stage
+                existing.procurement_method = rec.procurement_method
+                existing.document_hash = rec.document_hash
+                existing.extraction_fingerprint = rec.extraction_fingerprint
+            elif rec_is_full and existing_is_full:
+                # 即使当前正文较短，本轮已验证成功也必须清除上次“历史正文复用”标记。
+                existing.source_metadata = rec.source_metadata
+                existing.extraction_data = rec.extraction_data
+                existing.extraction_version = "v3"
+                existing.announcement_type = rec.announcement_type
+                existing.lifecycle_stage = rec.lifecycle_stage
+                existing.procurement_method = rec.procurement_method
+                existing.document_hash = rec.document_hash
+                existing.extraction_fingerprint = rec.extraction_fingerprint
+                existing.detail_url = (
+                    rec.source_metadata.get("detail_url")
+                    if rec.source_metadata
+                    else rec.source_url
+                )
+                existing.content_format = (
+                    rec.source_metadata.get("content_format")
+                    if rec.source_metadata
+                    else existing.content_format
+                )
+            elif not rec_is_full and not existing_is_full:
+                # 非完整详情也要保存本轮真实状态，不能让旧的“待验证/超时”
+                # 永久覆盖后来得到的更准确失败码。
+                existing.detail_status = rec.detail_status or "metadata_only"
+                existing.source_metadata = rec.source_metadata
+                existing.detail_url = (
+                    rec.source_metadata.get("detail_url")
+                    if rec.source_metadata
+                    else rec.source_url
+                )
+                existing.content_format = (
+                    rec.source_metadata.get("content_format")
+                    if rec.source_metadata
+                    else None
+                )
             corrections = (
                 await db.execute(
                     select(AnnouncementFieldCorrection)
@@ -539,12 +1533,22 @@ async def execute_search_task(
                 existing.extraction_data = apply_manual_corrections(
                     existing.extraction_data, corrections
                 )
+            existing.lifecycle_stage = rec.lifecycle_stage or existing.lifecycle_stage
+            existing.procurement_method = (
+                rec.procurement_method or existing.procurement_method
+            )
+            if rec.detail_status == "full":
+                existing.document_hash = rec.document_hash or existing.document_hash
+                existing.extraction_fingerprint = (
+                    rec.extraction_fingerprint or existing.extraction_fingerprint
+                )
             atts = list(existing.attachment_links or [])
             for a in rec.attachment_links or []:
                 if a not in atts:
                     atts.append(a)
             existing.attachment_links = atts
-            existing.content_hash = rec.content_hash or existing.content_hash
+            if rec_is_full or not existing_is_full:
+                existing.content_hash = rec.content_hash or existing.content_hash
             if rec.project_code and not existing.project_code:
                 existing.project_code = rec.project_code
             ann_id = existing.id
@@ -580,13 +1584,17 @@ async def execute_search_task(
                 detail_status=rec.detail_status,
                 source_metadata=rec.source_metadata,
                 extraction_data=rec.extraction_data,
-                extraction_version="v2",
+                extraction_version="v3",
                 announcement_type=rec.announcement_type,
+                lifecycle_stage=rec.lifecycle_stage,
+                procurement_method=rec.procurement_method,
                 detail_url=(rec.source_metadata or {}).get("detail_url") or rec.source_url,
                 content_format=(rec.source_metadata or {}).get("content_format"),
                 attachment_links=rec.attachment_links or [],
                 crawl_time=crawl_time,
                 content_hash=rec.content_hash,
+                document_hash=rec.document_hash,
+                extraction_fingerprint=rec.extraction_fingerprint,
                 deduplication_key=rec.deduplication_key,
                 is_primary=True,
                 related_urls=rec.related_urls or [rec.source_url],
@@ -621,6 +1629,50 @@ async def execute_search_task(
 
         saved_ids.append(ann_id)
         id_hash_pairs.append((ann_id, chash))
+        rec.db_id = ann_id
+
+    # 追加式采集审计：只保存阶段、耗时和公开失败码，不保存正文/PDF/Cookie。
+    for result in processed_details:
+        candidate = result.candidate
+        announcement_id = candidate.db_id if candidate else None
+        if candidate and not announcement_id:
+            for primary in deduped.primaries:
+                same, _ = is_duplicate(candidate, primary)
+                if same and primary.db_id:
+                    announcement_id = primary.db_id
+                    break
+        metadata = dict(result.detail.source_metadata or {})
+        failure_code = str(metadata.get("failure_reason") or "") or None
+        if metadata.get("detail_attempt_state") == "not_attempted":
+            outcome = "not_attempted"
+        elif result.detail.detail_status == "full":
+            outcome = "success"
+        elif result.detail.detail_status == "needs_human_verification":
+            outcome = "site_blocked"
+        else:
+            outcome = "failed"
+        db.add(
+            AnnouncementCrawlAttempt(
+                execution_id=execution.id,
+                announcement_id=announcement_id,
+                source_name=result.source.source_name,
+                source_item_id=result.item.source_item_id,
+                stage=str(metadata.get("failure_stage") or "detail_acquisition"),
+                outcome=outcome,
+                failure_code=failure_code,
+                duration_ms=result.detail_duration_ms,
+                diagnostics={
+                    "detail_status": result.detail.detail_status,
+                    "attempt_state": metadata.get("detail_attempt_state"),
+                    "acquisition_path": metadata.get("acquisition_path"),
+                    "extraction_status": metadata.get("extraction_status"),
+                    "extraction_cache_hit": bool(result.extraction_cache_hit),
+                    "retryable": bool(metadata.get("retryable", False)),
+                    "terminal_failure": bool(metadata.get("terminal_failure", False)),
+                },
+                attempted_at=crawl_time,
+            )
+        )
 
     # ---- 增量：相对本任务 DeliveryHistory ----
     # 完整快照是独立审计输出，不读取、不写入增量交付历史。
@@ -655,6 +1707,8 @@ async def execute_search_task(
             "attachment_extract_failed": False,
             "requires_login": ann.requires_login,
         }
+        stored_metadata = ann.source_metadata or meta.get("source_metadata") or {}
+        cached_full_reused = bool(stored_metadata.get("using_cached_full"))
         output_items.append(
             {
                 "announcement_id": ann.id,
@@ -678,13 +1732,21 @@ async def execute_search_task(
                 "region": ann.region,
                 "project_code": ann.project_code,
                 "announcement_type": ann.announcement_type,
+                "lifecycle_stage": ann.lifecycle_stage,
+                "procurement_method": ann.procurement_method,
+                "document_hash": ann.document_hash,
+                "extraction_fingerprint": ann.extraction_fingerprint,
                 "detail_status": ann.detail_status or meta.get("detail_status", "unknown"),
-                "source_metadata": ann.source_metadata or meta.get("source_metadata") or {},
+                "source_metadata": stored_metadata,
                 "extraction_data": ann.extraction_data,
                 "attachment_links": ann.attachment_links or [],
                 "data_mode": ann.data_mode,
                 "requires_login": ann.requires_login,
-                "detail_fetched": meta.get("detail_fetched", ann.detail_status == "full"),
+                "detail_fetched": ann.detail_status == "full",
+                "current_attempt_detail_fetched": meta.get(
+                    "detail_fetched", not cached_full_reused
+                ),
+                "cached_full_reused": cached_full_reused,
                 "attachment_extract_failed": meta.get("attachment_extract_failed", False),
                 "detail_url": ann.detail_url or ann.source_url,
                 "content_format": ann.content_format,
@@ -694,9 +1756,6 @@ async def execute_search_task(
 
     # 规则分析不影响采集成功与否；可选 LLM 仅在证据校验后补充简短研判。
     try:
-        profile_row = await db.scalar(
-            select(CompanyProfile).order_by(CompanyProfile.updated_at.desc())
-        )
         analysis = await build_execution_analysis(
             output_items,
             keywords=keywords,
@@ -704,6 +1763,11 @@ async def execute_search_task(
             start_date=start.isoformat() if start else None,
             end_date=end.isoformat() if end else None,
             company_profile=profile_row.profile_data if profile_row else None,
+            allow_llm=(
+                not extraction_controller.circuit_open
+                and not extraction_controller.budget_exhausted
+            ),
+            llm_budget_seconds=settings.llm_analysis_budget_seconds,
         )
     except Exception as exc:  # noqa: BLE001
         logger.warning("execution analysis unavailable: %s", exc)
@@ -751,6 +1815,15 @@ async def execute_search_task(
     execution.detail_metadata_count = stats.detail_metadata_only_count
     execution.detail_failed_count = stats.detail_failed + stats.detail_status_failed_count
     execution.detail_human_verification_count = stats.detail_human_verification_count
+    execution.detail_cap = stats.detail_cap
+    execution.detail_cap_skipped = stats.detail_cap_skipped
+    execution.coverage_status = stats.coverage_status
+    execution.search_depth = stats.search_depth
+    execution.extraction_cache_hit_count = stats.extraction_cache_hit_count
+    execution.llm_call_count = stats.llm_call_count
+    execution.llm_timeout_count = stats.llm_timeout_count
+    execution.opportunity_count = stats.opportunity_count
+    execution.lifecycle_count = stats.lifecycle_count
 
     if stats.sources_succeeded:
         has_quality_failures = bool(
@@ -759,6 +1832,8 @@ async def execute_search_task(
             or stats.detail_status_failed_count
             or stats.detail_metadata_only_count
             or stats.detail_human_verification_count
+            or stats.detail_not_attempted_count
+            or stats.failure_breakdown.get("extraction_failure", 0)
             or stats.truncated
         )
         execution.status = "partial" if has_quality_failures else "success"
@@ -798,10 +1873,21 @@ async def execute_search_task(
             f"{stats.detail_human_verification_count} 条详情要求人工完成安全验证；"
             "系统未绕过验证，该类记录不按完整正文分析。"
         )
+    if stats.detail_not_attempted_count:
+        warnings.append(
+            f"{stats.detail_not_attempted_count} 条详情因官方站点连续阻断而未继续请求；"
+            "这些记录不计为采集失败，仍保留列表元数据。"
+        )
+    if stats.cached_full_reused_count:
+        warnings.append(
+            f"{stats.cached_full_reused_count} 条公告本轮详情采集失败，但库中已有经校验的完整正文；"
+            "报告继续使用历史完整正文，并在项目详情中单独标注，不计为本轮采集成功。"
+        )
     if stats.truncated:
         warnings.append(
-            "本次快照已达每源 500 条安全上限，truncated=true；"
-            "报告不声称为完整覆盖。"
+            f"本次检索每源详情上限为 {stats.detail_cap} 条，"
+            f"共有 {stats.detail_cap_skipped} 条因上限未进入详情采集；"
+            "truncated=true，报告不声称为完整覆盖。"
         )
 
     report_ctx = ReportContext(
@@ -826,6 +1912,7 @@ async def execute_search_task(
         source_stats=list(stats.source_stats),
         raw_result_count=stats.raw_result_count,
         list_filtered_out=stats.list_filtered_out,
+        detail_cap=stats.detail_cap,
         detail_cap_skipped=stats.detail_cap_skipped,
         detail_failed=stats.detail_failed,
         detail_success_count=stats.detail_success_count,
@@ -889,6 +1976,34 @@ async def execute_search_task(
         task.status = "scheduled"
     else:
         task.status = "done" if execution.status in ("success", "partial") else "failed"
+    stats.stage_durations_ms["postprocess_report_wall"] = int(
+        (time.monotonic() - postprocess_started) * 1000
+    )
+    stats.stage_durations_ms["total_wall"] = int(
+        (time.monotonic() - execution_wall_started) * 1000
+    )
+    execution.crawl_diagnostics = {
+        "detail_not_attempted_count": stats.detail_not_attempted_count,
+        "cached_full_reused_count": stats.cached_full_reused_count,
+        "failure_breakdown": dict(stats.failure_breakdown),
+        "failure_breakdown_by_source": dict(stats.failure_breakdown_by_source),
+        "source_detail_breakdown": dict(stats.source_detail_breakdown),
+        "stage_durations_ms": dict(stats.stage_durations_ms),
+        "effective_concurrency": dict(stats.effective_concurrency),
+        "requested_regions": list(stats.requested_regions),
+        "effective_regions": list(stats.effective_regions),
+        "region_scope": stats.region_scope,
+        "detail_cap": stats.detail_cap,
+        "detail_cap_skipped": stats.detail_cap_skipped,
+        "coverage_status": stats.coverage_status,
+        "search_depth": stats.search_depth,
+        "extraction_cache_hit_count": stats.extraction_cache_hit_count,
+        "llm_call_count": stats.llm_call_count,
+        "llm_timeout_count": stats.llm_timeout_count,
+        "opportunity_count": stats.opportunity_count,
+        "lifecycle_count": stats.lifecycle_count,
+        "source_outcomes": dict(stats.source_outcomes),
+    }
     await db.commit()
     await db.refresh(execution)
     return execution, stats

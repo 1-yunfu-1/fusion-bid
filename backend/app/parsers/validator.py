@@ -5,6 +5,7 @@ from __future__ import annotations
 from datetime import datetime, time
 from zoneinfo import ZoneInfo
 
+from app.parsers.regions import resolve_region_selection
 from app.schemas.intent import ParsedIntent, ValidationIssue
 
 
@@ -33,13 +34,23 @@ def validate_intent(
             )
         )
 
-    if not intent.regions:
+    region_selection = resolve_region_selection(intent.regions)
+    if not region_selection.requested:
         issues.append(
             ValidationIssue(
                 code="missing_regions",
                 message="未识别到区域。请补充，例如：安徽省、上海市、北京市。",
                 field="regions",
                 severity="error",
+            )
+        )
+    elif region_selection.had_conflict:
+        issues.append(
+            ValidationIssue(
+                code="nationwide_overrides_regions",
+                message="同时选择了全国和具体省市；已按全国范围处理，不进行地区过滤。",
+                field="regions",
+                severity="warning",
             )
         )
 

@@ -12,10 +12,34 @@ async def test_health_ok(client: AsyncClient):
     assert data["status"] in ("ok", "degraded")
     assert data["database_ok"] is True
     assert data["database"] == "ok"
-    assert data["extraction_version"] == "v2"
+    assert data["extraction_version"] == "v3"
+    assert "lifecycle-extraction-v3" in data["capabilities"]
     assert "interactive-detail-recrawl-v1" in data["capabilities"]
     assert "official-document-import-v1" in data["capabilities"]
     assert "pdfjs-text-layer-capture-v1" in data["capabilities"]
+    assert "browser-rendered-detail-capture-v1" in data["capabilities"]
+    assert "managed-public-browser-v1" in data["capabilities"]
+    assert "managed-public-browser-pool-v2" in data["capabilities"]
+    assert "pdfjs-memory-document-capture-v1" in data["capabilities"]
+    assert data["public_browser"]["state"] in {
+        "not_started",
+        "starting",
+        "ready",
+        "busy",
+        "needs_verification",
+        "unavailable",
+    }
+    assert "port" not in data["public_browser"]
+    assert "profile_dir" not in data["public_browser"]
+    assert data["public_browser"]["pool_size"] == 2
+    assert data["public_browser"]["active_workers"] == 0
+    pipeline = data["public_browser"]["pdf_pipeline"]
+    assert pipeline["memory_pdf_bytes"] is True
+    assert isinstance(pipeline["text_ready"], bool)
+    assert isinstance(pipeline["scanned_pdf_ready"], bool)
+    assert pipeline["viewer_ready_timeout_seconds"] == 12
+    assert pipeline["ocr_timeout_seconds"] == 60
+    assert pipeline["invalid_pdf_cooldown_hours"] == 24
     assert "Asia/Shanghai" in data["timezone"]
     assert data["phase"] == "phase8-integration"
 

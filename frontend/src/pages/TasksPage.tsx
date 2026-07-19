@@ -52,6 +52,17 @@ const triggerLabels: Record<string, string> = {
   scheduled: "定时执行",
 };
 
+const collectionFailureLabels: Record<string, string> = {
+  invalid_pdf: "无效/损坏 PDF",
+  transient_pdf_timeout: "PDF 临时未就绪",
+  pdf_incomplete: "PDF 不完整",
+  ocr_failure: "OCR 失败",
+  invalid_pdf_cooldown: "损坏 PDF 冷却跳过",
+  site_blocked: "站点阻断",
+  browser_failure: "浏览器失败",
+  not_attempted: "未尝试",
+};
+
 const scheduleLabels: Record<string, string> = {
   once: "单次",
   daily: "每日",
@@ -288,7 +299,9 @@ export default function TasksPage() {
               <Tag>入库 {lastExecution.saved_count}</Tag>
               <Tag>增量 {lastExecution.incremental_count}</Tag>
               <Tag>{lastExecution.report_mode === "full_snapshot" ? "未去重完整快照" : "增量交付"}</Tag>
-              {lastExecution.truncated && <Tag color="error">已达安全上限，结果截断</Tag>}
+              <Tag>详情上限 {lastExecution.detail_cap}/源</Tag>
+              <Tag color="blue">抽取缓存 {lastExecution.extraction_cache_hit_count}</Tag>
+              {lastExecution.truncated && <Tag color="error">跳过详情 {lastExecution.detail_cap_skipped} 条</Tag>}
             </Space>
           }
           description={
@@ -506,7 +519,7 @@ export default function TasksPage() {
                 label="区域"
                 rules={[{ required: true, type: "array", min: 1, message: "至少 1 个区域" }]}
               >
-                <Select mode="tags" placeholder="如 北京市、安徽省" tokenSeparators={[",", "，"]} />
+                <Select mode="tags" placeholder="如 全国、北京市、安徽省" tokenSeparators={[",", "，"]} />
               </Form.Item>
             </Col>
           </Row>
@@ -594,7 +607,7 @@ export default function TasksPage() {
           rowKey="id"
           dataSource={historyQuery.data?.items || []}
           pagination={{ pageSize: 10, total: historyQuery.data?.total || 0 }}
-          scroll={{ x: 780 }}
+          scroll={{ x: 980 }}
           columns={[
             {
               title: "触发方式",
@@ -627,7 +640,9 @@ export default function TasksPage() {
               width: 150,
               render: (_: unknown, row) => (
                 <Typography.Text type="secondary">
-                  原始 {row.raw_result_count} / 增量 {row.incremental_count}
+                  原始 {row.raw_result_count} / 增量 {row.incremental_count}<br />
+                  机会 {row.opportunity_count} / 生命周期 {row.lifecycle_count}<br />
+                  缓存 {row.extraction_cache_hit_count} / 模型 {row.llm_call_count}
                 </Typography.Text>
               ),
             },
@@ -636,6 +651,35 @@ export default function TasksPage() {
               key: "note",
               ellipsis: true,
               render: (_: unknown, row) => row.error_message || row.analysis_preview?.portfolio_summary || "—",
+            },
+            {
+              title: "详情诊断",
+              key: "detail-diagnostics",
+              width: 280,
+              render: (_: unknown, row) => {
+                const failures = Object.entries(row.failure_breakdown || {});
+                const bySource = Object.entries(row.failure_breakdown_by_source || {});
+                return failures.length ? (
+                  <Space direction="vertical" size={2}>
+                    <Space size={[0, 4]} wrap>
+                      {failures.map(([reason, count]) => (
+                        <Tag key={reason}>
+                          {collectionFailureLabels[reason] || reason} {count}
+                        </Tag>
+                      ))}
+                    </Space>
+                    {bySource.map(([source, values]) => (
+                      <Typography.Text type="secondary" key={source} style={{ fontSize: 12 }}>
+                        {source}：{Object.entries(values).map(([reason, count]) => (
+                          `${collectionFailureLabels[reason] || reason} ${count}`
+                        )).join("，")}
+                      </Typography.Text>
+                    ))}
+                  </Space>
+                ) : (
+                  <Tag color="success">无详情失败</Tag>
+                );
+              },
             },
             {
               title: "报告",

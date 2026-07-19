@@ -11,7 +11,7 @@ python -m venv .venv
 .venv\Scripts\activate
 # Linux/macOS
 # source .venv/bin/activate
-pip install -e ".[dev]"
+pip install -e ".[dev,full]"
 uvicorn app.main:app --reload --host 127.0.0.1 --port 8000
 ```
 

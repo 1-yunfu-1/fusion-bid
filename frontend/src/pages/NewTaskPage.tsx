@@ -118,6 +118,7 @@ export default function NewTaskPage() {
   const [executionResult, setExecutionResult] = useState<TaskExecutionResponse | null>(null);
   const [executionError, setExecutionError] = useState<string | null>(null);
   const [scheduledWithoutInitial, setScheduledWithoutInitial] = useState(false);
+  const [searchDepth, setSearchDepth] = useState<"quick" | "standard" | "complete">("standard");
   const [form] = Form.useForm();
   const scheduleEnabled = Form.useWatch("schedule_enabled", form);
   const scheduleType = Form.useWatch("schedule_type", form);
@@ -135,7 +136,7 @@ export default function NewTaskPage() {
 
   const executeMutation = useMutation({
     mutationFn: ({ taskId, trigger }: { taskId: string; trigger: "initial" | "manual" }) =>
-      executeTask(taskId, trigger),
+      executeTask(taskId, trigger, "incremental", searchDepth),
     onSuccess: (data) => {
       setExecutionResult(data);
       setExecutionError(null);
@@ -308,7 +309,7 @@ export default function NewTaskPage() {
                 </Col>
                 <Col xs={24} md={12}>
                   <Form.Item name="regions" label="区域" rules={[{ required: true, type: "array", min: 1 }]}>
-                    <Select mode="tags" placeholder="如 安徽省、上海市" tokenSeparators={[",", "，"]} />
+                    <Select mode="tags" placeholder="如 全国、安徽省、上海市" tokenSeparators={[",", "，"]} />
                   </Form.Item>
                 </Col>
               </Row>
@@ -383,6 +384,17 @@ export default function NewTaskPage() {
               )}
 
               <Space wrap>
+                <Select
+                  aria-label="检索深度"
+                  value={searchDepth}
+                  onChange={setSearchDepth}
+                  style={{ minWidth: 220 }}
+                  options={[
+                    { value: "quick", label: "快速：每源最多 8 条详情" },
+                    { value: "standard", label: "标准：每源最多 30 条详情" },
+                    { value: "complete", label: "深度：每源最多 500 条详情" },
+                  ]}
+                />
                 <Button
                   type="primary"
                   loading={confirmMutation.isPending || executeMutation.isPending}
@@ -485,6 +497,12 @@ export default function NewTaskPage() {
                     <Col xs={12} md={6}><Statistic title="内容更新" value={executionResult.update_count} /></Col>
                     <Col xs={12} md={6}><Statistic title="已核验详情" value={executionResult.detail_success_count} /></Col>
                     <Col xs={12} md={6}><Statistic title="仅元数据" value={executionResult.detail_metadata_only_count} /></Col>
+                    <Col xs={12} md={6}><Statistic title="真实采集失败" value={executionResult.detail_failed_count} /></Col>
+                    <Col xs={12} md={6}><Statistic title="站点阻断未尝试" value={executionResult.detail_not_attempted_count} /></Col>
+                    <Col xs={12} md={6}><Statistic title="复用历史完整正文" value={executionResult.cached_full_reused_count || 0} /></Col>
+                    <Col xs={12} md={6}><Statistic title="抽取缓存命中" value={executionResult.extraction_cache_hit_count || 0} /></Col>
+                    <Col xs={12} md={6}><Statistic title="可参与机会" value={executionResult.opportunity_count || 0} /></Col>
+                    <Col xs={12} md={6}><Statistic title="生命周期情报" value={executionResult.lifecycle_count || 0} /></Col>
                   </Row>
                   <Descriptions size="small" column={{ xs: 1, md: 2 }} bordered>
                     <Descriptions.Item label="任务状态">
@@ -500,7 +518,64 @@ export default function NewTaskPage() {
                     <Descriptions.Item label="报告范围">
                       {executionResult.report_mode === "full_snapshot" ? "未去重完整快照" : "增量交付"}
                     </Descriptions.Item>
+                    <Descriptions.Item label="详情覆盖">
+                      每源上限 {executionResult.detail_cap} 条；跳过 {executionResult.detail_cap_skipped} 条
+                    </Descriptions.Item>
+                    <Descriptions.Item label="模型抽取">
+                      调用 {executionResult.llm_call_count}，超时 {executionResult.llm_timeout_count}
+                    </Descriptions.Item>
                   </Descriptions>
+                  {executionResult.truncated && (
+                    <Alert
+                      type="warning"
+                      showIcon
+                      message="本次结果达到详情采集上限"
+                      description={`发现结果中有 ${executionResult.detail_cap_skipped} 条未进入详情采集；当前报告不能视为完整覆盖。`}
+                    />
+                  )}
+                  {Object.keys(executionResult.failure_breakdown || {}).length > 0 && (
+                    <Alert
+                      type="warning"
+                      showIcon
+                      message="详情采集质量分组"
+                      description={Object.entries(executionResult.failure_breakdown).map(([reason, count]) => {
+                        const labels: Record<string, string> = {
+                          not_attempted: "未尝试",
+                          site_blocked: "站点阻断",
+                          browser_failure: "浏览器失败",
+                          invalid_pdf: "无效或损坏 PDF",
+                          transient_pdf_timeout: "PDF 临时未就绪",
+                          pdf_incomplete: "PDF 不完整",
+                          ocr_failure: "OCR 失败或超时",
+                          invalid_pdf_cooldown: "损坏 PDF 冷却跳过",
+                          identity_conflict: "身份冲突",
+                          extraction_failure: "抽取失败（已规则降级）",
+                          html_parse_failure: "HTML 解析失败",
+                          html_content_empty: "详情正文为空",
+                          http_detail_failure: "HTTP 详情失败",
+                          outer_detail_unavailable: "公告外层页暂不可用",
+                          official_content_unavailable: "官方正文暂停访问",
+                          metadata_only_other: "其他仅元数据",
+                        };
+                        return <Tag key={reason}>{labels[reason] || reason} {count}</Tag>;
+                      })}
+                    />
+                  )}
+                  {Object.keys(executionResult.failure_breakdown_by_source || {}).length > 0 && (
+                    <Alert
+                      type="info"
+                      showIcon
+                      message="按数据源定位失败"
+                      description={Object.entries(executionResult.failure_breakdown_by_source).map(([source, failures]) => (
+                        <div key={source}>
+                          <Typography.Text strong>{source}：</Typography.Text>
+                          {Object.entries(failures).map(([reason, count]) => (
+                            <Tag key={`${source}-${reason}`}>{reason} {count}</Tag>
+                          ))}
+                        </div>
+                      ))}
+                    />
+                  )}
                   {executionResult.analysis_preview?.portfolio_summary && (
                     <Alert
                       type="info"

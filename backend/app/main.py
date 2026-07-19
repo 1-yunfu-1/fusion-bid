@@ -14,6 +14,7 @@ from fastapi.staticfiles import StaticFiles
 from app.api.router import api_router
 from app.core.config import PROJECT_ROOT, get_settings
 from app.core.database import init_db
+from app.browser.managed_public import shutdown_managed_public_browser
 from app.scheduler.manager import restore_jobs_from_db, shutdown_scheduler, start_scheduler
 
 logger = logging.getLogger(__name__)
@@ -43,6 +44,7 @@ async def lifespan(_app: FastAPI):
     yield
     if settings.app_env != "test":
         shutdown_scheduler()
+        await shutdown_managed_public_browser()
 
 
 def create_app() -> FastAPI:

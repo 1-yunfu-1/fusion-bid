@@ -46,7 +46,7 @@ def test_unversioned_legacy_database_is_adopted_without_recreating_tables(
             "保留的历史任务",
         )
         assert connection.execute("SELECT version_num FROM alembic_version").fetchone() == (
-            "20260718_0006",
+            "20260719_0008",
         )
         announcement_columns = {
             row[1] for row in connection.execute("PRAGMA table_info(tender_announcements)")
@@ -54,8 +54,21 @@ def test_unversioned_legacy_database_is_adopted_without_recreating_tables(
         execution_columns = {
             row[1] for row in connection.execute("PRAGMA table_info(task_executions)")
         }
-        assert {"detail_url", "extraction_version", "analysis_data"} <= announcement_columns
-        assert {"report_mode", "truncated", "detail_full_count"} <= execution_columns
+        assert {
+            "detail_url",
+            "extraction_version",
+            "analysis_data",
+            "lifecycle_stage",
+            "procurement_method",
+            "document_hash",
+            "extraction_fingerprint",
+        } <= announcement_columns
+        assert {
+            "report_mode",
+            "truncated",
+            "detail_full_count",
+            "crawl_diagnostics",
+        } <= execution_columns
         assert connection.execute(
             "SELECT name FROM sqlite_master WHERE type='table' AND name='company_profiles'"
         ).fetchone()
