@@ -844,6 +844,190 @@ async def test_pdf_collection_timeout_releases_page_and_retries_once(monkeypatch
 
 
 @pytest.mark.asyncio
+async def test_pdfjs_explicit_corrupt_error_is_terminal_without_retry(monkeypatch):
+    class Frame:
+        async def evaluate(self, _script):
+            return {
+                "pageCount": 0,
+                "renderedPageCount": 0,
+                "errorVisible": True,
+                "errorMessage": "无效或损坏的 PDF 文件。",
+            }
+
+    viewer_state = await pdf_detail_module._wait_for_pdf_viewer_state(
+        Frame(), timeout_ms=500
+    )
+    assert viewer_state["state"] == "error"
+    assert viewer_state["failure_reason"] == "pdf_invalid_or_corrupt"
+
+    class FakeBroker:
+        acquire_count = 0
+
+        @asynccontextmanager
+        async def acquire(self, *, interactive=False):
+            self.acquire_count += 1
+            yield SimpleNamespace(
+                context=object(), page=object(), reused=True, engine="chrome"
+            )
+
+        @property
+        def is_connected(self):
+            return True
+
+        def status(self):
+            return {"state": "ready"}
+
+        def mark_needs_verification(self):
+            return None
+
+    broker = FakeBroker()
+    monkeypatch.setattr(managed_module, "get_managed_public_browser", lambda: broker)
+
+    async def collect(_page, **kwargs):
+        return PublicPdfDetail(
+            status="metadata_only",
+            detail_url=kwargs["detail_url"],
+            failure_reason="pdf_invalid_or_corrupt",
+            failure_stage="pdf_validation",
+            viewer_error_code="pdf_invalid_or_corrupt",
+            viewer_error_message="无效或损坏的 PDF 文件。",
+        )
+
+    monkeypatch.setattr(pdf_detail_module, "_collect_public_pdf_detail", collect)
+    result = await pdf_detail_module._fetch_managed_public_pdf_detail(
+        detail_url="https://ctbpsp.com/#/bulletinDetail?uuid=" + "d" * 32,
+        expected_id="d" * 32,
+        expected_title="损坏文件测试公告",
+        timeout_ms=60_000,
+        headless=True,
+    )
+
+    assert result.failure_reason == "pdf_invalid_or_corrupt"
+    assert result.terminal_failure is True
+    assert result.retryable is False
+    assert result.attempt_count == 1
+    assert broker.acquire_count == 1
+
+
+@pytest.mark.asyncio
+async def test_collect_stops_before_text_layer_and_ocr_on_pdfjs_corrupt_error(
+    monkeypatch,
+):
+    business_id = "4d1600b68217477890a8076bc98a6880"
+    title = "无效 PDF 测试项目招标公告"
+    detail_url = (
+        "https://ctbpsp.com/#/bulletinDetail?"
+        f"uuid={business_id}&inpvalue=&dataSource=0"
+    )
+
+    class Body:
+        async def inner_text(self, timeout=None):
+            return title
+
+    class Frame:
+        url = "https://ctbpsp.com/web_pdf/viewer.html?file=memory-test"
+
+    class Page:
+        url = detail_url
+        frames = [Frame()]
+
+        async def goto(self, url, **_kwargs):
+            if url != "about:blank":
+                self.url = url
+
+        async def wait_for_selector(self, _selector, **_kwargs):
+            return None
+
+        def locator(self, _selector):
+            return Body()
+
+    async def explicit_error(_frame, *, timeout_ms):
+        assert timeout_ms <= 12_000
+        return {
+            "state": "error",
+            "failure_reason": "pdf_invalid_or_corrupt",
+            "viewer_error_code": "pdf_invalid_or_corrupt",
+            "viewer_error_message": "Invalid or corrupted PDF file.",
+        }
+
+    async def must_not_run(*_args, **_kwargs):
+        raise AssertionError("损坏 PDF 不应继续读取字节、文字层或 OCR")
+
+    monkeypatch.setattr(
+        pdf_detail_module, "_wait_for_pdf_viewer_state", explicit_error
+    )
+    monkeypatch.setattr(pdf_detail_module, "_read_loaded_pdf_bytes", must_not_run)
+    monkeypatch.setattr(pdf_detail_module, "_extract_rendered_text_pages", must_not_run)
+    monkeypatch.setattr(pdf_detail_module, "_ocr_rendered_pages", must_not_run)
+
+    result = await pdf_detail_module._collect_public_pdf_detail(
+        Page(),
+        detail_url=detail_url,
+        expected_id=business_id,
+        expected_title=title,
+        timeout_ms=60_000,
+        headless=True,
+    )
+
+    assert result.failure_reason == "pdf_invalid_or_corrupt"
+    assert result.acquisition_path == "pdfjs_error_state"
+    assert result.viewer_error_message == "Invalid or corrupted PDF file."
+
+
+@pytest.mark.asyncio
+async def test_locally_rejected_pdf_bytes_are_not_downloaded_twice(monkeypatch):
+    class FakeBroker:
+        acquire_count = 0
+
+        @asynccontextmanager
+        async def acquire(self, *, interactive=False):
+            self.acquire_count += 1
+            yield SimpleNamespace(
+                context=object(), page=object(), reused=True, engine="chrome"
+            )
+
+        @property
+        def is_connected(self):
+            return True
+
+        def status(self):
+            return {"state": "ready"}
+
+        def mark_needs_verification(self):
+            return None
+
+    broker = FakeBroker()
+    monkeypatch.setattr(managed_module, "get_managed_public_browser", lambda: broker)
+
+    async def collect(_page, **kwargs):
+        return PublicPdfDetail(
+            status="captured",
+            detail_url=kwargs["detail_url"],
+            document_page_count=1,
+            document_bytes=b"%PDF-1.4\ncorrupt-test-only",
+        )
+
+    monkeypatch.setattr(pdf_detail_module, "_collect_public_pdf_detail", collect)
+    monkeypatch.setattr(
+        pdf_detail_module,
+        "_parse_pdf_bytes_sync",
+        lambda _data, *, max_pages: ([], 0, "pdf_invalid_or_corrupt"),
+    )
+    result = await pdf_detail_module._fetch_managed_public_pdf_detail(
+        detail_url="https://ctbpsp.com/#/bulletinDetail?uuid=" + "f" * 32,
+        expected_id="f" * 32,
+        expected_title="本地解析失败测试公告",
+        timeout_ms=60_000,
+        headless=True,
+    )
+
+    assert result.failure_reason == "pdf_invalid_or_corrupt"
+    assert result.attempt_count == 1
+    assert result.terminal_failure is True
+    assert broker.acquire_count == 1
+
+
+@pytest.mark.asyncio
 async def test_identity_failure_rebuilds_only_current_page_then_succeeds(monkeypatch):
     class Page:
         pass

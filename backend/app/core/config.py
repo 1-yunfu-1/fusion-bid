@@ -79,7 +79,16 @@ class Settings(BaseSettings):
         default="managed", alias="CEBPUB_BROWSER_MODE"
     )
     cebpub_browser_timeout_seconds: int = Field(
-        default=60, ge=15, le=300, alias="CEBPUB_BROWSER_TIMEOUT_SECONDS"
+        default=30, ge=15, le=300, alias="CEBPUB_BROWSER_TIMEOUT_SECONDS"
+    )
+    cebpub_pdf_ready_timeout_seconds: int = Field(
+        default=12, ge=3, le=60, alias="CEBPUB_PDF_READY_TIMEOUT_SECONDS"
+    )
+    cebpub_invalid_pdf_cooldown_hours: int = Field(
+        default=24, ge=0, le=720, alias="CEBPUB_INVALID_PDF_COOLDOWN_HOURS"
+    )
+    cebpub_ocr_timeout_seconds: int = Field(
+        default=60, ge=10, le=600, alias="CEBPUB_OCR_TIMEOUT_SECONDS"
     )
     cebpub_browser_concurrency: int = Field(
         default=2, ge=1, le=4, alias="CEBPUB_BROWSER_CONCURRENCY"

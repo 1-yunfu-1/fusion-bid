@@ -133,6 +133,21 @@ def _normalise_capture_identity(value: str) -> str:
 def _base_item(announcement: TenderAnnouncement) -> dict[str, Any]:
     metadata = announcement.source_metadata or {}
     last_recrawl = metadata.get("last_recrawl") or {}
+    diagnostic_candidates = [
+        value
+        for value in (
+            last_recrawl,
+            metadata.get("last_skip"),
+            metadata.get("last_attempt"),
+            metadata,
+        )
+        if isinstance(value, dict) and value.get("failure_reason")
+    ]
+    last_diagnostic = max(
+        diagnostic_candidates,
+        key=lambda value: str(value.get("attempted_at") or value.get("at") or ""),
+        default=metadata,
+    )
     attempt_state = metadata.get("detail_attempt_state")
     if not attempt_state:
         if announcement.detail_status == "full":
@@ -172,10 +187,29 @@ def _base_item(announcement: TenderAnnouncement) -> dict[str, Any]:
         "announcement_type": announcement.announcement_type,
         "source_metadata": metadata,
         "detail_attempt_state": attempt_state,
-        "failure_reason": last_recrawl.get("failure_reason")
-        or metadata.get("failure_reason"),
-        "failure_stage": last_recrawl.get("failure_stage")
-        or metadata.get("failure_stage"),
+        "failure_reason": last_diagnostic.get("failure_reason"),
+        "failure_stage": last_diagnostic.get("failure_stage"),
+        "terminal_failure": bool(last_diagnostic.get("terminal_failure", False)),
+        "retryable": bool(last_diagnostic.get("retryable", False)),
+        "viewer_error_code": last_diagnostic.get("viewer_error_code")
+        or metadata.get("viewer_error_code"),
+        "viewer_error_message": str(
+            last_diagnostic.get("viewer_error_message")
+            or metadata.get("viewer_error_message")
+            or ""
+        )[:500]
+        or None,
+        "fallback_attempted": bool(
+            last_diagnostic.get("fallback_attempted", False)
+        ),
+        "fallback_result": last_diagnostic.get("fallback_result"),
+        "cooldown_until": last_diagnostic.get("cooldown_until")
+        or metadata.get("cooldown_until"),
+        "time_to_failure_ms": int(
+            last_diagnostic.get("time_to_failure_ms")
+            or last_diagnostic.get("duration_ms")
+            or 0
+        ),
         "extraction_data": announcement.extraction_data or {},
         "analysis_data": announcement.analysis_data or {},
         "project_code": announcement.project_code,
@@ -624,11 +658,27 @@ async def _recrawl_announcement(
     )
     verification_attempted = False
     acquisition_mode = "headless"
+    verification_reasons = {
+        "verification_required",
+        "verification_timeout",
+        "site_rate_limited",
+    }
     try:
+        stored_failure_reason = str(
+            ((announcement.source_metadata or {}).get("last_recrawl") or {}).get(
+                "failure_reason"
+            )
+            or ((announcement.source_metadata or {}).get("last_attempt") or {}).get(
+                "failure_reason"
+            )
+            or (announcement.source_metadata or {}).get("failure_reason")
+            or ""
+        )
         use_interactive_first = (
             announcement.source_name == "cebpub"
             and body.interactive_on_verification
             and announcement.detail_status == "needs_human_verification"
+            and stored_failure_reason in verification_reasons
         )
         if use_interactive_first:
             verification_attempted = True
@@ -636,10 +686,14 @@ async def _recrawl_announcement(
             detail = await source.fetch_detail(item, interactive=True)
         else:
             detail = await source.fetch_detail(item, interactive=False)
+            current_failure_reason = str(
+                (detail.source_metadata or {}).get("failure_reason") or ""
+            )
             if (
                 announcement.source_name == "cebpub"
                 and body.interactive_on_verification
-                and detail.detail_status in {"needs_human_verification", "metadata_only"}
+                and detail.detail_status == "needs_human_verification"
+                and current_failure_reason in verification_reasons
             ):
                 verification_attempted = True
                 acquisition_mode = "interactive"
@@ -704,6 +758,29 @@ async def _recrawl_announcement(
             "site_blocked": bool(
                 (detail.source_metadata or {}).get("site_blocked", False)
             ),
+            "terminal_failure": bool(
+                (detail.source_metadata or {}).get("terminal_failure", False)
+            ),
+            "retryable": bool(
+                (detail.source_metadata or {}).get("retryable", False)
+            ),
+            "viewer_error_code": (detail.source_metadata or {}).get(
+                "viewer_error_code"
+            ),
+            "viewer_error_message": str(
+                (detail.source_metadata or {}).get("viewer_error_message") or ""
+            )[:500]
+            or None,
+            "fallback_attempted": bool(
+                (detail.source_metadata or {}).get("fallback_attempted", False)
+            ),
+            "fallback_result": (detail.source_metadata or {}).get(
+                "fallback_result"
+            ),
+            "cooldown_until": (detail.source_metadata or {}).get("cooldown_until"),
+            "time_to_failure_ms": int(
+                (detail.source_metadata or {}).get("time_to_failure_ms") or 0
+            ),
         }
         announcement.source_metadata = metadata
         if not previous_full:
@@ -740,6 +817,23 @@ async def _recrawl_announcement(
         ),
         "site_blocked": bool(
             (detail.source_metadata or {}).get("site_blocked", False)
+        ),
+        "terminal_failure": bool(
+            (detail.source_metadata or {}).get("terminal_failure", False)
+        ),
+        "retryable": bool((detail.source_metadata or {}).get("retryable", False)),
+        "viewer_error_code": (detail.source_metadata or {}).get("viewer_error_code"),
+        "viewer_error_message": str(
+            (detail.source_metadata or {}).get("viewer_error_message") or ""
+        )[:500]
+        or None,
+        "fallback_attempted": bool(
+            (detail.source_metadata or {}).get("fallback_attempted", False)
+        ),
+        "fallback_result": (detail.source_metadata or {}).get("fallback_result"),
+        "cooldown_until": (detail.source_metadata or {}).get("cooldown_until"),
+        "time_to_failure_ms": int(
+            (detail.source_metadata or {}).get("time_to_failure_ms") or 0
         ),
         "announcement": await _expanded_detail(announcement, db),
     }

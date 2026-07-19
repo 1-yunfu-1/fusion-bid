@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
 
 import pytest
@@ -226,6 +226,143 @@ async def test_execute_search_task_saves_announcements(monkeypatch):
         assert execution.status in ("success", "partial")
         assert stats.saved_count >= 1
         assert "mock_public" in stats.sources_succeeded
+
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_invalid_pdf_cooldown_skips_incremental_but_full_snapshot_bypasses(
+    monkeypatch, tmp_path
+):
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    factory = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+    business_id = "3d1600b68217477890a8076bc98a6880"
+    state = {"fetch_count": 0}
+
+    class CooldownSource(TenderSourceAdapter):
+        source_name = "cebpub"
+        requires_login = False
+        enabled = True
+
+        async def health_check(self) -> HealthResult:
+            return HealthResult(ok=True)
+
+        async def search(self, _query: SearchQuery) -> list[ListItem]:
+            return [
+                ListItem(
+                    title="安徽省服务器采购测试公告",
+                    source_url=f"https://ctbpsp.com/#/?uuid={business_id}",
+                    source_item_id=business_id,
+                    publish_time=datetime(2026, 7, 18, tzinfo=TZ),
+                    region="安徽省",
+                    snippet="安徽省服务器采购",
+                    raw={"businessId": business_id},
+                )
+            ]
+
+        async def fetch_detail(
+            self, item: ListItem, *, interactive: bool = False
+        ) -> DetailResult:
+            state["fetch_count"] += 1
+            content = f"{item.title}\n招标人：测试采购单位"
+            return DetailResult(
+                title=item.title,
+                source_url=item.source_url,
+                publish_time=item.publish_time,
+                region=item.region,
+                clean_content=content,
+                raw_content=content,
+                detail_fetched=True,
+                detail_status="full",
+                source_metadata={"detail_status": "full"},
+            )
+
+        async def extract_attachments(self, _detail: DetailResult) -> list[str]:
+            return []
+
+    monkeypatch.setattr(
+        crawl_service,
+        "build_sources",
+        lambda only_enabled=True: [CooldownSource()],
+    )
+
+    def fake_report(*_args, **_kwargs):
+        path = tmp_path / "cooldown.docx"
+        path.write_bytes(b"docx")
+        return path
+
+    monkeypatch.setattr(crawl_service, "generate_report_file", fake_report)
+
+    async with factory() as db:
+        attempted_at = datetime.now(TZ)
+        existing = TenderAnnouncement(
+            title="安徽省服务器采购测试公告",
+            source_name="cebpub",
+            source_url=f"https://ctbpsp.com/#/?uuid={business_id}",
+            source_item_id=business_id,
+            data_mode="live",
+            publish_time=datetime(2026, 7, 18, tzinfo=TZ),
+            region="安徽省",
+            clean_content="安徽省服务器采购测试公告",
+            raw_content="安徽省服务器采购测试公告",
+            detail_status="metadata_only",
+            source_metadata={
+                "last_attempt": {
+                    "attempted_at": attempted_at.isoformat(),
+                    "failure_reason": "pdf_invalid_or_corrupt",
+                    "failure_stage": "pdf_validation",
+                    "terminal_failure": True,
+                    "viewer_error_code": "pdf_invalid_or_corrupt",
+                    "viewer_error_message": "无效或损坏的 PDF 文件。",
+                    "cooldown_until": (attempted_at + timedelta(hours=24)).isoformat(),
+                }
+            },
+            extraction_data={},
+            attachment_links=[],
+            content_hash="cooldown-hash",
+            deduplication_key=f"cebpub:{business_id}",
+            is_primary=True,
+            crawl_time=attempted_at,
+            first_seen_at=attempted_at,
+            last_seen_at=attempted_at,
+        )
+        task = SearchTask(
+            original_query="安徽省服务器采购",
+            keywords=["服务器"],
+            regions=["安徽省"],
+            start_date=date(2026, 7, 1),
+            end_date=date(2026, 7, 19),
+            status="confirmed",
+        )
+        db.add_all([existing, task])
+        await db.commit()
+        await db.refresh(task)
+
+        _execution, stats = await crawl_service.execute_search_task(
+            db, task, max_details_per_source=1
+        )
+        assert state["fetch_count"] == 0
+        assert stats.detail_not_attempted_count == 1
+        assert stats.failure_breakdown == {"invalid_pdf_cooldown": 1}
+        saved = await db.scalar(
+            select(TenderAnnouncement).where(
+                TenderAnnouncement.source_item_id == business_id
+            )
+        )
+        assert saved is not None
+        assert saved.source_metadata["last_attempt"]["viewer_error_code"] == (
+            "pdf_invalid_or_corrupt"
+        )
+
+        await crawl_service.execute_search_task(
+            db,
+            task,
+            max_details_per_source=1,
+            report_mode="full_snapshot",
+        )
+        assert state["fetch_count"] == 1
 
     await engine.dispose()
 

@@ -36,6 +36,9 @@ async def test_health_ok(client: AsyncClient):
     assert pipeline["memory_pdf_bytes"] is True
     assert isinstance(pipeline["text_ready"], bool)
     assert isinstance(pipeline["scanned_pdf_ready"], bool)
+    assert pipeline["viewer_ready_timeout_seconds"] == 12
+    assert pipeline["ocr_timeout_seconds"] == 60
+    assert pipeline["invalid_pdf_cooldown_hours"] == 24
     assert "Asia/Shanghai" in data["timezone"]
     assert data["phase"] == "phase8-integration"
 

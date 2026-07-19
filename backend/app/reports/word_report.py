@@ -840,15 +840,36 @@ def _detail_pages(doc: Document, ctx: ReportContext, items: list[dict]) -> None:
                 }.get(it.get("detail_status"), "状态未知")
             ),
         )
-        if it.get("cached_full_reused"):
-            last_attempt = (it.get("source_metadata") or {}).get("last_attempt") or {}
+        if it.get("cached_full_reused") or it.get("detail_status") != "full":
+            source_metadata = it.get("source_metadata") or {}
+            last_attempt = (
+                source_metadata.get("last_skip")
+                or source_metadata.get("last_attempt")
+                or source_metadata
+            )
             attempt_reason = last_attempt.get("failure_reason") or "详情未取得"
+            reason_label = {
+                "pdf_invalid_or_corrupt": "官方 PDF 无效或损坏",
+                "invalid_pdf_cooldown": "损坏 PDF 冷却期内已跳过",
+                "pdf_document_unavailable": "PDF 文档暂未就绪",
+                "collector_timeout": "采集器等待超时",
+                "incomplete_pdf_pages": "PDF 页面不完整",
+                "ocr_failure": "扫描页 OCR 未识别正文",
+                "ocr_timeout": "扫描页 OCR 超时",
+                "official_content_unavailable": "官方正文暂停或停止提供",
+            }.get(attempt_reason, attempt_reason)
             attempt_message = last_attempt.get("message") or "本轮未取得新正文"
             _add_label_value(
                 doc,
                 "本轮采集：",
-                f"失败（{attempt_reason}）：{attempt_message}",
+                f"未取得新正文（{reason_label}）：{attempt_message}",
             )
+            if last_attempt.get("cooldown_until"):
+                _add_label_value(
+                    doc,
+                    "下次自动尝试：",
+                    str(last_attempt["cooldown_until"]),
+                )
         _add_label_value(doc, "数据模式：", it.get("data_mode") or "live")
         _add_label_value(
             doc,

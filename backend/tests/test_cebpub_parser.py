@@ -228,7 +228,7 @@ async def test_cebpub_interactive_fetch_uses_visible_browser(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_cebpub_keeps_managed_browser_metadata_only_failure(monkeypatch):
+async def test_cebpub_keeps_pdf_failure_when_short_json_fallback_is_empty(monkeypatch):
     source = CebpubSource()
     business_id = "1d1600b68217477890a8076bc98a6880"
     item = ListItem(
@@ -249,13 +249,13 @@ async def test_cebpub_keeps_managed_browser_metadata_only_failure(monkeypatch):
             browser_state="ready",
         )
 
-    async def legacy_must_not_run(_steps):
-        raise AssertionError("32 位 UUID 不应回退到旧详情接口")
+    async def empty_legacy_fallback(_steps):
+        return [FakeResp({}, "<html>通用门户</html>"), FakeResp({"object": {}})]
 
     monkeypatch.setattr(
         "app.sources.cebpub_source.fetch_public_pdf_detail", fake_pdf_detail
     )
-    monkeypatch.setattr(source.fetcher, "post_form_sequence", legacy_must_not_run)
+    monkeypatch.setattr(source.fetcher, "post_form_sequence", empty_legacy_fallback)
 
     detail = await source.fetch_detail(item)
 
@@ -263,3 +263,58 @@ async def test_cebpub_keeps_managed_browser_metadata_only_failure(monkeypatch):
     assert detail.source_metadata["failure_reason"] == "incomplete_pdf_pages"
     assert detail.source_metadata["acquisition_mode"] == "managed_chrome"
     assert detail.source_metadata["browser_reused"] is True
+    assert detail.source_metadata["fallback_attempted"] is True
+    assert detail.source_metadata["fallback_result"] == "empty_or_unverified"
+
+
+@pytest.mark.asyncio
+async def test_cebpub_accepts_verified_short_json_fallback_after_invalid_pdf(monkeypatch):
+    source = CebpubSource()
+    business_id = "2d1600b68217477890a8076bc98a6880"
+    item = ListItem(
+        title="服务器采购测试项目招标公告",
+        source_url="https://ctbpsp.com/",
+        source_item_id=business_id,
+        raw={"businessId": business_id},
+    )
+
+    async def fake_pdf_detail(**kwargs):
+        return PublicPdfDetail(
+            status="metadata_only",
+            detail_url=kwargs["detail_url"],
+            message="PDF 文件损坏",
+            failure_reason="pdf_invalid_or_corrupt",
+            terminal_failure=True,
+            acquisition_mode="managed_chrome",
+        )
+
+    async def verified_legacy_fallback(_steps):
+        return [
+            FakeResp({}, f"<h1>{item.title}</h1>{business_id}"),
+            FakeResp(
+                {
+                    "object": {
+                        "businessId": business_id,
+                        "businessObjectName": item.title,
+                        "tendererName": "测试招标单位",
+                        "bulletinContent": "<p>经校验的公告正文</p>",
+                    }
+                }
+            ),
+        ]
+
+    monkeypatch.setattr(
+        "app.sources.cebpub_source.fetch_public_pdf_detail", fake_pdf_detail
+    )
+    monkeypatch.setattr(
+        source.fetcher, "post_form_sequence", verified_legacy_fallback
+    )
+
+    detail = await source.fetch_detail(item)
+
+    assert detail.detail_status == "full"
+    assert "经校验的公告正文" in detail.clean_content
+    assert detail.source_metadata["fallback_result"] == "legacy_official_json_full"
+    assert detail.source_metadata["primary_failure_reason"] == (
+        "pdf_invalid_or_corrupt"
+    )

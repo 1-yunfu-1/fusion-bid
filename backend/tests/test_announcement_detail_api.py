@@ -272,6 +272,58 @@ async def test_default_recrawl_never_opens_interactive_browser(
     assert payload["browser_state"] == "needs_verification"
 
 
+async def test_metadata_only_invalid_pdf_never_opens_interactive_browser(
+    client, db_engine, monkeypatch
+):
+    announcement_id = await _create_pending_announcement(db_engine)
+
+    class FakeSource:
+        enabled = True
+
+        def __init__(self):
+            self.calls = []
+
+        async def fetch_detail(self, item, *, interactive=False):
+            self.calls.append(interactive)
+            return DetailResult(
+                title=item.title,
+                source_url=item.source_url,
+                detail_url=item.source_url,
+                detail_status="metadata_only",
+                detail_fetched=False,
+                source_metadata={
+                    "message": "官方 PDF 无效或损坏",
+                    "failure_reason": "pdf_invalid_or_corrupt",
+                    "failure_stage": "pdf_validation",
+                    "terminal_failure": True,
+                    "retryable": False,
+                    "fallback_attempted": True,
+                    "fallback_result": "empty_or_unverified",
+                    "cooldown_until": "2026-07-20T12:00:00+08:00",
+                    "time_to_failure_ms": 800,
+                },
+            )
+
+        async def extract_attachments(self, detail):
+            return []
+
+    source = FakeSource()
+    monkeypatch.setattr(announcements_api, "get_source", lambda _name: source)
+    response = await client.post(
+        f"/api/announcements/{announcement_id}/recrawl",
+        json={"interactive_on_verification": True},
+    )
+
+    assert response.status_code == 200, response.text
+    payload = response.json()
+    assert source.calls == [False]
+    assert payload["ok"] is False
+    assert payload["verification_attempted"] is False
+    assert payload["terminal_failure"] is True
+    assert payload["fallback_result"] == "empty_or_unverified"
+    assert payload["cooldown_until"] == "2026-07-20T12:00:00+08:00"
+
+
 async def test_browser_text_layer_capture_extracts_verified_pages(client, db_engine):
     await _create_pending_announcement(db_engine)
     detail_url = (

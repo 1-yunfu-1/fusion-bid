@@ -28,6 +28,9 @@ export interface HealthResponse {
       scanned_pdf_ready?: boolean;
       parse_concurrency?: number;
       ocr_concurrency?: number;
+      viewer_ready_timeout_seconds?: number;
+      ocr_timeout_seconds?: number;
+      invalid_pdf_cooldown_hours?: number;
     };
   };
   message: string;

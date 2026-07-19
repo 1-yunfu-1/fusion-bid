@@ -52,6 +52,17 @@ const triggerLabels: Record<string, string> = {
   scheduled: "定时执行",
 };
 
+const collectionFailureLabels: Record<string, string> = {
+  invalid_pdf: "无效/损坏 PDF",
+  transient_pdf_timeout: "PDF 临时未就绪",
+  pdf_incomplete: "PDF 不完整",
+  ocr_failure: "OCR 失败",
+  invalid_pdf_cooldown: "损坏 PDF 冷却跳过",
+  site_blocked: "站点阻断",
+  browser_failure: "浏览器失败",
+  not_attempted: "未尝试",
+};
+
 const scheduleLabels: Record<string, string> = {
   once: "单次",
   daily: "每日",
@@ -594,7 +605,7 @@ export default function TasksPage() {
           rowKey="id"
           dataSource={historyQuery.data?.items || []}
           pagination={{ pageSize: 10, total: historyQuery.data?.total || 0 }}
-          scroll={{ x: 780 }}
+          scroll={{ x: 980 }}
           columns={[
             {
               title: "触发方式",
@@ -636,6 +647,35 @@ export default function TasksPage() {
               key: "note",
               ellipsis: true,
               render: (_: unknown, row) => row.error_message || row.analysis_preview?.portfolio_summary || "—",
+            },
+            {
+              title: "详情诊断",
+              key: "detail-diagnostics",
+              width: 280,
+              render: (_: unknown, row) => {
+                const failures = Object.entries(row.failure_breakdown || {});
+                const bySource = Object.entries(row.failure_breakdown_by_source || {});
+                return failures.length ? (
+                  <Space direction="vertical" size={2}>
+                    <Space size={[0, 4]} wrap>
+                      {failures.map(([reason, count]) => (
+                        <Tag key={reason}>
+                          {collectionFailureLabels[reason] || reason} {count}
+                        </Tag>
+                      ))}
+                    </Space>
+                    {bySource.map(([source, values]) => (
+                      <Typography.Text type="secondary" key={source} style={{ fontSize: 12 }}>
+                        {source}：{Object.entries(values).map(([reason, count]) => (
+                          `${collectionFailureLabels[reason] || reason} ${count}`
+                        )).join("，")}
+                      </Typography.Text>
+                    ))}
+                  </Space>
+                ) : (
+                  <Tag color="success">无详情失败</Tag>
+                );
+              },
             },
             {
               title: "报告",

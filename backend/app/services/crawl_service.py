@@ -7,7 +7,7 @@ import hashlib
 import logging
 import time
 from dataclasses import dataclass, field
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
 
 from sqlalchemy import select
@@ -47,6 +47,16 @@ from app.sources.registry import build_sources
 
 logger = logging.getLogger(__name__)
 TZ = ZoneInfo("Asia/Shanghai")
+
+_COOLDOWN_FAILURE_REASONS = {
+    "pdf_invalid_or_corrupt",
+    "pdf_too_large",
+    "pdf_page_limit",
+    "pdf_parse_failure",
+    "ocr_failure",
+    "ocr_timeout",
+    "official_content_unavailable",
+}
 
 
 @dataclass
@@ -216,6 +226,8 @@ def _failure_bucket(detail: DetailResult, *, extraction_failed: bool = False) ->
     metadata = detail.source_metadata or {}
     attempt_state = metadata.get("detail_attempt_state")
     reason = str(metadata.get("failure_reason") or "")
+    if reason == "invalid_pdf_cooldown":
+        return "invalid_pdf_cooldown"
     if attempt_state == "not_attempted":
         return "not_attempted"
     if attempt_state == "blocked" or reason in {
@@ -238,20 +250,25 @@ def _failure_bucket(detail: DetailResult, *, extraction_failed: bool = False) ->
         return "html_content_empty"
     if reason == "http_detail_fetch_failure":
         return "http_detail_failure"
+    if reason in {"pdf_invalid_or_corrupt", "pdf_parse_failure"}:
+        return "invalid_pdf"
+    if reason in {"ocr_failure", "ocr_timeout"}:
+        return "ocr_failure"
     if reason in {
         "content_unavailable",
         "incomplete_pdf_pages",
+        "pdf_too_large",
+        "pdf_page_limit",
+    }:
+        return "pdf_incomplete"
+    if reason in {
         "pdf_not_ready",
         "pdf_not_loaded",
         "pdf_document_unavailable",
         "pdf_bytes_timeout",
-        "pdf_too_large",
-        "pdf_page_limit",
-        "pdf_parse_failure",
-        "ocr_failure",
         "collector_timeout",
     }:
-        return "pdf_incomplete"
+        return "transient_pdf_timeout"
     if reason == "outer_detail_unavailable":
         return "outer_detail_unavailable"
     if reason == "official_content_unavailable":
@@ -453,6 +470,99 @@ async def _discover_source(
         )
 
 
+def _as_aware_datetime(value: object) -> datetime | None:
+    if isinstance(value, datetime):
+        parsed = value
+    elif isinstance(value, str) and value.strip():
+        try:
+            parsed = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+        except ValueError:
+            return None
+    else:
+        return None
+    return parsed.replace(tzinfo=TZ) if parsed.tzinfo is None else parsed
+
+
+def _active_pdf_cooldown(
+    metadata: dict[str, object],
+    *,
+    now: datetime,
+    cooldown_hours: int,
+) -> dict[str, object] | None:
+    attempts = [
+        metadata.get("last_recrawl"),
+        metadata.get("last_attempt"),
+        metadata,
+    ]
+    for value in attempts:
+        if not isinstance(value, dict):
+            continue
+        reason = str(value.get("failure_reason") or "")
+        terminal = bool(value.get("terminal_failure")) or reason in _COOLDOWN_FAILURE_REASONS
+        if not terminal or reason not in _COOLDOWN_FAILURE_REASONS:
+            continue
+        cooldown_until = _as_aware_datetime(
+            value.get("cooldown_until") or metadata.get("cooldown_until")
+        )
+        if cooldown_until is None:
+            attempted_at = _as_aware_datetime(
+                value.get("attempted_at") or value.get("at")
+            )
+            if attempted_at is None or cooldown_hours <= 0:
+                continue
+            cooldown_until = attempted_at + timedelta(hours=cooldown_hours)
+        if cooldown_until <= now:
+            continue
+        return {
+            "failure_reason": reason,
+            "cooldown_until": cooldown_until.isoformat(),
+            "last_attempt": dict(value),
+        }
+    return None
+
+
+async def _load_cebpub_cooldowns(
+    db: AsyncSession,
+    work: list[tuple[TenderSourceAdapter, ListItem]],
+    *,
+    now: datetime,
+    report_mode: str,
+) -> dict[str, dict[str, object]]:
+    settings = get_settings()
+    if (
+        report_mode == "full_snapshot"
+        or settings.cebpub_invalid_pdf_cooldown_hours <= 0
+    ):
+        return {}
+    source_ids = {
+        str(item.source_item_id)
+        for source, item in work
+        if source.source_name == "cebpub" and item.source_item_id
+    }
+    if not source_ids:
+        return {}
+    rows = (
+        await db.execute(
+            select(TenderAnnouncement).where(
+                TenderAnnouncement.source_name == "cebpub",
+                TenderAnnouncement.source_item_id.in_(source_ids),
+            )
+        )
+    ).scalars().all()
+    active: dict[str, dict[str, object]] = {}
+    for row in rows:
+        if not row.source_item_id:
+            continue
+        value = _active_pdf_cooldown(
+            dict(row.source_metadata or {}),
+            now=now,
+            cooldown_hours=settings.cebpub_invalid_pdf_cooldown_hours,
+        )
+        if value:
+            active[str(row.source_item_id)] = value
+    return active
+
+
 async def _process_detail_work(
     source: TenderSourceAdapter,
     item: ListItem,
@@ -462,6 +572,7 @@ async def _process_detail_work(
     source_semaphore: asyncio.Semaphore,
     llm_semaphore: asyncio.Semaphore,
     cebpub_controller: _CebpubRunController,
+    cooldown: dict[str, object] | None = None,
 ) -> _ProcessedDetail:
     detail_started = time.monotonic()
     acquisition_exception = False
@@ -485,7 +596,31 @@ async def _process_detail_work(
             attachment_extract_failed = True
         return detail_value
 
-    if source.source_name == "cebpub":
+    if source.source_name == "cebpub" and cooldown:
+        detail = _metadata_detail(
+            item,
+            status="metadata_only",
+            attempt_state="not_attempted",
+            reason="invalid_pdf_cooldown",
+            message=(
+                "该公告最近一次确定性 PDF 失败仍在冷却期，本轮已快速跳过；"
+                f"可在 {cooldown.get('cooldown_until')} 后自动重试"
+            ),
+            failure_stage="preflight",
+        )
+        detail.source_metadata.update(
+            {
+                "terminal_failure": True,
+                "retryable": False,
+                "cooldown_until": cooldown.get("cooldown_until"),
+                "last_failure_reason": cooldown.get("failure_reason"),
+                "last_attempt": cooldown.get("last_attempt") or {},
+                "fallback_attempted": False,
+                "fallback_result": "cooldown_skip",
+                "time_to_failure_ms": 0,
+            }
+        )
+    elif source.source_name == "cebpub":
         allowed = await cebpub_controller.acquire()
         if not allowed:
             detail = _metadata_detail(
@@ -784,6 +919,13 @@ async def execute_search_task(
     except Exception:  # noqa: BLE001
         managed_browser = None
 
+    cebpub_cooldowns = await _load_cebpub_cooldowns(
+        db,
+        work,
+        now=datetime.now(TZ),
+        report_mode=report_mode,
+    )
+
     pipeline_started = time.monotonic()
     processed_details: list[_ProcessedDetail] = []
     try:
@@ -801,6 +943,11 @@ async def execute_search_task(
                     ),
                     llm_semaphore=llm_semaphore,
                     cebpub_controller=cebpub_controller,
+                    cooldown=(
+                        cebpub_cooldowns.get(str(item.source_item_id))
+                        if item.source_item_id
+                        else None
+                    ),
                 )
                 for source, item in work
             )
@@ -965,7 +1112,7 @@ async def execute_search_task(
             if reused_cached_full:
                 current_metadata = dict(rec.source_metadata or {})
                 preserved_metadata = dict(existing.source_metadata or {})
-                preserved_metadata["last_attempt"] = {
+                current_event = {
                     "attempted_at": crawl_time.isoformat(),
                     "status": rec.detail_status or "metadata_only",
                     "detail_fetched": False,
@@ -978,7 +1125,33 @@ async def execute_search_task(
                     "message": str(current_metadata.get("message") or "")[:500],
                     "attempt_count": int(current_metadata.get("attempt_count") or 0),
                     "duration_ms": int(current_metadata.get("duration_ms") or 0),
+                    "terminal_failure": bool(
+                        current_metadata.get("terminal_failure", False)
+                    ),
+                    "retryable": bool(current_metadata.get("retryable", False)),
+                    "cooldown_until": current_metadata.get("cooldown_until"),
+                    "fallback_attempted": bool(
+                        current_metadata.get("fallback_attempted", False)
+                    ),
+                    "fallback_result": current_metadata.get("fallback_result"),
+                    "viewer_error_code": current_metadata.get("viewer_error_code"),
+                    "viewer_error_message": str(
+                        current_metadata.get("viewer_error_message") or ""
+                    )[:500]
+                    or None,
+                    "time_to_failure_ms": int(
+                        current_metadata.get("time_to_failure_ms")
+                        or current_metadata.get("duration_ms")
+                        or 0
+                    ),
                 }
+                if current_metadata.get("failure_reason") == "invalid_pdf_cooldown":
+                    prior_attempt = current_metadata.get("last_attempt")
+                    if isinstance(prior_attempt, dict) and prior_attempt:
+                        preserved_metadata["last_attempt"] = prior_attempt
+                    preserved_metadata["last_skip"] = current_event
+                else:
+                    preserved_metadata["last_attempt"] = current_event
                 preserved_metadata["using_cached_full"] = True
                 preserved_metadata["cached_full_captured_at"] = (
                     existing.crawl_time.isoformat() if existing.crawl_time else None

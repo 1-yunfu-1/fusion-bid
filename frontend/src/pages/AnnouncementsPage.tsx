@@ -49,6 +49,14 @@ type AnnouncementRow = {
   detail_attempt_state?: "not_attempted" | "attempted" | "blocked" | string;
   failure_reason?: string | null;
   failure_stage?: string | null;
+  terminal_failure?: boolean;
+  retryable?: boolean;
+  viewer_error_code?: string | null;
+  viewer_error_message?: string | null;
+  fallback_attempted?: boolean;
+  fallback_result?: string | null;
+  cooldown_until?: string | null;
+  time_to_failure_ms?: number;
   source_metadata?: Record<string, unknown>;
 };
 
@@ -124,6 +132,18 @@ const fieldLabels: Record<string, string> = {
   agent_allowed: "代理商条件",
   platform_registration_required: "平台注册",
   ca_required: "CA/电子签章",
+};
+
+const failureLabels: Record<string, string> = {
+  pdf_invalid_or_corrupt: "官方 PDF 无效或损坏",
+  invalid_pdf_cooldown: "损坏 PDF 冷却期内已跳过",
+  pdf_document_unavailable: "PDF 文档暂未就绪",
+  collector_timeout: "采集器等待超时",
+  pdf_bytes_timeout: "PDF 字节读取超时",
+  incomplete_pdf_pages: "PDF 页面不完整",
+  ocr_failure: "扫描页 OCR 未识别正文",
+  ocr_timeout: "扫描页 OCR 超时",
+  official_content_unavailable: "官方正文暂停或停止提供",
 };
 
 function statusTag(status: string) {
@@ -521,11 +541,23 @@ export default function AnnouncementsPage() {
               ) : null}
               {detail.failure_reason ? (
                 <Alert
-                  type="warning"
+                  type={detail.failure_reason === "invalid_pdf_cooldown" ? "info" : "warning"}
                   showIcon
                   style={{ marginBottom: 16 }}
-                  message="最近一次采集诊断"
-                  description={`${detail.failure_stage || "unknown"} / ${detail.failure_reason}`}
+                  message={failureLabels[detail.failure_reason] || "最近一次采集诊断"}
+                  description={[
+                    `${detail.failure_stage || "unknown"} / ${detail.failure_reason}`,
+                    detail.viewer_error_message,
+                    detail.fallback_attempted
+                      ? `官方 JSON 兜底：${detail.fallback_result || "无有效正文"}`
+                      : undefined,
+                    detail.cooldown_until
+                      ? `自动重试时间：${formatDateTime(detail.cooldown_until)}`
+                      : undefined,
+                    detail.time_to_failure_ms
+                      ? `本次耗时：${(detail.time_to_failure_ms / 1000).toFixed(1)} 秒`
+                      : undefined,
+                  ].filter(Boolean).join("；")}
                 />
               ) : null}
               {publicBrowserState === "unavailable" ? (
