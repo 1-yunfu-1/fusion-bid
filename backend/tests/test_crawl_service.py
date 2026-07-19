@@ -14,10 +14,32 @@ from app.core.database import Base
 from app.models.task import SearchTask
 from app.models.delivery import DeliveryHistory
 from app.models.announcement import TenderAnnouncement
+from app.models.quality import AnnouncementCrawlAttempt
 from app.services import crawl_service
 from app.sources.base import DetailResult, HealthResult, ListItem, SearchQuery, TenderSourceAdapter
 
 TZ = ZoneInfo("Asia/Shanghai")
+
+
+@pytest.mark.asyncio
+async def test_extraction_timeout_circuit_opens_after_two_consecutive_timeouts():
+    controller = crawl_service._ExtractionRunController(
+        timeout_threshold=2, execution_budget_seconds=60
+    )
+    assert await controller.begin_call() is True
+    await controller.observe(timed_out=True)
+    assert await controller.begin_call() is True
+    await controller.observe(timed_out=True)
+    assert controller.circuit_open is True
+    assert controller.timeout_count == 2
+    assert await controller.begin_call() is False
+
+    budgeted = crawl_service._ExtractionRunController(
+        timeout_threshold=2, execution_budget_seconds=1
+    )
+    budgeted.started_at -= 2
+    assert await budgeted.begin_call() is False
+    assert budgeted.budget_exhausted is True
 
 
 class MockPublicSource(TenderSourceAdapter):
@@ -226,6 +248,100 @@ async def test_execute_search_task_saves_announcements(monkeypatch):
         assert execution.status in ("success", "partial")
         assert stats.saved_count >= 1
         assert "mock_public" in stats.sources_succeeded
+
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_second_run_reuses_unchanged_extraction_and_default_cap_is_30(
+    monkeypatch, tmp_path
+):
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    factory = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+    calls = {"ai": 0, "detail": 0}
+
+    class ManyItemsSource(MockPublicSource):
+        source_name = "cache_source"
+
+        async def search(self, query: SearchQuery) -> list[ListItem]:
+            return [
+                ListItem(
+                    title=f"安徽省服务器采购项目{i}公开招标公告",
+                    source_url=f"https://example.test/cache/{i}",
+                    source_item_id=f"cache-{i}",
+                    publish_time=datetime(2026, 7, 1, tzinfo=TZ),
+                    region="安徽省",
+                    snippet="安徽省服务器采购",
+                )
+                for i in range(35)
+            ]
+
+        async def fetch_detail(
+            self, item: ListItem, *, interactive: bool = False
+        ) -> DetailResult:
+            calls["detail"] += 1
+            return DetailResult(
+                title=item.title,
+                source_url=item.source_url,
+                publish_time=item.publish_time,
+                region=item.region,
+                clean_content=(
+                    f"采购人：测试单位{item.source_item_id}\n"
+                    f"项目编号：PROJECT-{item.source_item_id}\n"
+                    "安徽省服务器公开招标"
+                ),
+                detail_fetched=True,
+                detail_status="full",
+            )
+
+    async def fake_ai(**kwargs):
+        calls["ai"] += 1
+        return crawl_service.build_extraction_data(**kwargs)
+
+    monkeypatch.setattr(
+        crawl_service, "build_sources", lambda only_enabled=True: [ManyItemsSource()]
+    )
+    monkeypatch.setattr(crawl_service, "build_extraction_data_with_ai", fake_ai)
+
+    def fake_report(*_args, **_kwargs):
+        path = tmp_path / "cache.docx"
+        path.write_bytes(b"docx")
+        return path
+
+    monkeypatch.setattr(crawl_service, "generate_report_file", fake_report)
+
+    async with factory() as db:
+        task = SearchTask(
+            original_query="安徽省服务器招标",
+            keywords=["服务器"],
+            regions=["安徽省"],
+            start_date=date(2026, 6, 1),
+            end_date=date(2026, 7, 19),
+            status="confirmed",
+        )
+        db.add(task)
+        await db.commit()
+        await db.refresh(task)
+
+        first_execution, first = await crawl_service.execute_search_task(db, task)
+        assert first.detail_cap == 30
+        assert first.detail_cap_skipped == 5
+        assert first.truncated is True
+        assert first.coverage_status == "truncated"
+        assert first.llm_call_count == 30
+        assert calls["ai"] == 30
+        assert first_execution.detail_cap_skipped == 5
+
+        _, second = await crawl_service.execute_search_task(db, task)
+        assert second.extraction_cache_hit_count == 30
+        assert second.llm_call_count == 0
+        assert calls["ai"] == 30
+        attempt_count = await db.scalar(
+            select(func.count()).select_from(AnnouncementCrawlAttempt)
+        )
+        assert attempt_count == 60
 
     await engine.dispose()
 

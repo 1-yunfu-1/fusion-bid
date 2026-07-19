@@ -39,6 +39,7 @@ class JsonLlmCallResult:
     model: str | None = None
     data: dict[str, Any] | None = None
     error: str | None = None
+    error_kind: str | None = None
 
 
 def _extract_json_object(text: str) -> dict[str, Any]:
@@ -245,12 +246,23 @@ async def call_json_with_provider(
         message = re.sub(r"Bearer\s+\S+", "Bearer ***", str(exc))
         logger.info("Evidence-bounded LLM analysis unavailable for %s: %s", provider, message)
         return JsonLlmCallResult(
-            success=False, provider=provider, model=model, error=message
+            success=False,
+            provider=provider,
+            model=model,
+            error=message,
+            error_kind=(
+                "timeout"
+                if isinstance(exc, (httpx.TimeoutException, TimeoutError))
+                else "provider_error"
+            ),
         )
 
 
 async def call_json_llm_chain(
-    messages: list[dict[str, str]], *, prefer_order: list[str] | None = None
+    messages: list[dict[str, str]],
+    *,
+    prefer_order: list[str] | None = None,
+    stop_after_timeout: bool = False,
 ) -> JsonLlmCallResult:
     eff = effective_llm_settings()
     order = prefer_order or [x for x in eff["prefer_order"] if x in ("api", "ollama")]
@@ -262,6 +274,8 @@ async def call_json_llm_chain(
         if result.success:
             return result
         last = result
+        if stop_after_timeout and result.error_kind == "timeout":
+            break
     return last
 
 

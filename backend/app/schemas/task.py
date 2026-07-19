@@ -55,6 +55,8 @@ class TaskExecuteRequest(BaseModel):
     report_mode: Literal["incremental", "full_snapshot"] = "incremental"
     # 旧前端兼容；snapshot 等价于 full_snapshot。
     report_scope: Literal["incremental", "snapshot"] | None = None
+    search_depth: Literal["quick", "standard", "complete"] = "standard"
+    refresh_extraction: bool = False
 
     @model_validator(mode="before")
     @classmethod
@@ -99,6 +101,16 @@ class TaskExecutionResponse(BaseModel):
     requested_regions: list[str] = Field(default_factory=list)
     effective_regions: list[str] = Field(default_factory=list)
     region_scope: Literal["nationwide", "restricted"] = "restricted"
+    detail_cap: int = 30
+    detail_cap_skipped: int = 0
+    coverage_status: str = "complete"
+    search_depth: str = "standard"
+    extraction_cache_hit_count: int = 0
+    llm_call_count: int = 0
+    llm_timeout_count: int = 0
+    opportunity_count: int = 0
+    lifecycle_count: int = 0
+    source_outcomes: dict[str, dict[str, Any]] = Field(default_factory=dict)
     filtered_out_count: int = 0
     duplicate_count: int = 0
     cross_source_merge_count: int = 0
@@ -148,6 +160,16 @@ class TaskExecutionItem(BaseModel):
     requested_regions: list[str] = Field(default_factory=list)
     effective_regions: list[str] = Field(default_factory=list)
     region_scope: Literal["nationwide", "restricted"] = "restricted"
+    detail_cap: int = 30
+    detail_cap_skipped: int = 0
+    coverage_status: str = "complete"
+    search_depth: str = "standard"
+    extraction_cache_hit_count: int = 0
+    llm_call_count: int = 0
+    llm_timeout_count: int = 0
+    opportunity_count: int = 0
+    lifecycle_count: int = 0
+    source_outcomes: dict[str, dict[str, Any]] = Field(default_factory=dict)
     report_filename: str | None = None
     report_download_url: str | None = None
     analysis_status: str = "rule_only"

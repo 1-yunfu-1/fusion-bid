@@ -105,6 +105,21 @@ class Settings(BaseSettings):
     llm_extraction_concurrency: int = Field(
         default=2, ge=1, le=8, alias="LLM_EXTRACTION_CONCURRENCY"
     )
+    llm_extraction_budget_seconds: int = Field(
+        default=75, ge=10, le=600, alias="LLM_EXTRACTION_BUDGET_SECONDS"
+    )
+    llm_extraction_timeout_threshold: int = Field(
+        default=2, ge=1, le=10, alias="LLM_EXTRACTION_TIMEOUT_THRESHOLD"
+    )
+    llm_extraction_execution_budget_seconds: int = Field(
+        default=150,
+        ge=30,
+        le=1800,
+        alias="LLM_EXTRACTION_EXECUTION_BUDGET_SECONDS",
+    )
+    llm_analysis_budget_seconds: int = Field(
+        default=30, ge=5, le=180, alias="LLM_ANALYSIS_BUDGET_SECONDS"
+    )
     cebpub_site_block_threshold: int = Field(
         default=2, ge=1, le=5, alias="CEBPUB_SITE_BLOCK_THRESHOLD"
     )

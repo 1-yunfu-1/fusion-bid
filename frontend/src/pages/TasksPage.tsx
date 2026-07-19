@@ -299,7 +299,9 @@ export default function TasksPage() {
               <Tag>入库 {lastExecution.saved_count}</Tag>
               <Tag>增量 {lastExecution.incremental_count}</Tag>
               <Tag>{lastExecution.report_mode === "full_snapshot" ? "未去重完整快照" : "增量交付"}</Tag>
-              {lastExecution.truncated && <Tag color="error">已达安全上限，结果截断</Tag>}
+              <Tag>详情上限 {lastExecution.detail_cap}/源</Tag>
+              <Tag color="blue">抽取缓存 {lastExecution.extraction_cache_hit_count}</Tag>
+              {lastExecution.truncated && <Tag color="error">跳过详情 {lastExecution.detail_cap_skipped} 条</Tag>}
             </Space>
           }
           description={
@@ -638,7 +640,9 @@ export default function TasksPage() {
               width: 150,
               render: (_: unknown, row) => (
                 <Typography.Text type="secondary">
-                  原始 {row.raw_result_count} / 增量 {row.incremental_count}
+                  原始 {row.raw_result_count} / 增量 {row.incremental_count}<br />
+                  机会 {row.opportunity_count} / 生命周期 {row.lifecycle_count}<br />
+                  缓存 {row.extraction_cache_hit_count} / 模型 {row.llm_call_count}
                 </Typography.Text>
               ),
             },

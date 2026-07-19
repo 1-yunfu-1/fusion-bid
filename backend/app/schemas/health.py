@@ -30,7 +30,7 @@ class HealthResponse(BaseModel):
     database: str = Field(description="ok | error")
     database_ok: bool
     database_revision: str = "unversioned"
-    extraction_version: str = "v2"
+    extraction_version: str = "v3"
     capabilities: list[str] = Field(default_factory=list)
     public_browser: PublicBrowserStatus = Field(default_factory=PublicBrowserStatus)
     message: str = ""

@@ -39,10 +39,17 @@ export async function executeTask(
   id: string,
   triggerType: "initial" | "manual" = "manual",
   reportMode: "incremental" | "full_snapshot" = "incremental",
+  searchDepth: "quick" | "standard" | "complete" = "standard",
+  refreshExtraction = false,
 ): Promise<TaskExecutionResponse> {
   const { data } = await apiClient.post<TaskExecutionResponse>(
     `/api/tasks/${id}/execute`,
-    { trigger_type: triggerType, report_mode: reportMode },
+    {
+      trigger_type: triggerType,
+      report_mode: reportMode,
+      search_depth: reportMode === "full_snapshot" ? "complete" : searchDepth,
+      refresh_extraction: refreshExtraction,
+    },
     { timeout: 300000 },
   );
   return data;

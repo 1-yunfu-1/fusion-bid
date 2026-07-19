@@ -41,6 +41,21 @@ class TaskExecution(Base):
     detail_human_verification_count: Mapped[int] = mapped_column(
         Integer, default=0, nullable=False
     )
+    detail_cap: Mapped[int] = mapped_column(Integer, default=30, nullable=False)
+    detail_cap_skipped: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    coverage_status: Mapped[str] = mapped_column(
+        String(24), default="complete", nullable=False, index=True
+    )
+    search_depth: Mapped[str] = mapped_column(
+        String(16), default="standard", nullable=False, index=True
+    )
+    extraction_cache_hit_count: Mapped[int] = mapped_column(
+        Integer, default=0, nullable=False
+    )
+    llm_call_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    llm_timeout_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    opportunity_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    lifecycle_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     sources_requested: Mapped[list | None] = mapped_column(JSON, nullable=True)
     sources_succeeded: Mapped[list | None] = mapped_column(JSON, nullable=True)
     raw_result_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)

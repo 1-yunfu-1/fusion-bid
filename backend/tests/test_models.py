@@ -10,6 +10,8 @@ def test_tables_registered():
     assert "task_executions" in names
     assert "tender_announcements" in names
     assert "delivery_histories" in names
+    assert "announcement_crawl_attempts" in names
+    assert "announcement_quality_feedback" in names
 
 
 def test_announcement_has_data_mode():
@@ -18,6 +20,10 @@ def test_announcement_has_data_mode():
     assert "source_url" in table.c
     assert "attachment_links" in table.c
     assert "content_hash" in table.c
+    assert "document_hash" in table.c
+    assert "extraction_fingerprint" in table.c
+    assert "lifecycle_stage" in table.c
+    assert "procurement_method" in table.c
 
 
 def test_search_task_schedule_fields():

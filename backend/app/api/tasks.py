@@ -175,12 +175,16 @@ async def execute_task(
         trigger_type = body.trigger_type if body else "manual"
         report_mode = body.report_mode if body else "incremental"
         report_scope = "snapshot" if report_mode == "full_snapshot" else "incremental"
+        search_depth = body.search_depth if body else "standard"
+        refresh_extraction = body.refresh_extraction if body else False
         execution, stats = await execute_search_task(
             db,
             task,
             trigger_type=trigger_type,
             report_mode=report_mode,
             report_scope=report_scope,
+            search_depth=search_depth,
+            refresh_extraction=refresh_extraction,
         )
         # 接口语义以当次请求为准；同时保留 report_scope 供旧客户端读取。
         execution.report_mode = report_mode
@@ -235,6 +239,18 @@ async def execute_task(
             requested_regions=getattr(stats, "requested_regions", []),
             effective_regions=getattr(stats, "effective_regions", []),
             region_scope=getattr(stats, "region_scope", "restricted"),
+            detail_cap=getattr(stats, "detail_cap", 30),
+            detail_cap_skipped=getattr(stats, "detail_cap_skipped", 0),
+            coverage_status=getattr(stats, "coverage_status", "complete"),
+            search_depth=getattr(stats, "search_depth", search_depth),
+            extraction_cache_hit_count=getattr(
+                stats, "extraction_cache_hit_count", 0
+            ),
+            llm_call_count=getattr(stats, "llm_call_count", 0),
+            llm_timeout_count=getattr(stats, "llm_timeout_count", 0),
+            opportunity_count=getattr(stats, "opportunity_count", 0),
+            lifecycle_count=getattr(stats, "lifecycle_count", 0),
+            source_outcomes=getattr(stats, "source_outcomes", {}),
             filtered_out_count=stats.filtered_out_count,
             duplicate_count=stats.duplicate_count,
             cross_source_merge_count=stats.cross_source_merge_count,
@@ -405,6 +421,50 @@ async def list_executions(
                 requested_regions=list(diagnostics.get("requested_regions") or []),
                 effective_regions=list(diagnostics.get("effective_regions") or []),
                 region_scope=str(diagnostics.get("region_scope") or "restricted"),
+                detail_cap=int(
+                    diagnostics.get("detail_cap")
+                    or getattr(e, "detail_cap", 30)
+                    or 30
+                ),
+                detail_cap_skipped=int(
+                    diagnostics.get("detail_cap_skipped")
+                    or getattr(e, "detail_cap_skipped", 0)
+                    or 0
+                ),
+                coverage_status=str(
+                    diagnostics.get("coverage_status")
+                    or getattr(e, "coverage_status", "complete")
+                ),
+                search_depth=str(
+                    diagnostics.get("search_depth")
+                    or getattr(e, "search_depth", "standard")
+                ),
+                extraction_cache_hit_count=int(
+                    diagnostics.get("extraction_cache_hit_count")
+                    or getattr(e, "extraction_cache_hit_count", 0)
+                    or 0
+                ),
+                llm_call_count=int(
+                    diagnostics.get("llm_call_count")
+                    or getattr(e, "llm_call_count", 0)
+                    or 0
+                ),
+                llm_timeout_count=int(
+                    diagnostics.get("llm_timeout_count")
+                    or getattr(e, "llm_timeout_count", 0)
+                    or 0
+                ),
+                opportunity_count=int(
+                    diagnostics.get("opportunity_count")
+                    or getattr(e, "opportunity_count", 0)
+                    or 0
+                ),
+                lifecycle_count=int(
+                    diagnostics.get("lifecycle_count")
+                    or getattr(e, "lifecycle_count", 0)
+                    or 0
+                ),
+                source_outcomes=dict(diagnostics.get("source_outcomes") or {}),
                 report_filename=report_filename,
                 report_download_url=report_download_url,
                 analysis_status=(e.analysis_data or {}).get("status", "rule_only"),

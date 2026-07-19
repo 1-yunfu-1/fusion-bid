@@ -13,6 +13,7 @@ type CompanyProfile = {
   delivery_constraints: string[];
   agent_capability?: boolean | null;
   joint_venture_capability?: boolean | null;
+  qualification_expiry_warnings?: string[];
 };
 
 const tagProps = {
@@ -63,6 +64,15 @@ export default function CompanyProfileCard() {
         message={query.data?.configured ? "已配置企业画像" : "企业画像为可选项"}
         description="配置后，公告 AI 分析会把资格条款与产品能力、服务区域、资质、案例及交付限制逐条比对；未配置时仍提供通用分析。这里不保存账号、Key、Cookie 或登录状态。"
       />
+      {(query.data?.qualification_expiry_warnings || []).length > 0 && (
+        <Alert
+          type="warning"
+          showIcon
+          style={{ marginBottom: 16 }}
+          message="资质有效期提醒"
+          description={(query.data?.qualification_expiry_warnings || []).join("；")}
+        />
+      )}
       <Form
         form={form}
         layout="vertical"

@@ -7,6 +7,7 @@ This module deliberately does not attempt bid-win prediction.
 
 from __future__ import annotations
 
+import asyncio
 import re
 from datetime import date, datetime
 from typing import Any, Sequence
@@ -15,6 +16,7 @@ from zoneinfo import ZoneInfo
 from app.llm.client import call_json_llm_chain
 from app.llm.prompts import REPORT_ANALYSIS_SYSTEM_PROMPT, build_report_analysis_prompt
 from app.reports.fields import _MISSING, enrich_report_item
+from app.reports.lifecycle import LIFECYCLE_OPPORTUNITY
 
 TZ = ZoneInfo("Asia/Shanghai")
 _MISSING_VALUES = {
@@ -155,21 +157,30 @@ def _project_rule(
     qualification_items = [
         x for x in (fields.get("qualification_items") or []) if x and x not in _MISSING_VALUES
     ]
+    lifecycle_stage = str(fields.get("lifecycle_stage") or LIFECYCLE_OPPORTUNITY)
     gaps: list[str] = []
     if detail_status != "full":
         gaps.append("尚未获得可验证的公告详情，仅有列表元数据")
     if fields.get("purchaser") in _MISSING_VALUES:
         gaps.append("招标人/采购人原文未提取")
-    if not qualification_items and fields.get("qualification") in _MISSING_VALUES:
-        gaps.append("资格要求原文未提取")
-    if fields.get("deadline") in _MISSING_VALUES:
-        gaps.append("投标或报名截止时间原文未提取")
-
-    announcement_type = str(fields.get("announcement_type") or "")
+    if lifecycle_stage == LIFECYCLE_OPPORTUNITY:
+        if not qualification_items and fields.get("qualification") in _MISSING_VALUES:
+            gaps.append("资格要求原文未提取")
+        if fields.get("deadline") in _MISSING_VALUES:
+            gaps.append("投标或报名截止时间原文未提取")
+    elif lifecycle_stage == "结果公告":
+        if fields.get("awardee") in _MISSING_VALUES:
+            gaps.append("中标人/成交供应商未提取")
+        if fields.get("award_amount") in _MISSING_VALUES:
+            gaps.append("中标/成交金额未提取")
+    elif lifecycle_stage == "更正/澄清" and fields.get("change_summary") in _MISSING_VALUES:
+        gaps.append("变更事项未提取")
+    elif lifecycle_stage == "终止/废标" and fields.get("termination_reason") in _MISSING_VALUES:
+        gaps.append("终止/废标原因未提取")
     reasons: list[str] = []
-    if announcement_type in {"中标公告", "成交公告", "废标公告"}:
-        priority = "低"
-        reasons.append("公告类型显示为结果/废标类，通常不作为新的投标机会")
+    if lifecycle_stage != LIFECYCLE_OPPORTUNITY:
+        priority = "生命周期情报"
+        reasons.append(f"该记录属于{lifecycle_stage}，不作为新的可参与机会评分")
     elif deadline_state == "已过期":
         priority = "低"
         reasons.append("已提取到可能过期的截止日期，需先人工核验")
@@ -187,33 +198,55 @@ def _project_rule(
         reasons.append("详情存在但资格要求未提取完整")
 
     actions: list[str] = []
-    if detail_status != "full":
+    if lifecycle_stage != LIFECYCLE_OPPORTUNITY:
+        if lifecycle_stage == "结果公告":
+            actions.append("记录中标人和中标金额，关联原机会公告用于竞争情报")
+        elif lifecycle_stage == "更正/澄清":
+            actions.append("核对变更事项和新时间，并同步更新原公告倒排计划")
+        elif lifecycle_stage == "终止/废标":
+            actions.append("记录终止/废标原因，关注重新招标或后续采购公告")
+        else:
+            actions.append("复核公告生命周期后再决定后续处理")
+    elif detail_status != "full":
         actions.append("打开官方详情页，补充并核验公告正文")
-    if qualification_items:
-        actions.append("将资格条款与本企业资质、业绩、人员和联合体条件逐项比对")
-    else:
-        actions.append("定位原文资格章节后再进行资质符合性判断")
-    if deadline_state in {"紧急", "一周内", "两周内"}:
-        actions.append("核对公告的投标截止、文件获取及澄清时间，形成倒排计划")
-    elif deadline_state == "已过期":
-        actions.append("确认是否存在延期、更正或重新招标公告")
-    if fields.get("purchaser") not in _MISSING_VALUES:
-        actions.append("结合招标人/采购人和项目内容确认客户覆盖与项目匹配度")
+    if lifecycle_stage == LIFECYCLE_OPPORTUNITY:
+        if qualification_items:
+            actions.append("将资格条款与本企业资质、业绩、人员和联合体条件逐项比对")
+        else:
+            actions.append("定位原文资格章节后再进行资质符合性判断")
+        if deadline_state in {"紧急", "一周内", "两周内"}:
+            actions.append("核对公告的投标截止、文件获取及澄清时间，形成倒排计划")
+        elif deadline_state == "已过期":
+            actions.append("确认是否存在延期、更正或重新招标公告")
+        if fields.get("purchaser") not in _MISSING_VALUES:
+            actions.append("结合招标人/采购人和项目内容确认客户覆盖与项目匹配度")
 
-    known_evidence = [
-        key for key in ("purchaser", "qualification", "deadline", "project_code") if evidence.get(key)
-    ]
+    evidence_keys = {
+        "机会公告": ("purchaser", "qualification", "deadline", "project_code"),
+        "结果公告": ("purchaser", "awardee", "award_amount", "project_code"),
+        "更正/澄清": ("change_summary", "deadline", "project_code"),
+        "终止/废标": ("termination_reason", "purchaser", "project_code"),
+    }.get(lifecycle_stage, ("purchaser", "project_code"))
+    known_evidence = [key for key in evidence_keys if evidence.get(key)]
     evidence_ids = [
         str(evidence[key].get("evidence_id"))
         for key in known_evidence
         if isinstance(evidence.get(key), dict) and evidence[key].get("evidence_id")
     ]
-    qualification_matrix = _qualification_matrix(qualification_items, company_profile)
-    risks, missing_materials = _risk_materials(fields)
-    if detail_status != "full":
+    qualification_matrix = (
+        _qualification_matrix(qualification_items, company_profile)
+        if lifecycle_stage == LIFECYCLE_OPPORTUNITY
+        else []
+    )
+    risks, missing_materials = (
+        _risk_materials(fields)
+        if lifecycle_stage == LIFECYCLE_OPPORTUNITY
+        else ([], [])
+    )
+    if lifecycle_stage != LIFECYCLE_OPPORTUNITY:
+        decision = "不适用（生命周期情报）"
+    elif detail_status != "full":
         decision = "信息不足"
-    elif announcement_type in {"中标公告", "成交公告", "废标公告", "终止公告"}:
-        decision = "不建议参与"
     elif deadline_state == "已过期":
         decision = "不建议参与"
     elif not qualification_items or fields.get("bid_deadline") in _MISSING_VALUES:
@@ -243,6 +276,8 @@ def _project_rule(
     return {
         "announcement_id": item.get("announcement_id"),
         "title": item.get("title"),
+        "lifecycle_stage": lifecycle_stage,
+        "is_opportunity": lifecycle_stage == LIFECYCLE_OPPORTUNITY,
         "priority": priority,
         "priority_reasons": reasons,
         "deadline_urgency": deadline_state,
@@ -266,11 +301,15 @@ def _project_rule(
 def _portfolio_summary(projects: Sequence[dict[str, Any]]) -> str:
     if not projects:
         return "本轮没有形成可报告的公告条目。"
+    opportunities = [project for project in projects if project.get("is_opportunity")]
+    lifecycle_count = len(projects) - len(opportunities)
     counts: dict[str, int] = {}
-    for project in projects:
+    for project in opportunities:
         priority = str(project["priority"])
         counts[priority] = counts.get(priority, 0) + 1
-    parts = [f"共 {len(projects)} 个项目"]
+    parts = [f"共 {len(opportunities)} 条可参与机会"]
+    if lifecycle_count:
+        parts.append(f"另有 {lifecycle_count} 条项目生命周期情报")
     for label in ("高", "中", "待核验", "低"):
         if counts.get(label):
             parts.append(f"{label}优先级 {counts[label]} 个")
@@ -326,6 +365,8 @@ async def build_execution_analysis(
     start_date: str | None,
     end_date: str | None,
     company_profile: dict[str, Any] | None = None,
+    allow_llm: bool = True,
+    llm_budget_seconds: int | None = None,
 ) -> dict[str, Any]:
     """Build deterministic insights, then optionally enrich with validated LLM notes."""
     prepared = [
@@ -365,20 +406,30 @@ async def build_execution_analysis(
             "decision": project["decision"],
         }
         for project in projects
-        if project.get("evidence_fields")
+        if project.get("is_opportunity") and project.get("evidence_fields")
     ]
-    if not llm_projects:
+    if not llm_projects or not allow_llm:
+        if not allow_llm:
+            result["llm_suppressed"] = "execution_timeout_circuit_open"
         return result
     from app.core.config import get_settings
 
     if get_settings().app_env == "test":
         return result
-    llm = await call_json_llm_chain(
-        [
-            {"role": "system", "content": REPORT_ANALYSIS_SYSTEM_PROMPT},
-            {"role": "user", "content": build_report_analysis_prompt(llm_projects)},
-        ]
-    )
+    messages = [
+        {"role": "system", "content": REPORT_ANALYSIS_SYSTEM_PROMPT},
+        {"role": "user", "content": build_report_analysis_prompt(llm_projects)},
+    ]
+    try:
+        call = call_json_llm_chain(messages, stop_after_timeout=True)
+        llm = (
+            await asyncio.wait_for(call, timeout=llm_budget_seconds)
+            if llm_budget_seconds
+            else await call
+        )
+    except TimeoutError:
+        result["llm_suppressed"] = "analysis_budget_exhausted"
+        return result
     if not llm.success:
         return result
     summary, notes = _validated_llm_notes(llm.data, projects)
@@ -412,6 +463,12 @@ def analysis_preview(analysis: dict[str, Any] | None) -> dict[str, Any]:
         "provider": analysis.get("provider") or "rules",
         "portfolio_summary": analysis.get("portfolio_summary") or "",
         "priority_counts": priority_counts,
+        "opportunity_count": sum(
+            1 for project in projects if isinstance(project, dict) and project.get("is_opportunity")
+        ),
+        "lifecycle_count": sum(
+            1 for project in projects if isinstance(project, dict) and not project.get("is_opportunity")
+        ),
         "top_projects": [
             {
                 "announcement_id": project.get("announcement_id"),
@@ -419,7 +476,6 @@ def analysis_preview(analysis: dict[str, Any] | None) -> dict[str, Any]:
                 "priority": project.get("priority"),
                 "deadline_urgency": project.get("deadline_urgency"),
             }
-            for project in projects[:3]
-            if isinstance(project, dict)
+            for project in [p for p in projects if isinstance(p, dict) and p.get("is_opportunity")][:3]
         ],
     }

@@ -106,7 +106,7 @@ def test_sample_extracts_tenderer_qualification_and_strict_semantics():
         source_metadata={"content_pages": [{"page": 1, "text": SAMPLE}]},
     )
     fields = extraction["fields"]
-    assert extraction["version"] == 2
+    assert extraction["version"] == 3
     assert fields["purchaser"] == "西安航天动力试验技术研究所"
     assert fields["purchaser_source_label"] == "招标人"
     assert fields["agency"] == "陕西铭源项目管理有限公司"

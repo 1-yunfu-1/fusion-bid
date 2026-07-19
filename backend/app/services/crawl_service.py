@@ -4,13 +4,14 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 import logging
 import time
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
 
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.browser.session import LoginRequiredError
@@ -27,6 +28,7 @@ from app.models.announcement import TenderAnnouncement
 from app.models.company import CompanyProfile
 from app.models.company import AnnouncementFieldCorrection
 from app.models.execution import TaskExecution
+from app.models.quality import AnnouncementCrawlAttempt
 from app.models.task import SearchTask
 from app.parsers.regions import resolve_region_selection
 from app.reports.analysis import build_execution_analysis
@@ -36,6 +38,7 @@ from app.reports.fields import (
     build_extraction_data_with_ai,
     source_display_name,
 )
+from app.reports.lifecycle import classify_announcement, is_opportunity
 from app.reports.word_report import ReportContext, SourceRunStat, generate_report_file
 from app.sources.base import (
     DetailResult,
@@ -103,6 +106,15 @@ class CrawlStats:
     requested_regions: list[str] = field(default_factory=list)
     effective_regions: list[str] = field(default_factory=list)
     region_scope: str = "restricted"
+    detail_cap: int = 30
+    coverage_status: str = "complete"
+    search_depth: str = "standard"
+    extraction_cache_hit_count: int = 0
+    llm_call_count: int = 0
+    llm_timeout_count: int = 0
+    opportunity_count: int = 0
+    lifecycle_count: int = 0
+    source_outcomes: dict[str, dict[str, object]] = field(default_factory=dict)
 
 
 @dataclass
@@ -129,6 +141,65 @@ class _ProcessedDetail:
     extraction_failed: bool = False
     detail_duration_ms: int = 0
     extraction_duration_ms: int = 0
+    extraction_cache_hit: bool = False
+
+
+class _ExtractionRunController:
+    """单次执行内的模型预算、缓存计数和超时熔断。"""
+
+    def __init__(self, *, timeout_threshold: int, execution_budget_seconds: int) -> None:
+        self.timeout_threshold = max(1, timeout_threshold)
+        self._lock = asyncio.Lock()
+        self.timeout_streak = 0
+        self.call_count = 0
+        self.timeout_count = 0
+        self.cache_hit_count = 0
+        self.circuit_open = False
+        self.execution_budget_seconds = max(1, execution_budget_seconds)
+        self.started_at = time.monotonic()
+        self.budget_exhausted = False
+
+    async def cache_hit(self) -> None:
+        async with self._lock:
+            self.cache_hit_count += 1
+
+    async def begin_call(self) -> bool:
+        async with self._lock:
+            if time.monotonic() - self.started_at >= self.execution_budget_seconds:
+                self.budget_exhausted = True
+                return False
+            if self.circuit_open:
+                return False
+            self.call_count += 1
+            return True
+
+    async def observe(self, *, timed_out: bool) -> None:
+        async with self._lock:
+            if timed_out:
+                self.timeout_count += 1
+                self.timeout_streak += 1
+                if self.timeout_streak >= self.timeout_threshold:
+                    self.circuit_open = True
+            else:
+                self.timeout_streak = 0
+
+
+def _rules_need_ai(fields: dict[str, object]) -> bool:
+    missing_values = {
+        None,
+        "",
+        "原文未明确说明",
+        "本次未成功提取",
+        "提取失败，待复核",
+    }
+    lifecycle = str(fields.get("lifecycle_stage") or "机会公告")
+    required = {
+        "机会公告": ("purchaser", "project_code", "qualification", "bid_deadline"),
+        "结果公告": ("purchaser", "project_code", "awardee", "award_amount"),
+        "更正/澄清": ("project_code", "change_summary"),
+        "终止/废标": ("project_code", "termination_reason"),
+    }.get(lifecycle, ("purchaser", "project_code"))
+    return any(fields.get(name) in missing_values for name in required)
 
 
 class _CebpubRunController:
@@ -281,8 +352,77 @@ def _failure_bucket(detail: DetailResult, *, extraction_failed: bool = False) ->
 
 
 def _content_hash(title: str, content: str, url: str) -> str:
-    raw = f"{title}|{content[:2000]}|{url}"
+    raw = f"{title}|{content}|{url}"
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def _document_hash(content: str) -> str:
+    """Hash the complete normalized document, independent of source URL."""
+    normalized = "\n".join(
+        line.rstrip() for line in (content or "").replace("\r\n", "\n").split("\n")
+    ).strip()
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+
+
+def _extraction_fingerprint(*, company_profile: dict | None = None) -> str:
+    settings = get_settings()
+    profile_blob = json.dumps(
+        company_profile or {}, ensure_ascii=False, sort_keys=True, default=str
+    )
+    raw = "|".join(
+        [
+            "extraction-v3",
+            "fields-prompt-20260719-v1",
+            settings.llm_prefer_order,
+            settings.llm_model,
+            settings.ollama_model,
+            hashlib.sha256(profile_blob.encode("utf-8")).hexdigest(),
+        ]
+    )
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+async def _load_extraction_cache(
+    db: AsyncSession,
+    work: list[tuple[TenderSourceAdapter, ListItem]],
+) -> dict[tuple[str, str], TenderAnnouncement]:
+    source_names = {source.source_name for source, _ in work}
+    source_item_ids = {str(item.source_item_id) for _, item in work if item.source_item_id}
+    urls = {item.source_url for _, item in work if item.source_url}
+    if not source_names or (not source_item_ids and not urls):
+        return {}
+    identities = []
+    if source_item_ids:
+        identities.append(TenderAnnouncement.source_item_id.in_(source_item_ids))
+    if urls:
+        identities.append(TenderAnnouncement.source_url.in_(urls))
+    rows = (
+        await db.execute(
+            select(TenderAnnouncement).where(
+                TenderAnnouncement.source_name.in_(source_names),
+                or_(*identities),
+            )
+        )
+    ).scalars().all()
+    cache: dict[tuple[str, str], TenderAnnouncement] = {}
+    for row in rows:
+        if row.source_item_id:
+            cache[(row.source_name, f"id:{row.source_item_id}")] = row
+        if row.source_url:
+            cache[(row.source_name, f"url:{row.source_url}")] = row
+    return cache
+
+
+def _cached_announcement_for(
+    cache: dict[tuple[str, str], TenderAnnouncement],
+    source: TenderSourceAdapter,
+    item: ListItem,
+) -> TenderAnnouncement | None:
+    if item.source_item_id:
+        row = cache.get((source.source_name, f"id:{item.source_item_id}"))
+        if row:
+            return row
+    return cache.get((source.source_name, f"url:{item.source_url}"))
 
 
 def _source_dedupe_key(source_name: str, item_id: str | None, url: str, title: str) -> str:
@@ -377,6 +517,10 @@ def _build_snapshot_output_items(
                 "region": record.region,
                 "project_code": record.project_code,
                 "announcement_type": record.announcement_type,
+                "lifecycle_stage": record.lifecycle_stage,
+                "procurement_method": record.procurement_method,
+                "document_hash": record.document_hash,
+                "extraction_fingerprint": record.extraction_fingerprint,
                 "detail_status": record.detail_status or meta.get("detail_status", "unknown"),
                 "source_metadata": record.source_metadata
                 or meta.get("source_metadata")
@@ -445,7 +589,7 @@ async def _discover_source(
             items=kept[:detail_cap],
             list_filtered_out=filtered_out,
             detail_cap_skipped=max(0, len(kept) - detail_cap),
-            truncated=report_mode == "full_snapshot" and len(kept) >= 500,
+            truncated=len(kept) > detail_cap,
         )
     except LoginRequiredError as exc:
         message = str(exc)
@@ -572,6 +716,10 @@ async def _process_detail_work(
     source_semaphore: asyncio.Semaphore,
     llm_semaphore: asyncio.Semaphore,
     cebpub_controller: _CebpubRunController,
+    extraction_controller: _ExtractionRunController,
+    extraction_fingerprint: str,
+    cached_announcement: TenderAnnouncement | None = None,
+    refresh_extraction: bool = False,
     cooldown: dict[str, object] | None = None,
 ) -> _ProcessedDetail:
     detail_started = time.monotonic()
@@ -710,31 +858,25 @@ async def _process_detail_work(
         source.source_name, item.source_item_id, detail.source_url, detail.title
     )
     content_hash = _content_hash(detail.title, detail.clean_content, detail.source_url)
+    document_hash = _document_hash(detail.clean_content)
     summary = simple_summary(detail.title, detail.clean_content)
     project_code = normalize_bid_code(f"{detail.title} {detail.clean_content or ''}")
     extraction_started = time.monotonic()
     extraction_failed = False
-    try:
-        async with llm_semaphore:
-            extraction_data = await build_extraction_data_with_ai(
-                title=detail.title,
-                clean_content=detail.clean_content,
-                summary=summary,
-                region=detail.region or item.region,
-                project_code=project_code,
-                publish_time=detail.publish_time,
-                detail_status=detail.detail_status,
-                source_metadata=detail.source_metadata,
-            )
-        detail.source_metadata["extraction_status"] = "completed"
-    except Exception as exc:  # noqa: BLE001
-        extraction_failed = True
-        logger.warning(
-            "%s extraction failed %s: %s",
-            source.source_name,
-            item.source_url,
-            type(exc).__name__,
-        )
+    extraction_cache_hit = bool(
+        not refresh_extraction
+        and detail.detail_status == "full"
+        and cached_announcement is not None
+        and cached_announcement.document_hash == document_hash
+        and cached_announcement.extraction_fingerprint == extraction_fingerprint
+        and cached_announcement.extraction_version == "v3"
+        and isinstance(cached_announcement.extraction_data, dict)
+    )
+    if extraction_cache_hit:
+        extraction_data = dict(cached_announcement.extraction_data or {})
+        detail.source_metadata["extraction_status"] = "cache_hit"
+        await extraction_controller.cache_hit()
+    else:
         extraction_data = build_extraction_data(
             title=detail.title,
             clean_content=detail.clean_content,
@@ -745,12 +887,87 @@ async def _process_detail_work(
             detail_status=detail.detail_status,
             source_metadata=detail.source_metadata,
         )
-        detail.source_metadata["extraction_status"] = "rule_fallback_after_error"
-        detail.source_metadata["extraction_failure"] = type(exc).__name__
+        should_call_ai = (
+            detail.detail_status == "full"
+            and bool(detail.clean_content.strip())
+            and _rules_need_ai(extraction_data.get("fields") or {})
+        )
+        if should_call_ai:
+            async with llm_semaphore:
+                should_call_ai = await extraction_controller.begin_call()
+                if should_call_ai:
+                    try:
+                        extraction_data = await asyncio.wait_for(
+                            build_extraction_data_with_ai(
+                                title=detail.title,
+                                clean_content=detail.clean_content,
+                                summary=summary,
+                                region=detail.region or item.region,
+                                project_code=project_code,
+                                publish_time=detail.publish_time,
+                                detail_status=detail.detail_status,
+                                source_metadata=detail.source_metadata,
+                            ),
+                            timeout=get_settings().llm_extraction_budget_seconds,
+                        )
+                        ai_validation = extraction_data.get("ai_validation") or {}
+                        timed_out = ai_validation.get("error_kind") == "timeout"
+                        await extraction_controller.observe(timed_out=timed_out)
+                        detail.source_metadata["extraction_status"] = (
+                            "rule_fallback_after_timeout"
+                            if timed_out
+                            else "completed"
+                        )
+                        if timed_out:
+                            detail.source_metadata["ai_pending"] = True
+                    except TimeoutError:
+                        await extraction_controller.observe(timed_out=True)
+                        detail.source_metadata["extraction_status"] = (
+                            "rule_fallback_after_timeout"
+                        )
+                        detail.source_metadata["extraction_failure"] = "TimeoutError"
+                        detail.source_metadata["ai_pending"] = True
+                    except Exception as exc:  # noqa: BLE001
+                        extraction_failed = True
+                        await extraction_controller.observe(timed_out=False)
+                        logger.warning(
+                            "%s extraction failed %s: %s",
+                            source.source_name,
+                            item.source_url,
+                            type(exc).__name__,
+                        )
+                        detail.source_metadata["extraction_status"] = (
+                            "rule_fallback_after_error"
+                        )
+                        detail.source_metadata["extraction_failure"] = type(exc).__name__
+                else:
+                    detail.source_metadata["extraction_status"] = (
+                        "rule_fallback_execution_budget"
+                        if extraction_controller.budget_exhausted
+                        else "rule_fallback_circuit_open"
+                    )
+                    detail.source_metadata["ai_pending"] = True
+        else:
+            detail.source_metadata["extraction_status"] = (
+                "rules_complete"
+                if detail.detail_status == "full"
+                else "rules_only_no_full_detail"
+            )
     extraction_duration_ms = int((time.monotonic() - extraction_started) * 1000)
     detail.source_metadata["extraction_duration_ms"] = extraction_duration_ms
+    detail.source_metadata["extraction_cache_hit"] = extraction_cache_hit
     detail_meta["source_metadata"] = detail.source_metadata
-    announcement_type = (extraction_data.get("fields") or {}).get("announcement_type")
+    extraction_fields = extraction_data.get("fields") or {}
+    lifecycle_stage, procurement_method = classify_announcement(
+        title=detail.title,
+        content=detail.clean_content,
+        explicit_type=extraction_fields.get("announcement_type"),
+    )
+    extraction_fields["lifecycle_stage"] = lifecycle_stage
+    extraction_fields["procurement_method"] = (
+        procurement_method or extraction_fields.get("procurement_method")
+    )
+    announcement_type = extraction_fields.get("announcement_type")
     candidate = CandidateRecord(
         title=detail.title[:512],
         source_name=source.source_name,
@@ -770,9 +987,13 @@ async def _process_detail_work(
         extraction_data=extraction_data,
         attachment_links=list(detail.attachment_links or []),
         content_hash=content_hash,
+        document_hash=document_hash,
+        extraction_fingerprint=extraction_fingerprint,
         deduplication_key=dedupe_key,
         project_code=project_code,
         announcement_type=announcement_type,
+        lifecycle_stage=lifecycle_stage,
+        procurement_method=procurement_method,
     )
     return _ProcessedDetail(
         source=source,
@@ -784,6 +1005,7 @@ async def _process_detail_work(
         extraction_failed=extraction_failed,
         detail_duration_ms=detail_duration_ms,
         extraction_duration_ms=extraction_duration_ms,
+        extraction_cache_hit=extraction_cache_hit,
     )
 
 
@@ -795,6 +1017,8 @@ async def execute_search_task(
     trigger_type: str = "manual",
     report_mode: str | None = None,
     report_scope: str | None = None,
+    search_depth: str = "standard",
+    refresh_extraction: bool = False,
 ) -> tuple[TaskExecution, CrawlStats]:
     settings = get_settings()
     execution_wall_started = time.monotonic()
@@ -804,14 +1028,20 @@ async def execute_search_task(
         report_mode if report_mode in {"incremental", "full_snapshot"} else "incremental"
     )
     report_scope = "snapshot" if report_mode == "full_snapshot" else "incremental"
+    if report_mode == "full_snapshot":
+        search_depth = "complete"
+    if search_depth not in {"quick", "standard", "complete"}:
+        search_depth = "standard"
     detail_cap = max_details_per_source
     if detail_cap is None:
-        detail_cap = 500 if report_mode == "full_snapshot" else 8
+        detail_cap = {"quick": 8, "standard": 30, "complete": 500}[search_depth]
     detail_cap = min(max(int(detail_cap), 1), 500)
     stats = CrawlStats(
         report_scope=report_scope,
         report_mode=report_mode,
         deduplicate=report_mode != "full_snapshot",
+        detail_cap=detail_cap,
+        search_depth=search_depth,
     )
     now = datetime.now(TZ)
 
@@ -824,6 +1054,10 @@ async def execute_search_task(
         report_mode=report_mode,
         deduplicate=report_mode != "full_snapshot",
         truncated=False,
+        detail_cap=detail_cap,
+        detail_cap_skipped=0,
+        coverage_status="complete",
+        search_depth=search_depth,
         sources_requested=[],
         sources_succeeded=[],
         raw_result_count=0,
@@ -897,10 +1131,29 @@ async def execute_search_task(
         stats.truncated = stats.truncated or discovery.truncated
         if discovery.status == "success":
             stats.sources_succeeded.append(discovery.source.source_name)
+            stats.source_outcomes[discovery.source.source_name] = {
+                "status": (
+                    "success_with_results"
+                    if discovery.source_stat.raw_count
+                    else "success_empty"
+                ),
+                "raw_count": discovery.source_stat.raw_count,
+                "kept_count": discovery.source_stat.list_kept,
+                "detail_attempted": len(discovery.items),
+                "detail_cap_skipped": discovery.detail_cap_skipped,
+            }
             work.extend((discovery.source, item) for item in discovery.items)
         else:
             message = discovery.error or "数据源未完成"
             stats.sources_failed[discovery.source.source_name] = message
+            stats.source_outcomes[discovery.source.source_name] = {
+                "status": (
+                    "login_required"
+                    if discovery.status == "skipped" and discovery.source.requires_login
+                    else "failed"
+                ),
+                "message": message[:500],
+            }
             if discovery.status == "failed":
                 errors.append(f"{discovery.source.source_name}: {message}")
 
@@ -925,6 +1178,17 @@ async def execute_search_task(
         now=datetime.now(TZ),
         report_mode=report_mode,
     )
+    profile_row = await db.scalar(
+        select(CompanyProfile).order_by(CompanyProfile.updated_at.desc())
+    )
+    extraction_fingerprint = _extraction_fingerprint(
+        company_profile=profile_row.profile_data if profile_row else None
+    )
+    extraction_cache = await _load_extraction_cache(db, work)
+    extraction_controller = _ExtractionRunController(
+        timeout_threshold=settings.llm_extraction_timeout_threshold,
+        execution_budget_seconds=settings.llm_extraction_execution_budget_seconds,
+    )
 
     pipeline_started = time.monotonic()
     processed_details: list[_ProcessedDetail] = []
@@ -943,6 +1207,12 @@ async def execute_search_task(
                     ),
                     llm_semaphore=llm_semaphore,
                     cebpub_controller=cebpub_controller,
+                    extraction_controller=extraction_controller,
+                    extraction_fingerprint=extraction_fingerprint,
+                    cached_announcement=_cached_announcement_for(
+                        extraction_cache, source, item
+                    ),
+                    refresh_extraction=refresh_extraction,
                     cooldown=(
                         cebpub_cooldowns.get(str(item.source_item_id))
                         if item.source_item_id
@@ -964,6 +1234,9 @@ async def execute_search_task(
     stats.stage_durations_ms["extraction_work_total"] = sum(
         result.extraction_duration_ms for result in processed_details
     )
+    stats.extraction_cache_hit_count = extraction_controller.cache_hit_count
+    stats.llm_call_count = extraction_controller.call_count
+    stats.llm_timeout_count = extraction_controller.timeout_count
     source_stats_by_name = {row.source_name: row for row in stats.source_stats}
     for result in processed_details:
         detail = result.detail
@@ -1011,6 +1284,23 @@ async def execute_search_task(
         if result.candidate is not None:
             candidates.append(result.candidate)
 
+    for source_name, outcome in stats.source_outcomes.items():
+        if outcome.get("status") in {"login_required", "failed"}:
+            continue
+        detail_counts = stats.source_detail_breakdown.get(source_name, {})
+        full_count = int(detail_counts.get("full") or 0)
+        failures = stats.failure_breakdown_by_source.get(source_name, {})
+        if full_count > 0:
+            outcome["status"] = "success_with_results"
+            if failures:
+                outcome["detail_failures"] = dict(failures)
+        elif int(outcome.get("raw_count") or 0) == 0:
+            outcome["status"] = "success_empty"
+        elif failures.get("site_blocked"):
+            outcome["status"] = "site_blocked"
+        elif failures:
+            outcome["status"] = "collection_failed"
+
     stats.effective_concurrency = {
         "source_discovery": settings.crawl_max_concurrency,
         "http_detail": settings.crawl_max_concurrency,
@@ -1018,7 +1308,11 @@ async def execute_search_task(
         "llm_extraction": settings.llm_extraction_concurrency,
         "cebpub_adaptive": cebpub_controller.degraded,
         "cebpub_circuit_open": cebpub_controller.circuit_open,
+        "llm_circuit_open": extraction_controller.circuit_open,
+        "llm_budget_exhausted": extraction_controller.budget_exhausted,
     }
+    stats.coverage_status = "truncated" if stats.detail_cap_skipped else "complete"
+    stats.truncated = bool(stats.detail_cap_skipped)
 
     # ---- 跨源去重（本批次）----
     postprocess_started = time.monotonic()
@@ -1034,6 +1328,10 @@ async def execute_search_task(
     stats.cross_source_merge_count = deduped.merged_count
     stats.duplicate_count = deduped.merged_count
     stats.primary_count = len(deduped.primaries)
+    stats.opportunity_count = sum(
+        1 for rec in deduped.primaries if is_opportunity(rec.lifecycle_stage)
+    )
+    stats.lifecycle_count = len(deduped.primaries) - stats.opportunity_count
     stats.dedupe_reasons = deduped.reasons
     # 闭合：候选 = 合并减少 + 主记录（若引擎定义不同则以实际为准）
     if stats.candidates_count and stats.cross_source_merge_count + stats.primary_count != stats.candidates_count:
@@ -1054,15 +1352,15 @@ async def execute_search_task(
                 TenderAnnouncement.project_code == rec.project_code,
                 TenderAnnouncement.is_primary.is_(True),
             )
-            if rec.announcement_type:
+            if rec.lifecycle_stage:
                 sibling_stmt = sibling_stmt.where(
-                    TenderAnnouncement.announcement_type != rec.announcement_type
+                    TenderAnnouncement.lifecycle_stage != rec.lifecycle_stage
                 )
             lifecycle_siblings = list((await db.execute(sibling_stmt)).scalars().all())
             existing = await db.scalar(
                 select(TenderAnnouncement).where(
                     TenderAnnouncement.project_code == rec.project_code,
-                    TenderAnnouncement.announcement_type == rec.announcement_type,
+                    TenderAnnouncement.lifecycle_stage == rec.lifecycle_stage,
                     TenderAnnouncement.is_primary.is_(True),
                 )
             )
@@ -1171,22 +1469,34 @@ async def execute_search_task(
                 existing.detail_status = rec.detail_status
                 existing.source_metadata = rec.source_metadata
                 existing.extraction_data = rec.extraction_data
-                existing.extraction_version = "v2"
+                existing.extraction_version = "v3"
                 existing.announcement_type = rec.announcement_type
+                existing.lifecycle_stage = rec.lifecycle_stage
+                existing.procurement_method = rec.procurement_method
+                existing.document_hash = rec.document_hash
+                existing.extraction_fingerprint = rec.extraction_fingerprint
                 existing.detail_url = rec.source_metadata.get("detail_url") if rec.source_metadata else rec.source_url
                 existing.content_format = rec.source_metadata.get("content_format") if rec.source_metadata else None
             elif existing.detail_status in {"unknown", "failed"} and rec.detail_status:
                 existing.detail_status = rec.detail_status
                 existing.source_metadata = rec.source_metadata
                 existing.extraction_data = rec.extraction_data
-                existing.extraction_version = "v2"
+                existing.extraction_version = "v3"
                 existing.announcement_type = rec.announcement_type
+                existing.lifecycle_stage = rec.lifecycle_stage
+                existing.procurement_method = rec.procurement_method
+                existing.document_hash = rec.document_hash
+                existing.extraction_fingerprint = rec.extraction_fingerprint
             elif rec_is_full and existing_is_full:
                 # 即使当前正文较短，本轮已验证成功也必须清除上次“历史正文复用”标记。
                 existing.source_metadata = rec.source_metadata
                 existing.extraction_data = rec.extraction_data
-                existing.extraction_version = "v2"
+                existing.extraction_version = "v3"
                 existing.announcement_type = rec.announcement_type
+                existing.lifecycle_stage = rec.lifecycle_stage
+                existing.procurement_method = rec.procurement_method
+                existing.document_hash = rec.document_hash
+                existing.extraction_fingerprint = rec.extraction_fingerprint
                 existing.detail_url = (
                     rec.source_metadata.get("detail_url")
                     if rec.source_metadata
@@ -1222,6 +1532,15 @@ async def execute_search_task(
             if corrections and existing.extraction_data:
                 existing.extraction_data = apply_manual_corrections(
                     existing.extraction_data, corrections
+                )
+            existing.lifecycle_stage = rec.lifecycle_stage or existing.lifecycle_stage
+            existing.procurement_method = (
+                rec.procurement_method or existing.procurement_method
+            )
+            if rec.detail_status == "full":
+                existing.document_hash = rec.document_hash or existing.document_hash
+                existing.extraction_fingerprint = (
+                    rec.extraction_fingerprint or existing.extraction_fingerprint
                 )
             atts = list(existing.attachment_links or [])
             for a in rec.attachment_links or []:
@@ -1265,13 +1584,17 @@ async def execute_search_task(
                 detail_status=rec.detail_status,
                 source_metadata=rec.source_metadata,
                 extraction_data=rec.extraction_data,
-                extraction_version="v2",
+                extraction_version="v3",
                 announcement_type=rec.announcement_type,
+                lifecycle_stage=rec.lifecycle_stage,
+                procurement_method=rec.procurement_method,
                 detail_url=(rec.source_metadata or {}).get("detail_url") or rec.source_url,
                 content_format=(rec.source_metadata or {}).get("content_format"),
                 attachment_links=rec.attachment_links or [],
                 crawl_time=crawl_time,
                 content_hash=rec.content_hash,
+                document_hash=rec.document_hash,
+                extraction_fingerprint=rec.extraction_fingerprint,
                 deduplication_key=rec.deduplication_key,
                 is_primary=True,
                 related_urls=rec.related_urls or [rec.source_url],
@@ -1306,6 +1629,50 @@ async def execute_search_task(
 
         saved_ids.append(ann_id)
         id_hash_pairs.append((ann_id, chash))
+        rec.db_id = ann_id
+
+    # 追加式采集审计：只保存阶段、耗时和公开失败码，不保存正文/PDF/Cookie。
+    for result in processed_details:
+        candidate = result.candidate
+        announcement_id = candidate.db_id if candidate else None
+        if candidate and not announcement_id:
+            for primary in deduped.primaries:
+                same, _ = is_duplicate(candidate, primary)
+                if same and primary.db_id:
+                    announcement_id = primary.db_id
+                    break
+        metadata = dict(result.detail.source_metadata or {})
+        failure_code = str(metadata.get("failure_reason") or "") or None
+        if metadata.get("detail_attempt_state") == "not_attempted":
+            outcome = "not_attempted"
+        elif result.detail.detail_status == "full":
+            outcome = "success"
+        elif result.detail.detail_status == "needs_human_verification":
+            outcome = "site_blocked"
+        else:
+            outcome = "failed"
+        db.add(
+            AnnouncementCrawlAttempt(
+                execution_id=execution.id,
+                announcement_id=announcement_id,
+                source_name=result.source.source_name,
+                source_item_id=result.item.source_item_id,
+                stage=str(metadata.get("failure_stage") or "detail_acquisition"),
+                outcome=outcome,
+                failure_code=failure_code,
+                duration_ms=result.detail_duration_ms,
+                diagnostics={
+                    "detail_status": result.detail.detail_status,
+                    "attempt_state": metadata.get("detail_attempt_state"),
+                    "acquisition_path": metadata.get("acquisition_path"),
+                    "extraction_status": metadata.get("extraction_status"),
+                    "extraction_cache_hit": bool(result.extraction_cache_hit),
+                    "retryable": bool(metadata.get("retryable", False)),
+                    "terminal_failure": bool(metadata.get("terminal_failure", False)),
+                },
+                attempted_at=crawl_time,
+            )
+        )
 
     # ---- 增量：相对本任务 DeliveryHistory ----
     # 完整快照是独立审计输出，不读取、不写入增量交付历史。
@@ -1365,6 +1732,10 @@ async def execute_search_task(
                 "region": ann.region,
                 "project_code": ann.project_code,
                 "announcement_type": ann.announcement_type,
+                "lifecycle_stage": ann.lifecycle_stage,
+                "procurement_method": ann.procurement_method,
+                "document_hash": ann.document_hash,
+                "extraction_fingerprint": ann.extraction_fingerprint,
                 "detail_status": ann.detail_status or meta.get("detail_status", "unknown"),
                 "source_metadata": stored_metadata,
                 "extraction_data": ann.extraction_data,
@@ -1385,9 +1756,6 @@ async def execute_search_task(
 
     # 规则分析不影响采集成功与否；可选 LLM 仅在证据校验后补充简短研判。
     try:
-        profile_row = await db.scalar(
-            select(CompanyProfile).order_by(CompanyProfile.updated_at.desc())
-        )
         analysis = await build_execution_analysis(
             output_items,
             keywords=keywords,
@@ -1395,6 +1763,11 @@ async def execute_search_task(
             start_date=start.isoformat() if start else None,
             end_date=end.isoformat() if end else None,
             company_profile=profile_row.profile_data if profile_row else None,
+            allow_llm=(
+                not extraction_controller.circuit_open
+                and not extraction_controller.budget_exhausted
+            ),
+            llm_budget_seconds=settings.llm_analysis_budget_seconds,
         )
     except Exception as exc:  # noqa: BLE001
         logger.warning("execution analysis unavailable: %s", exc)
@@ -1442,6 +1815,15 @@ async def execute_search_task(
     execution.detail_metadata_count = stats.detail_metadata_only_count
     execution.detail_failed_count = stats.detail_failed + stats.detail_status_failed_count
     execution.detail_human_verification_count = stats.detail_human_verification_count
+    execution.detail_cap = stats.detail_cap
+    execution.detail_cap_skipped = stats.detail_cap_skipped
+    execution.coverage_status = stats.coverage_status
+    execution.search_depth = stats.search_depth
+    execution.extraction_cache_hit_count = stats.extraction_cache_hit_count
+    execution.llm_call_count = stats.llm_call_count
+    execution.llm_timeout_count = stats.llm_timeout_count
+    execution.opportunity_count = stats.opportunity_count
+    execution.lifecycle_count = stats.lifecycle_count
 
     if stats.sources_succeeded:
         has_quality_failures = bool(
@@ -1503,8 +1885,9 @@ async def execute_search_task(
         )
     if stats.truncated:
         warnings.append(
-            "本次快照已达每源 500 条安全上限，truncated=true；"
-            "报告不声称为完整覆盖。"
+            f"本次检索每源详情上限为 {stats.detail_cap} 条，"
+            f"共有 {stats.detail_cap_skipped} 条因上限未进入详情采集；"
+            "truncated=true，报告不声称为完整覆盖。"
         )
 
     report_ctx = ReportContext(
@@ -1529,6 +1912,7 @@ async def execute_search_task(
         source_stats=list(stats.source_stats),
         raw_result_count=stats.raw_result_count,
         list_filtered_out=stats.list_filtered_out,
+        detail_cap=stats.detail_cap,
         detail_cap_skipped=stats.detail_cap_skipped,
         detail_failed=stats.detail_failed,
         detail_success_count=stats.detail_success_count,
@@ -1609,6 +1993,16 @@ async def execute_search_task(
         "requested_regions": list(stats.requested_regions),
         "effective_regions": list(stats.effective_regions),
         "region_scope": stats.region_scope,
+        "detail_cap": stats.detail_cap,
+        "detail_cap_skipped": stats.detail_cap_skipped,
+        "coverage_status": stats.coverage_status,
+        "search_depth": stats.search_depth,
+        "extraction_cache_hit_count": stats.extraction_cache_hit_count,
+        "llm_call_count": stats.llm_call_count,
+        "llm_timeout_count": stats.llm_timeout_count,
+        "opportunity_count": stats.opportunity_count,
+        "lifecycle_count": stats.lifecycle_count,
+        "source_outcomes": dict(stats.source_outcomes),
     }
     await db.commit()
     await db.refresh(execution)

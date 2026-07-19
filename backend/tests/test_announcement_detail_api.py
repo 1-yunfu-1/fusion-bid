@@ -68,7 +68,7 @@ async def test_detail_reextract_analyze_and_manual_correction(client, db_engine)
 
     reextract = await client.post(f"/api/announcements/{announcement_id}/reextract")
     assert reextract.status_code == 200, reextract.text
-    assert reextract.json()["announcement"]["extraction_version"] == "v2"
+    assert reextract.json()["announcement"]["extraction_version"] == "v3"
 
     corrected = await client.patch(
         f"/api/announcements/{announcement_id}/fields",
@@ -96,6 +96,18 @@ async def test_detail_reextract_analyze_and_manual_correction(client, db_engine)
         "不建议参与",
         "信息不足",
     }
+
+    feedback = await client.post(
+        f"/api/announcements/{announcement_id}/feedback",
+        json={"verdict": "incorrect", "reason": "代理机构字段仍需复核"},
+    )
+    assert feedback.status_code == 200, feedback.text
+    detail_after_feedback = await client.get(f"/api/announcements/{announcement_id}")
+    assert detail_after_feedback.json()["review_status"] == "needs_review"
+    assert detail_after_feedback.json()["feedback"][0]["verdict"] == "incorrect"
+    metrics = await client.get("/api/announcements/quality-metrics")
+    assert metrics.status_code == 200
+    assert metrics.json()["sample"]["feedback"] == 1
 
 
 async def test_company_profile_roundtrip(client):

@@ -45,9 +45,12 @@ async def health_check() -> HealthResponse:
         database="ok" if db_ok else "error",
         database_ok=db_ok,
         database_revision=revision,
-        extraction_version="v2",
+        extraction_version="v3",
         capabilities=[
             "detail-evidence-v2",
+            "lifecycle-extraction-v3",
+            "extraction-cache-v1",
+            "crawl-quality-audit-v1",
             "interactive-detail-recrawl-v1",
             "official-document-import-v1",
             "pdfjs-text-layer-capture-v1",

@@ -64,6 +64,7 @@ class ReportContext:
     # 闭合漏斗
     raw_result_count: int = 0
     list_filtered_out: int = 0
+    detail_cap: int = 30
     detail_cap_skipped: int = 0
     detail_failed: int = 0
     detail_success_count: int = 0
@@ -569,7 +570,11 @@ def _page2_summary(doc: Document, ctx: ReportContext, items: list[dict]) -> None
     funnel_rows = [
         ["原始列表结果", str(ctx.raw_result_count), "各成功数据源列表页合计"],
         ["列表阶段过滤排除", str(ctx.list_filtered_out), "关键词/区域/时间/相关性"],
-        ["详情上限未抓取", str(ctx.detail_cap_skipped), "超过每源详情抓取上限"],
+        [
+            "详情上限未抓取",
+            str(ctx.detail_cap_skipped),
+            f"每源最多采集 {ctx.detail_cap} 条详情",
+        ],
         ["详情抓取失败", str(ctx.detail_failed), "打开详情页异常"],
         ["仅列表元数据", str(ctx.detail_metadata_only_count), "未验证详情，不作为公告正文"],
         ["详情内容失败", str(ctx.detail_status_failed_count), "已保留来源记录与失败状态"],
@@ -618,7 +623,9 @@ def _page2_summary(doc: Document, ctx: ReportContext, items: list[dict]) -> None
         color=RGBColor(0x66, 0x66, 0x66),
     )
     projects = [
-        p for p in analysis.get("projects", []) if isinstance(p, dict)
+        p
+        for p in analysis.get("projects", [])
+        if isinstance(p, dict) and p.get("is_opportunity", True)
     ]
     if projects:
         analysis_rows = []
@@ -642,13 +649,18 @@ def _page2_summary(doc: Document, ctx: ReportContext, items: list[dict]) -> None
         _add_para(doc, "暂无可分析项目；可先补齐官方详情后重新生成未去重完整报告。")
 
     _add_heading(doc, "五、重点项目 Top 3", 1)
-    if not items:
+    opportunity_items = [
+        it
+        for it in items
+        if (it.get("fields") or {}).get("lifecycle_stage") == "机会公告"
+    ]
+    if not opportunity_items:
         _add_para(doc, "本次无有效结果条目。")
     else:
         # 优先级由证据受限的规则研判给出，再按完整度排序。
         priority_rank = {"高": 4, "中": 3, "待核验": 2, "低": 1}
         ranked = sorted(
-            items,
+            opportunity_items,
             key=lambda x: (
                 priority_rank.get(
                     (x.get("opportunity_analysis") or {}).get("priority"), 0
@@ -695,8 +707,14 @@ def _page3_overview(doc: Document, ctx: ReportContext, items: list[dict]) -> Non
     if not items:
         _add_para(doc, "无项目可展示。")
         return
+    opportunity_items = [
+        it for it in items if (it.get("fields") or {}).get("lifecycle_stage") == "机会公告"
+    ]
+    lifecycle_items = [it for it in items if it not in opportunity_items]
+
+    _add_heading(doc, "七（一）、可参与机会", 2)
     rows = []
-    for i, it in enumerate(items, 1):
+    for i, it in enumerate(opportunity_items, 1):
         f = it.get("fields") or {}
         cached_full_reused = bool(it.get("cached_full_reused"))
         rows.append(
@@ -716,7 +734,7 @@ def _page3_overview(doc: Document, ctx: ReportContext, items: list[dict]) -> Non
                         "needs_human_verification": "待人工验证",
                     }.get(it.get("detail_status"), "状态未知")
                 ),
-                f.get("announcement_type") or _MISSING,
+                f.get("procurement_method") or _MISSING,
                 it.get("publish_time_cn") or _MISSING,
                 f.get("deadline") or _MISSING,
                 f.get("budget") or _MISSING,
@@ -732,7 +750,7 @@ def _page3_overview(doc: Document, ctx: ReportContext, items: list[dict]) -> Non
             "采购人/招标人",
             "优先级",
             "详情状态",
-            "公告类型",
+            "采购方式",
             "发布时间",
             "截止时间",
             "预算金额",
@@ -741,6 +759,41 @@ def _page3_overview(doc: Document, ctx: ReportContext, items: list[dict]) -> Non
         rows,
         col_widths_cm=[0.8, 2.4, 1.4, 1.8, 1.1, 1.5, 1.2, 1.4, 1.4, 1.3, 1.4],
     )
+    if not rows:
+        _add_para(doc, "本次报告没有可参与机会。")
+
+    _add_heading(doc, "七（二）、项目生命周期情报", 2)
+    lifecycle_rows = []
+    for i, it in enumerate(lifecycle_items, 1):
+        f = it.get("fields") or {}
+        stage = f.get("lifecycle_stage") or "待复核"
+        key_fact = (
+            f"中标人：{f.get('awardee') or _MISSING}；金额：{f.get('award_amount') or _MISSING}"
+            if stage == "结果公告"
+            else f.get("change_summary") or _MISSING
+            if stage == "更正/澄清"
+            else f.get("termination_reason") or _MISSING
+        )
+        lifecycle_rows.append(
+            [
+                str(i),
+                it.get("short_title") or _MISSING,
+                stage,
+                f.get("project_code") or _MISSING,
+                str(key_fact)[:100],
+                it.get("publish_time_cn") or _MISSING,
+                it.get("source_display") or source_display_name(it.get("source_name")),
+            ]
+        )
+    if lifecycle_rows:
+        _add_table(
+            doc,
+            ["序号", "项目简称", "生命周期", "项目编号", "关键情报", "发布时间", "来源"],
+            lifecycle_rows,
+            col_widths_cm=[0.8, 3.0, 1.8, 2.4, 5.0, 1.8, 2.0],
+        )
+    else:
+        _add_para(doc, "本次报告没有结果、更正或终止类生命周期情报。")
 
 
 def _detail_pages(doc: Document, ctx: ReportContext, items: list[dict]) -> None:
@@ -800,10 +853,20 @@ def _detail_pages(doc: Document, ctx: ReportContext, items: list[dict]) -> None:
         _add_label_value(doc, "招标/采购代理机构：", f.get("agency") or _MISSING)
         _add_label_value(doc, "交易平台：", f.get("transaction_platform") or _MISSING)
         _add_label_value(doc, "项目地区：", f.get("region") or _MISSING)
-        _add_label_value(doc, "公告类型：", f.get("announcement_type") or _MISSING)
+        lifecycle_stage = f.get("lifecycle_stage") or "待复核"
+        _add_label_value(doc, "公告生命周期：", lifecycle_stage)
+        _add_label_value(doc, "采购方式：", f.get("procurement_method") or _MISSING)
         _add_label_value(doc, "采购内容：", f.get("content") or _MISSING)
-        _add_label_value(doc, "预算金额：", f.get("budget") or _MISSING)
-        _add_label_value(doc, "招标文件售价：", f.get("document_price") or _MISSING)
+        if lifecycle_stage == "结果公告":
+            _add_label_value(doc, "中标人/成交供应商：", f.get("awardee") or _MISSING)
+            _add_label_value(doc, "中标/成交金额：", f.get("award_amount") or _MISSING)
+        elif lifecycle_stage == "更正/澄清":
+            _add_label_value(doc, "更正/澄清事项：", f.get("change_summary") or _MISSING)
+        elif lifecycle_stage == "终止/废标":
+            _add_label_value(doc, "终止/废标原因：", f.get("termination_reason") or _MISSING)
+        else:
+            _add_label_value(doc, "预算金额：", f.get("budget") or _MISSING)
+            _add_label_value(doc, "招标文件售价：", f.get("document_price") or _MISSING)
         _add_label_value(doc, "资金来源：", f.get("funding_source") or _MISSING)
         _add_label_value(doc, "发布时间：", it.get("publish_time_cn") or _MISSING)
         _add_label_value(doc, "公告结束时间：", f.get("notice_end_time") or _MISSING)
@@ -820,7 +883,9 @@ def _detail_pages(doc: Document, ctx: ReportContext, items: list[dict]) -> None:
         _add_label_value(doc, "投标截止时间：", f.get("bid_deadline") or f.get("deadline") or _MISSING)
         _add_label_value(doc, "开标时间：", f.get("opening_time") or _MISSING)
         qualification_items = f.get("qualification_items") or []
-        if qualification_items:
+        if lifecycle_stage != "机会公告":
+            pass
+        elif qualification_items:
             _add_label_value(doc, "资格要求（原文提取）：", "见以下条款")
             for requirement in qualification_items:
                 _add_bullet(doc, str(requirement), size=10)
@@ -878,10 +943,17 @@ def _detail_pages(doc: Document, ctx: ReportContext, items: list[dict]) -> None:
         )
 
         opportunity = it.get("opportunity_analysis") or {}
-        _add_para(doc, "投标决策分析：", bold=True)
-        _add_label_value(doc, "AI/规则参与建议：", opportunity.get("decision") or "信息不足")
-        _add_label_value(doc, "机会优先级：", opportunity.get("priority") or "待核验")
-        _add_label_value(doc, "时间紧迫度：", opportunity.get("deadline_urgency") or "未知")
+        _add_para(
+            doc,
+            "投标决策分析：" if lifecycle_stage == "机会公告" else "生命周期情报分析：",
+            bold=True,
+        )
+        if lifecycle_stage == "机会公告":
+            _add_label_value(doc, "AI/规则参与建议：", opportunity.get("decision") or "信息不足")
+            _add_label_value(doc, "机会优先级：", opportunity.get("priority") or "待核验")
+            _add_label_value(doc, "时间紧迫度：", opportunity.get("deadline_urgency") or "未知")
+        else:
+            _add_label_value(doc, "参与建议：", "不适用（该记录仅作为项目生命周期情报）")
         if opportunity.get("deadline_note"):
             _add_para(doc, f"· {opportunity['deadline_note']}", size=10)
         if opportunity.get("gaps"):
@@ -1037,7 +1109,7 @@ def _last_page(doc: Document, ctx: ReportContext, items: list[dict]) -> None:
             if ctx.report_scope == "snapshot"
             else "增量：相对本任务历史交付记录，仅将新增或内容变化条目写入本报告。"
         ),
-        "字段抽取：AI 优先提取 → 原文证据校验 → 规则兜底；无法定位的 AI 值会被拒绝。",
+        "字段抽取：规则快速提取 → 关键字段缺口 AI 抽取 → 原文证据校验 → 规则结果保底；无法定位的 AI 值会被拒绝。",
     ]:
         _add_para(doc, f"· {line}")
 

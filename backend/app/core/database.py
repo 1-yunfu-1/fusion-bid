@@ -78,6 +78,14 @@ def _sqlite_add_missing_columns(sync_conn) -> None:
         )
     if "announcement_type" not in existing:
         alters.append("ALTER TABLE tender_announcements ADD COLUMN announcement_type VARCHAR(64)")
+    if "lifecycle_stage" not in existing:
+        alters.append("ALTER TABLE tender_announcements ADD COLUMN lifecycle_stage VARCHAR(32)")
+    if "procurement_method" not in existing:
+        alters.append("ALTER TABLE tender_announcements ADD COLUMN procurement_method VARCHAR(64)")
+    if "document_hash" not in existing:
+        alters.append("ALTER TABLE tender_announcements ADD COLUMN document_hash VARCHAR(64)")
+    if "extraction_fingerprint" not in existing:
+        alters.append("ALTER TABLE tender_announcements ADD COLUMN extraction_fingerprint VARCHAR(64)")
     if "analysis_data" not in existing:
         alters.append("ALTER TABLE tender_announcements ADD COLUMN analysis_data JSON")
     for stmt in alters:
@@ -143,6 +151,30 @@ def _sqlite_add_missing_columns(sync_conn) -> None:
                 exec_alters.append(
                     f"ALTER TABLE task_executions ADD COLUMN {name} INTEGER DEFAULT 0 NOT NULL"
                 )
+        for name in (
+            "detail_cap_skipped",
+            "extraction_cache_hit_count",
+            "llm_call_count",
+            "llm_timeout_count",
+            "opportunity_count",
+            "lifecycle_count",
+        ):
+            if name not in ecols:
+                exec_alters.append(
+                    f"ALTER TABLE task_executions ADD COLUMN {name} INTEGER DEFAULT 0 NOT NULL"
+                )
+        if "detail_cap" not in ecols:
+            exec_alters.append(
+                "ALTER TABLE task_executions ADD COLUMN detail_cap INTEGER DEFAULT 30 NOT NULL"
+            )
+        if "coverage_status" not in ecols:
+            exec_alters.append(
+                "ALTER TABLE task_executions ADD COLUMN coverage_status VARCHAR(24) DEFAULT 'complete' NOT NULL"
+            )
+        if "search_depth" not in ecols:
+            exec_alters.append(
+                "ALTER TABLE task_executions ADD COLUMN search_depth VARCHAR(16) DEFAULT 'standard' NOT NULL"
+            )
         for stmt in exec_alters:
             sync_conn.execute(
                 text(stmt)
@@ -162,11 +194,12 @@ async def init_db() -> None:
 
 
 async def _upgrade_legacy_extractions() -> None:
-    """已有正文的 v1 记录自动重抽取；只有列表元数据的标记待重采。"""
+    """已有正文的旧记录自动重抽取；只有列表元数据的标记待重采。"""
     from sqlalchemy import or_, select
 
     from app.models.announcement import TenderAnnouncement
-    from app.reports.fields import build_extraction_data
+    from app.models.company import AnnouncementFieldCorrection
+    from app.reports.fields import apply_manual_corrections, build_extraction_data
     from app.sources.cebpub_source import current_detail_url
 
     async with AsyncSessionLocal() as session:
@@ -174,7 +207,7 @@ async def _upgrade_legacy_extractions() -> None:
             await session.execute(
                 select(TenderAnnouncement).where(
                     or_(
-                        TenderAnnouncement.extraction_version != "v2",
+                        TenderAnnouncement.extraction_version != "v3",
                         TenderAnnouncement.extraction_data.is_(None),
                         TenderAnnouncement.detail_url.is_(None),
                     )
@@ -199,9 +232,24 @@ async def _upgrade_legacy_extractions() -> None:
                     detail_status="full",
                     source_metadata=row.source_metadata or {},
                 )
-                row.extraction_version = "v2"
+                corrections = (
+                    await session.execute(
+                        select(AnnouncementFieldCorrection)
+                        .where(
+                            AnnouncementFieldCorrection.announcement_id == row.id
+                        )
+                        .order_by(AnnouncementFieldCorrection.corrected_at.asc())
+                    )
+                ).scalars().all()
+                if corrections:
+                    row.extraction_data = apply_manual_corrections(
+                        row.extraction_data, corrections
+                    )
+                row.extraction_version = "v3"
                 fields = (row.extraction_data or {}).get("fields") or {}
                 row.announcement_type = fields.get("announcement_type")
+                row.lifecycle_stage = fields.get("lifecycle_stage")
+                row.procurement_method = fields.get("procurement_method")
             else:
                 row.extraction_version = "needs_recrawl"
                 if row.detail_status in {"unknown", "failed"}:
